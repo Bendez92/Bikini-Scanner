@@ -1,2 +1,46 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bikini-scanner"
+description = "Local desktop app for scanning a chosen folder of images for bikini-related content."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dynamic = ["version"]
+
+dependencies = [
+    "numpy",
+    "Pillow",
+    "transformers",
+    "torch",
+    "pillow-heif",
+    "psutil",
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+# Drag-and-drop onto the window, and recycle-bin deletes instead of unlink.
+extras = [
+    "tkinterdnd2",
+    "send2trash",
+]
+# ONNX Runtime backend; see build_onnx.bat and scripts/export_onnx.py.
+onnx = [
+    "onnx==1.17.0",
+    "onnxruntime==1.19.2",
+    "onnxscript==0.7.1",
+]
+
+[project.scripts]
+bikini-scanner = "bikini_scanner.run:main"
+
+[tool.setuptools]
+packages = ["bikini_scanner"]
+
+[tool.setuptools.dynamic]
+version = { attr = "bikini_scanner.__version__.__version__" }
+
 [tool.ruff]
 line-length = 100
