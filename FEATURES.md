@@ -112,6 +112,11 @@ Audit of the requested feature list and what the program now does.
 - **Human-in-the-Loop (Review UI)** — ✅ The whole app: review borderline
   buckets (uncertain, likely false positives/negatives, model disagreements), mark
   Accept/REJECT, and the model retrains and re-ranks immediately.
+- **Local vision-LLM adjudication** — ✅ Optional Ollama/llama.cpp-compatible
+  second opinion for borderline and uncertain-age images. Requests cover all
+  detection axes, run concurrently, include the best body crop, and cache verdicts
+  by content hash/model/prompt version. CLIP remains the fast pass and an inexpensive
+  skin-exposure signal only prioritises eligible images.
 - **Gallery / Viewer UX** — ✅ The review area is a responsive grid with a
   full-size viewer, path/label/bucket search, score-range filtering, sort,
   filter, and reveal/open actions.

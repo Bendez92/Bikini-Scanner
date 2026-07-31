@@ -39,6 +39,7 @@ from .regions import (
 from .store import FolderStore, collect_image_paths, safe_stat
 from .vision_analysis import detect_face_boxes, detect_face_count
 from .logging_setup import configure_logging
+from .skin import skin_fraction
 
 LOGGER = logging.getLogger(__name__)
 
@@ -729,8 +730,11 @@ class BikiniScorer:
             if refined_rows.any():
                 # The larger model gets the louder vote, but not the only one.
                 zero_shot = zero_shot.copy()
+                refine_weight = float(self.config.vlm_weight if self.config.vlm_enabled else 0.65)
+                refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
-                    0.35 * zero_shot[refined_rows] + 0.65 * refine.scores[refined_rows]
+                    (1.0 - refine_weight) * zero_shot[refined_rows]
+                    + refine_weight * refine.scores[refined_rows]
                 ).astype(np.float32)
             for index in np.nonzero(refine.minor)[0]:
                 position = int(index)
@@ -1008,6 +1012,140 @@ class RefineResult:
 
     def any(self) -> bool:
         return bool(np.isfinite(self.scores).any())
+
+
+def compute_vlm_scores(
+    scorer: BikiniScorer,
+    state: ScoreState,
+    threshold: float = 0.5,
+    cancel_event: threading.Event | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    store: FolderStore | None = None,
+) -> RefineResult | None:
+    """Adjudicate borderline images with a local vision model.
+
+    Only images near the threshold, plus the ones whose age reading is unsettled, are
+    sent. Skin exposure orders that band so the most likely matches are judged first;
+    it never removes an image from the band, though the `vlm_max_images` cap can.
+    """
+    if not scorer.config.vlm_enabled or scorer.config.pipeline == "legacy" or not state.paths:
+        return None
+    limit = int(scorer.config.vlm_max_images)
+    if limit <= 0:
+        return None
+    from .vlm_backend import VLM_AXES, VLM_PROMPT_VERSION, VLMCancelled, VLMClient
+
+    client = VLMClient(
+        scorer.config.vlm_base_url,
+        scorer.config.vlm_model,
+        scorer.config.vlm_api_key,
+        scorer.config.vlm_timeout,
+        scorer.config.vlm_concurrency,
+    )
+    if not client.probe():
+        return None
+    band = float(scorer.config.vlm_band)
+    child = cascade_module.evidence(
+        np.asarray(state.axis_scores.get("child", np.full(len(state.paths), 0.5)), dtype=np.float32)
+    )
+    adult = cascade_module.evidence(
+        np.asarray(state.axis_scores.get("adult", np.full(len(state.paths), 0.5)), dtype=np.float32)
+    )
+    age_margin = max(0.05, band * 0.65)
+    candidates: list[tuple[float, int]] = []
+    for index, score in enumerate(np.asarray(state.scores, dtype=np.float32)):
+        if state.excluded is not None and bool(state.excluded[index]):
+            continue
+        distance = abs(float(score) - float(threshold))
+        age_uncertain = (
+            abs(float(child[index]) - float(scorer.config.minor_threshold)) <= age_margin
+            or abs(float(adult[index]) - float(scorer.config.min_adult_confidence)) <= age_margin
+        )
+        if distance <= band or age_uncertain:
+            candidates.append((distance, index))
+    if not candidates:
+        return None
+    detail_regions = state.detail_regions or [FULL_REGION] * len(state.paths)
+    ranked: list[tuple[float, int, list[Image.Image]]] = []
+    for distance, index in candidates:
+        try:
+            with Image.open(state.paths[index]) as handle:
+                image = handle.convert("RGB")
+                views = [image.copy()]
+                wanted = detail_regions[index] if index < len(detail_regions) else FULL_REGION
+                if wanted != FULL_REGION:
+                    faces = detect_face_boxes(image)
+                    planned = {
+                        region.key: region
+                        for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
+                    }
+                    region = planned.get(wanted)
+                    if region is not None and region.box is not None:
+                        views.append(image.crop(region.box))
+                skin = skin_fraction(views[-1])
+                # Skin only breaks ties within the eligible band; it never filters.
+                priority = 0 if distance <= band else 1
+                normalized = distance / max(band, 1e-6)
+                ranked.append((priority * 10.0 + normalized - 0.5 * skin, index, views))
+        except (OSError, ValueError) as exc:
+            LOGGER.warning("VLM pass skipped %s: %s", state.paths[index], exc)
+    ranked.sort(key=lambda item: item[0])
+    ranked = ranked[:limit]
+    if not ranked:
+        return None
+    cached: dict[int, dict[str, float]] = {}
+    pending: dict[str, dict[str, float]] = {}
+    uncached_images: list[list[Image.Image]] = []
+    uncached_positions: list[int] = []
+    for position, (_, index, views) in enumerate(ranked):
+        content_hash = store.content_hash_for_path(state.paths[index]) if store is not None else None
+        if content_hash and store is not None:
+            key = store.vlm_cache_key(content_hash, scorer.config.vlm_model, VLM_PROMPT_VERSION)
+            verdict = store.lookup_vlm_verdict(key)
+            if verdict is not None:
+                cached[position] = verdict
+                continue
+        uncached_images.append(views)
+        uncached_positions.append(position)
+    if uncached_images:
+        try:
+            responses = client.score_images(uncached_images, cancel_event=cancel_event, on_progress=on_progress)
+        except VLMCancelled:
+            raise ScanCancelled
+        for position, response in zip(uncached_positions, responses, strict=False):
+            if response is None:
+                continue
+            cached[position] = response
+            _, index, _ = ranked[position]
+            content_hash = store.content_hash_for_path(state.paths[index]) if store is not None else None
+            if content_hash and store is not None:
+                key = store.vlm_cache_key(content_hash, scorer.config.vlm_model, VLM_PROMPT_VERSION)
+                pending[key] = response
+    if store is not None and pending:
+        store.save_vlm_verdicts(pending)
+    if on_progress is not None and not uncached_images:
+        on_progress(len(ranked), len(ranked))
+    scores = np.full((len(state.paths),), np.nan, dtype=np.float32)
+    minor = np.zeros((len(state.paths),), dtype=bool)
+    config = scorer.config
+    for position, (_, index, _views) in enumerate(ranked):
+        values = cached.get(position)
+        if values is None:
+            continue
+        matrix = np.asarray([[values.get(axis, 0.5) for axis in VLM_AXES]], dtype=np.float32)
+        axis_scores = {axis: matrix[:, offset] for offset, axis in enumerate(VLM_AXES)}
+        table = RegionScoreTable(
+            owner=np.array([0], dtype=np.int64),
+            kinds=np.array([KIND_FULL], dtype=object),
+            axis_scores=axis_scores,
+            image_count=1,
+            full_row=np.array([0], dtype=np.int64),
+        )
+        result = cascade_module.evaluate(table, config, None)
+        if result.score.size:
+            scores[index] = float(result.score[0])
+            minor[index] = bool(result.stage and result.stage[0] == cascade_module.STAGE_MINOR)
+    return RefineResult(scores=scores, minor=minor)
 
 
 def compute_refine_scores(
@@ -1530,9 +1668,20 @@ def scan_and_score_folder(
             reporter.start_phase(PHASE_REFINE, total)
         reporter.emit(done)
 
-    refine = compute_refine_scores(
-        scorer, state, threshold=threshold, cancel_event=cancel_event, on_progress=_refine_progress
-    )
+    refine = None
+    if scorer.config.vlm_enabled:
+        refine = compute_vlm_scores(
+            scorer,
+            state,
+            threshold=threshold,
+            cancel_event=cancel_event,
+            on_progress=_refine_progress,
+            store=store,
+        )
+    if refine is None:
+        refine = compute_refine_scores(
+            scorer, state, threshold=threshold, cancel_event=cancel_event, on_progress=_refine_progress
+        )
     if refine_started:
         reporter.complete_phase()
         reporter.start_phase(PHASE_SCORE, len(ordered_paths))
