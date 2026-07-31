@@ -1,0 +1,13 @@
+--index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://pypi.org/simple
+numpy
+Pillow
+transformers
+torch
+pillow-heif
+psutil
+opencv-python-headless
+# Optional drag-and-drop support
+tkinterdnd2
+# Optional recycle-bin support
+send2trash
