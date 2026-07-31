@@ -22,6 +22,7 @@ FACE_COUNTS_FILENAME = "face_counts.json"
 CLASSIFIER_FILENAME = "classifier.pkl"
 CONFIG_OVERRIDE_FILENAME = "config_override.json"
 REGION_EMBEDDINGS_FILENAME = "region_embeddings.npz"
+VLM_VERDICTS_FILENAME = "vlm_verdicts.json"
 CLASSIFIER_CACHE_VERSION = 1
 LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +58,18 @@ def safe_stat(path: Path) -> os.stat_result | None:
         return None
 
 
+def content_hash_for_path(path: str | Path, chunk_size: int = 1024 * 1024) -> str | None:
+    """Hash file contents using the same SHA-1 identity as the scan cache."""
+    digest = hashlib.sha1()
+    try:
+        with Path(path).open("rb") as handle:
+            while chunk := handle.read(chunk_size):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 def _legacy_cache_key(path: Path) -> str | None:
     stat = safe_stat(path)
     if stat is None:
@@ -79,11 +92,13 @@ class FolderStore:
     config_override_path: Path = field(init=False)
     review_session_path: Path = field(init=False)
     region_embeddings_path: Path = field(init=False)
+    vlm_verdicts_path: Path = field(init=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
     _face_count_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _region_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
+    _vlm_cache: dict[str, dict[str, float]] | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.folder = self.folder.expanduser().resolve()
@@ -98,6 +113,40 @@ class FolderStore:
         self.config_override_path = self.cache_dir / CONFIG_OVERRIDE_FILENAME
         self.review_session_path = self.cache_dir / "review_session.json"
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
+        self.vlm_verdicts_path = self.cache_dir / VLM_VERDICTS_FILENAME
+
+    def _load_vlm_cache(self) -> dict[str, dict[str, float]]:
+        if self._vlm_cache is None:
+            if not self.vlm_verdicts_path.exists():
+                self._vlm_cache = {}
+            else:
+                try:
+                    payload = json.loads(self.vlm_verdicts_path.read_text(encoding="utf-8"))
+                    self._vlm_cache = {
+                        str(key): {str(axis): float(value) for axis, value in values.items()}
+                        for key, values in payload.items()
+                        if isinstance(values, dict)
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.warning("Ignoring unreadable VLM verdict cache %s: %s", self.vlm_verdicts_path, exc)
+                    self._vlm_cache = {}
+        return self._vlm_cache
+
+    @staticmethod
+    def vlm_cache_key(content_hash: str, model: str, prompt_version: str) -> str:
+        return f"{content_hash}|{model}|{prompt_version}"
+
+    def lookup_vlm_verdict(self, key: str) -> dict[str, float] | None:
+        value = self._load_vlm_cache().get(str(key))
+        return dict(value) if value is not None else None
+
+    def save_vlm_verdicts(self, entries: Mapping[str, Mapping[str, float]]) -> None:
+        if not entries:
+            return
+        cache = self._load_vlm_cache()
+        for key, value in entries.items():
+            cache[str(key)] = {str(axis): float(score) for axis, score in value.items()}
+        atomic_write_json(self.vlm_verdicts_path, cache)
 
     def load_labels(self) -> dict[str, int]:
         if self._labels_cache is None:
@@ -252,6 +301,9 @@ class FolderStore:
         if embedding is None:
             return None
         return embedding.astype(np.float32)
+
+    def content_hash_for_path(self, path: str | Path) -> str | None:
+        return content_hash_for_path(path)
 
     def lookup_face_count(self, content_hash: str) -> int | None:
         return self._load_face_count_cache().get(str(content_hash))
@@ -464,6 +516,7 @@ class FolderStore:
         self._embedding_cache = None
         self._face_count_cache = None
         self._region_cache = None
+        self._vlm_cache = None
 
     def build_scan_metadata(
         self,

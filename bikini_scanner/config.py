@@ -74,6 +74,15 @@ DEFAULT_MAX_FACES = 3
 DEFAULT_REFINE_MODEL = ""
 DEFAULT_REFINE_BAND = 0.18
 DEFAULT_REFINE_MAX_IMAGES = 400
+DEFAULT_VLM_ENABLED = False
+DEFAULT_VLM_BASE_URL = "http://localhost:11434/v1"
+DEFAULT_VLM_MODEL = "qwen2.5vl:7b"
+DEFAULT_VLM_API_KEY = ""
+DEFAULT_VLM_BAND = 0.18
+DEFAULT_VLM_MAX_IMAGES = 400
+DEFAULT_VLM_CONCURRENCY = 4
+DEFAULT_VLM_TIMEOUT = 60.0
+DEFAULT_VLM_WEIGHT = 0.65
 HIGH_ACCURACY_MODEL = "openai/clip-vit-large-patch14"
 # Accept/REJECT decisions are pooled across folders unless this is turned off.
 DEFAULT_GLOBAL_LEARNING = True
@@ -132,6 +141,15 @@ class ScannerConfig:
     refine_model: str = DEFAULT_REFINE_MODEL
     refine_band: float = DEFAULT_REFINE_BAND
     refine_max_images: int = DEFAULT_REFINE_MAX_IMAGES
+    vlm_enabled: bool = DEFAULT_VLM_ENABLED
+    vlm_base_url: str = DEFAULT_VLM_BASE_URL
+    vlm_model: str = DEFAULT_VLM_MODEL
+    vlm_api_key: str = DEFAULT_VLM_API_KEY
+    vlm_band: float = DEFAULT_VLM_BAND
+    vlm_max_images: int = DEFAULT_VLM_MAX_IMAGES
+    vlm_concurrency: int = DEFAULT_VLM_CONCURRENCY
+    vlm_timeout: float = DEFAULT_VLM_TIMEOUT
+    vlm_weight: float = DEFAULT_VLM_WEIGHT
     global_learning: bool = DEFAULT_GLOBAL_LEARNING
     detail_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_DETAIL_WEIGHTS))
 
@@ -199,6 +217,15 @@ class ScannerConfig:
         config.refine_max_images = _coerce_int(
             mapping.get("refine_max_images"), config.refine_max_images, minimum=0, maximum=1_000_000
         )
+        config.vlm_enabled = _coerce_bool(mapping.get("vlm_enabled"), config.vlm_enabled)
+        config.vlm_base_url = _coerce_str(mapping.get("vlm_base_url"), config.vlm_base_url)
+        config.vlm_model = _coerce_str(mapping.get("vlm_model"), config.vlm_model)
+        config.vlm_api_key = _coerce_str(mapping.get("vlm_api_key"), config.vlm_api_key)
+        config.vlm_band = _coerce_float(mapping.get("vlm_band"), config.vlm_band, 0.0, 1.0)
+        config.vlm_max_images = _coerce_int(mapping.get("vlm_max_images"), config.vlm_max_images, 0, 1_000_000)
+        config.vlm_concurrency = _coerce_int(mapping.get("vlm_concurrency"), config.vlm_concurrency, 1, 64)
+        config.vlm_timeout = _coerce_float(mapping.get("vlm_timeout"), config.vlm_timeout, 1.0, 600.0)
+        config.vlm_weight = _coerce_float(mapping.get("vlm_weight"), config.vlm_weight, 0.0, 1.0)
         config.global_learning = _coerce_bool(mapping.get("global_learning"), config.global_learning)
         config.detail_weights = _coerce_weights(mapping.get("detail_weights"), config.detail_weights)
         return config

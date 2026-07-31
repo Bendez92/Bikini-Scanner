@@ -19,6 +19,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
@@ -45,7 +46,10 @@ from bikini_scanner.config_profiles import BUILTIN_PROFILES, profile_config, pro
 from bikini_scanner.global_store import GlobalLearningStore  # noqa: E402
 from bikini_scanner.regions import plan_regions  # noqa: E402
 from bikini_scanner.scorer import BikiniScorer, bucketed_sampling, scan_and_score_folder  # noqa: E402
+from bikini_scanner.scorer import RefineResult, ScoreState, compute_vlm_scores  # noqa: E402
+from bikini_scanner.skin import skin_fraction  # noqa: E402
 from bikini_scanner.store import FolderStore, collect_image_paths  # noqa: E402
+from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, parse_axis_json  # noqa: E402
 from bikini_scanner.vision_analysis import FaceBox, detect_face_count  # noqa: E402
 
 IMAGE_COUNT = 8
@@ -142,6 +146,132 @@ class ScanPipeline(unittest.TestCase):
         record = payload["images"][0]
         for key in ("filename", "path", "score", "axis_scores", "matched", "cascade_stage"):
             self.assertIn(key, record)
+
+
+class VLMAdjudication(unittest.TestCase):
+    class Handler(BaseHTTPRequestHandler):
+        calls = 0
+        lock = threading.Lock()
+
+        def do_GET(self):
+            if self.path == "/v1/models":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"data":[]}')
+                return
+            self.send_error(404)
+
+        def do_POST(self):
+            if self.path != "/v1/chat/completions":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            with self.lock:
+                type(self).calls += 1
+            body = json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '```json\n{"bikini": 1.4, "child": 0.1, "adult": 0.9}\n```'
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    @classmethod
+    def setUpClass(cls):
+        cls.Handler.calls = 0
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), cls.Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.url = f"http://127.0.0.1:{cls.server.server_port}/v1"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join(timeout=2)
+
+    def test_parser_fences_missing_and_clamps(self):
+        values = parse_axis_json('```json\n{"bikini": 2, "child": -1}\n```')
+        self.assertEqual(values["bikini"], 1.0)
+        self.assertEqual(values["child"], 0.0)
+        self.assertNotIn("adult", values)
+        with self.assertRaises((ValueError, TypeError, json.JSONDecodeError)):
+            parse_axis_json("not JSON")
+
+    def test_skin_fraction_is_bounded(self):
+        for color in ((0, 0, 0), (255, 255, 255), (180, 120, 90)):
+            value = skin_fraction(Image.new("RGB", (300, 200), color))
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+
+    def test_concurrency_and_cancel(self):
+        client = VLMClient(self.url, "test", concurrency=2)
+        images = [[Image.new("RGB", (16, 16), "white")] for _ in range(3)]
+        progress = []
+        results = client.score_images(images, on_progress=lambda done, total: progress.append((done, total)))
+        self.assertEqual(len(results), 3)
+        self.assertTrue(progress)
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(VLMCancelled):
+            client.score_images(images, cancel_event=cancel)
+
+    def test_cache_hit_and_target_band(self):
+        class Backend:
+            image_embedding_dim = 2
+
+            def embed_texts(self, prompts):
+                return np.ones((len(prompts), 2), dtype=np.float32)
+
+        root = Path(tempfile.mkdtemp(prefix="vlm_test_"))
+        paths = []
+        for index in range(3):
+            path = root / f"{index}.jpg"
+            Image.new("RGB", (80, 80), (180, 120, 90)).save(path)
+            paths.append(str(path))
+        config = ScannerConfig(vlm_enabled=True, vlm_base_url=self.url, vlm_model="test", vlm_max_images=2)
+        scorer = BikiniScorer(Backend(), config)
+        state = ScoreState(
+            paths=paths,
+            embeddings=np.ones((3, 2), dtype=np.float32),
+            zero_shot_scores=np.array([0.34, 0.9, 0.36], dtype=np.float32),
+            scores=np.array([0.34, 0.9, 0.36], dtype=np.float32),
+            axis_scores={
+                "child": np.array([0.5, 0.5, 0.5], dtype=np.float32),
+                "adult": np.array([0.5, 0.5, 0.5], dtype=np.float32),
+            },
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.array([False, False, False]),
+        )
+        store = FolderStore(root)
+        before = self.Handler.calls
+        result = compute_vlm_scores(scorer, state, threshold=0.35, store=store)
+        self.assertIsInstance(result, RefineResult)
+        self.assertEqual(np.isfinite(result.scores).sum(), 2)
+        first_calls = self.Handler.calls - before
+        self.assertEqual(first_calls, 2)
+        compute_vlm_scores(scorer, state, threshold=0.35, store=store)
+        self.assertEqual(self.Handler.calls - before, first_calls)
+
+    def test_unreachable_probe_skips(self):
+        client = VLMClient("http://127.0.0.1:1/v1", "test", timeout=0.1)
+        self.assertFalse(client.probe())
 
 
 class AgeGate(unittest.TestCase):

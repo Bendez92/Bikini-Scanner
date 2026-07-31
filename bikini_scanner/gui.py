@@ -2474,6 +2474,12 @@ class BikiniScannerApp:
         female_threshold_var = StringVar(value=str(self.config.female_threshold))
         global_learning_var = BooleanVar(value=self.config.global_learning)
         refine_var = BooleanVar(value=bool(self.config.refine_model))
+        vlm_enabled_var = BooleanVar(value=self.config.vlm_enabled)
+        vlm_base_url_var = StringVar(value=self.config.vlm_base_url)
+        vlm_model_var = StringVar(value=self.config.vlm_model)
+        vlm_concurrency_var = StringVar(value=str(self.config.vlm_concurrency))
+        vlm_band_var = StringVar(value=str(self.config.vlm_band))
+        vlm_max_images_var = StringVar(value=str(self.config.vlm_max_images))
 
         def add_labeled_entry(row: int, label: str, variable: StringVar, width: int = 48, tip: str = "") -> ttk.Entry:
             caption = ttk.Label(form, text=label)
@@ -2765,8 +2771,57 @@ class BikiniScannerApp:
             "mistakes live, so the accuracy is worth it there. Costs a one-time ~1.7 GB "
             "download and adds minutes to a scan; the rest of the images are untouched.",
         )
+        add_check(
+            form,
+            24,
+            0,
+            "Use local vision-LLM adjudication",
+            vlm_enabled_var,
+            "Optional second opinion from a local Ollama or llama.cpp server. It only checks "
+            "borderline images and uncertain age calls, in parallel, so the usual CLIP scan "
+            "stays fast. The server must already be running.",
+        )
+        add_labeled_entry(
+            25,
+            "VLM server URL",
+            vlm_base_url_var,
+            width=36,
+            tip="OpenAI-compatible local endpoint, for example http://localhost:11434/v1. "
+            "The stage is skipped if it cannot reach this address.",
+        )
+        add_labeled_entry(
+            26,
+            "VLM model",
+            vlm_model_var,
+            width=36,
+            tip="Model name served by Ollama or llama.cpp, for example qwen2.5vl:7b.",
+        )
+        add_labeled_entry(
+            27,
+            "VLM concurrency",
+            vlm_concurrency_var,
+            width=18,
+            tip="How many local requests run at once. Higher is faster only when your server "
+            "has enough CPU/GPU memory; 4 is a sensible starting point.",
+        )
+        add_labeled_entry(
+            28,
+            "VLM borderline band",
+            vlm_band_var,
+            width=18,
+            tip="Only scores within this distance of the threshold are sent to the VLM, plus "
+            "uncertain age calls. Wider is more accurate but costs more requests.",
+        )
+        add_labeled_entry(
+            29,
+            "VLM maximum images",
+            vlm_max_images_var,
+            width=18,
+            tip="Hard cap on VLM requests per scan. Skin exposure is only used to prioritize "
+            "images inside the eligible band; it never excludes an eligible image by itself.",
+        )
         face_row = ttk.Frame(form)
-        face_row.grid(row=24, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        face_row.grid(row=30, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         face_status = ttk.Label(face_row, text=self._face_model_status())
         face_status.pack(side=LEFT)
         face_button = ttk.Button(
@@ -2784,9 +2839,9 @@ class BikiniScannerApp:
         )
         self._tooltip(face_status, "Whether face-anchored crops are available right now.")
 
-        ttk.Separator(form, orient="horizontal").grid(row=25, column=0, columnspan=2, sticky="ew", pady=(6, 6))
+        ttk.Separator(form, orient="horizontal").grid(row=31, column=0, columnspan=2, sticky="ew", pady=(6, 6))
         add_labeled_entry(
-            26,
+            32,
             "Thumbnail cache entries",
             thumbnail_cache_var,
             width=18,
@@ -2794,9 +2849,9 @@ class BikiniScannerApp:
             "and resizing smoother at the cost of RAM. Lower it if the app feels heavy.",
         )
         url_caption = ttk.Label(form, text="Update manifest URL (optional)")
-        url_caption.grid(row=27, column=0, sticky="w", pady=(0, 4))
+        url_caption.grid(row=33, column=0, sticky="w", pady=(0, 4))
         update_url_entry = ttk.Entry(form, textvariable=self.update_url_var, width=48)
-        update_url_entry.grid(row=27, column=1, sticky="ew", pady=(0, 8))
+        update_url_entry.grid(row=33, column=1, sticky="ew", pady=(0, 8))
         url_tip = (
             "Optional address of a JSON file listing the newest version, used by Help > Check "
             "for updates. Leave empty and the app never contacts anything for updates."
@@ -2805,7 +2860,7 @@ class BikiniScannerApp:
         self._tooltip(update_url_entry, url_tip)
 
         button_row = ttk.Frame(form)
-        button_row.grid(row=28, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        button_row.grid(row=34, column=0, columnspan=2, sticky="e", pady=(10, 0))
 
         def close_dialog() -> None:
             dialog.grab_release()
@@ -2855,11 +2910,34 @@ class BikiniScannerApp:
                 threshold = float(threshold_var.get().strip())
                 nsfw_threshold = float(nsfw_threshold_var.get().strip())
                 person_threshold = float(person_threshold_var.get().strip())
+                vlm_concurrency = int(vlm_concurrency_var.get().strip())
+                vlm_band = float(vlm_band_var.get().strip())
+                vlm_max_images = int(vlm_max_images_var.get().strip())
             except Exception:  # noqa: BLE001
                 messagebox.showerror(
                     "Invalid settings",
                     "Scale, weights, thresholds, and person/NSFW values must be numeric.",
                     parent=dialog,
+                )
+                return
+            if not 1 <= vlm_concurrency <= 64:
+                messagebox.showerror("Invalid settings", "VLM concurrency must be from 1 to 64.", parent=dialog)
+                return
+            if not 0.0 <= vlm_band <= 1.0:
+                messagebox.showerror("Invalid settings", "VLM band must be between 0 and 1.", parent=dialog)
+                return
+            if not 0 <= vlm_max_images <= 1_000_000:
+                messagebox.showerror(
+                    "Invalid settings",
+                    "VLM maximum images must be from 0 to 1,000,000.",
+                    parent=dialog,
+                )
+                return
+            vlm_base_url = vlm_base_url_var.get().strip()
+            vlm_model = vlm_model_var.get().strip()
+            if bool(vlm_enabled_var.get()) and (not vlm_base_url or not vlm_model):
+                messagebox.showerror(
+                    "Invalid settings", "VLM server URL and model are required when enabled.", parent=dialog
                 )
                 return
             if zero_shot_scale <= 0:
@@ -2939,6 +3017,14 @@ class BikiniScannerApp:
             rescan_needed = deep_scan != self.config.deep_scan or (
                 HIGH_ACCURACY_MODEL if bool(refine_var.get()) else ""
             ) != self.config.refine_model
+            vlm_changed = (
+                bool(vlm_enabled_var.get()) != self.config.vlm_enabled
+                or vlm_base_url != self.config.vlm_base_url
+                or vlm_model != self.config.vlm_model
+                or vlm_concurrency != self.config.vlm_concurrency
+                or vlm_band != self.config.vlm_band
+                or vlm_max_images != self.config.vlm_max_images
+            )
 
             self.config.backend = backend
             self.config.model_name = model_name
@@ -2965,6 +3051,12 @@ class BikiniScannerApp:
             self.config.female_threshold = female_threshold
             self.config.global_learning = bool(global_learning_var.get())
             self.config.refine_model = HIGH_ACCURACY_MODEL if bool(refine_var.get()) else ""
+            self.config.vlm_enabled = bool(vlm_enabled_var.get())
+            self.config.vlm_base_url = vlm_base_url
+            self.config.vlm_model = vlm_model
+            self.config.vlm_concurrency = vlm_concurrency
+            self.config.vlm_band = vlm_band
+            self.config.vlm_max_images = vlm_max_images
             self.thumbnail_cache_size_var.set(thumbnail_cache_size)
             self._trim_thumbnail_cache()
             if not self.folder_override_active:
@@ -2985,7 +3077,7 @@ class BikiniScannerApp:
                 if self.config.preload_backend:
                     self._backend_preload_started = False
                     self._maybe_preload_backend()
-            elif rescan_needed:
+            elif rescan_needed or vlm_changed:
                 # Deep scan and refine decide what gets embedded, so a rescore of the
                 # cached region table cannot apply them.
                 self.scorer = None

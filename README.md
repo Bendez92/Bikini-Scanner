@@ -109,6 +109,28 @@ signatures still work.
 Labels whose files no longer exist are pruned automatically, and
 **Tools → Reset cross-folder learning** clears the pool without touching per-folder labels.
 
+## Optional local vision-LLM adjudication
+
+CLIP remains the fast first pass. An optional local vision-language model can then
+judge only the small band of images near the threshold, plus uncertain age calls.
+Requests run in parallel, include the full frame and the best body crop, and are
+cached by image hash, model, and prompt version. A cheap skin-colour estimate only
+prioritises images within the eligible band; it never excludes an image.
+
+The stage is off by default and needs an OpenAI-compatible local server. Ollama is
+the simplest option:
+
+```bash
+ollama pull qwen2.5vl:7b
+ollama serve
+```
+
+Enable **Use local vision-LLM adjudication** in Settings, leave the server URL at
+`http://localhost:11434/v1`, and choose the model served by Ollama. The same API
+works with `llama-server` from llama.cpp. This improves borderline accuracy at the
+cost of extra local inference; an unreachable server is detected once and the
+ordinary CLIP result is retained.
+
 ## Cache and labels
 
 Each scanned folder stores:
