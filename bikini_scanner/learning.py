@@ -185,7 +185,7 @@ def _calibrate(estimator: Any, features: np.ndarray, labels: np.ndarray) -> Any:
         return estimator
 
 
-def fit(features: np.ndarray, labels: np.ndarray) -> LearningOutcome:
+def fit(features: np.ndarray, labels: np.ndarray, max_weight: float = 0.85) -> LearningOutcome:
     """Train from labelled feature vectors. Never raises: a failure means no learning."""
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int64)
@@ -215,15 +215,16 @@ def fit(features: np.ndarray, labels: np.ndarray) -> LearningOutcome:
             LOGGER.exception("Classifier training failed; keeping the prototype model")
             outcome.classifier = None
 
-    outcome.weight = _blend_weight(outcome)
+    outcome.weight = _blend_weight(outcome, max_weight=max_weight)
     return outcome
 
 
-def _blend_weight(outcome: LearningOutcome) -> float:
-    """How much of the final score the learned model earns, in 0..0.85.
+def _blend_weight(outcome: LearningOutcome, max_weight: float = 0.85) -> float:
+    """How much of the final score the learned model earns, in 0..max_weight.
 
     Driven by measured separability (AUC) and volume of evidence. A model that cannot
-    beat a coin flip on held-out data gets no influence at all.
+    beat a coin flip on held-out data gets no influence at all. Capped below 1.0 so
+    zero-shot prompts always retain a voice.
     """
     if not outcome.trained:
         return 0.0
@@ -233,8 +234,7 @@ def _blend_weight(outcome: LearningOutcome) -> float:
         quality = 0.5 if outcome.classifier is not None else 0.35
     else:
         quality = float(np.clip((outcome.cv_auc - 0.5) * 2.0, 0.0, 1.0))
-    # Cap below 1.0 so zero-shot prompts always retain a voice.
-    return float(np.clip(quality * volume, 0.0, 1.0) * 0.85)
+    return float(np.clip(quality * volume, 0.0, 1.0) * float(max_weight))
 
 
 def blend(zero_shot: np.ndarray, learned: np.ndarray | None, weight: float) -> np.ndarray:

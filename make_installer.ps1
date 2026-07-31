@@ -47,7 +47,10 @@ function Invoke-SignFile($Path) {
         Write-Warning "signtool not found; leaving $(Split-Path -Leaf $Path) unsigned."
         return
     }
-    & $signtool.Source sign /f $env:BIKINI_SIGN_PFX /p $env:BIKINI_SIGN_PASS /fd SHA256 $Path
+    # /tr timestamps the signature so it stays valid after the certificate expires.
+    # Without it, a signed installer becomes untrusted the moment the cert lapses,
+    # even if it was signed while the cert was valid.
+    & $signtool.Source sign /f $env:BIKINI_SIGN_PFX /p $env:BIKINI_SIGN_PASS /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 $Path
     if ($LASTEXITCODE -ne 0) { throw "signtool failed for $Path" }
 }
 
@@ -124,7 +127,12 @@ if (-not $Iscc) {
 }
 
 Write-Step "Compiling installer"
-& $Iscc "installer.iss"
+# Read the version from the single source of truth so the installer and the app
+# can never drift. installer.iss has a fallback #define for standalone ISCC runs.
+$Version = & $VenvPython -c "from bikini_scanner.__version__ import __version__; print(__version__)"
+if ($LASTEXITCODE -ne 0 -or -not $Version) { throw "Could not read __version__ from bikini_scanner" }
+$Version = $Version.Trim()
+& $Iscc "/DMyAppVersion=$Version" "installer.iss"
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
 Invoke-SignFile $SetupExe
 

@@ -68,6 +68,12 @@ datas = [
     *send2trash_datas,
     *torch_datas,
 ]
+# Conditionally bundle exported ONNX graphs so the clip-onnx backend works in a
+# packaged build without a manual copy. Only included when the models have been
+# exported (python -m scripts.export_onnx); absent models don't break the build.
+_onnx_model_dir = ROOT / "models"
+if (_onnx_model_dir / "clip_vision.onnx").is_file() and (_onnx_model_dir / "clip_text.onnx").is_file():
+    datas.append((str(_onnx_model_dir), "models"))
 binaries = [
     *pillow_bins,
     *pillow_heif_bins,

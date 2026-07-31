@@ -170,6 +170,8 @@ def combine_detail(
     axis_scores: Mapping[str, np.ndarray],
     weights: Mapping[str, float],
     axes: Sequence[str] = DETAIL_AXES,
+    strongest_weight: float = 0.65,
+    average_weight: float = 0.35,
 ) -> np.ndarray:
     """Combine the detail axes into one score.
 
@@ -177,6 +179,12 @@ def combine_detail(
     signals count. Measured against real labels this beat both a plain max and a soft
     OR: the max alone throws away agreement between axes, and the soft OR saturates -
     once several axes are confident everything ties at 1.0 and the ranking collapses.
+
+    A corroboration floor prevents a single weak axis from carrying an image to a
+    match: if fewer than 2 axes show evidence above 0.15 AND the strongest is below
+    0.55, the score is dampened by half. This stops the crop-top false positive
+    (midriff fires alone at ~0.4, no other axis corroborates) without affecting
+    genuine matches where multiple axes agree.
     """
     columns: list[np.ndarray] = []
     for axis in axes:
@@ -192,7 +200,12 @@ def combine_detail(
     stack = np.vstack(columns)
     strongest = stack.max(axis=0)
     average = stack.mean(axis=0)
-    return (0.65 * strongest + 0.35 * average).astype(np.float32)
+    raw = (strongest_weight * strongest + average_weight * average).astype(np.float32)
+    # Corroboration floor: dampen images where only one axis fires weakly.
+    corroborated = (stack >= 0.15).sum(axis=0)
+    uncorroborated_weak = (corroborated < 2) & (strongest < 0.55)
+    raw = np.where(uncorroborated_weak, raw * 0.5, raw)
+    return raw.astype(np.float32)
 
 
 def combine_detail_rows(
@@ -264,7 +277,12 @@ def evaluate(
         else female >= float(config.female_threshold)
     )
 
-    detail = combine_detail(aggregated, config.detail_weights)
+    detail = combine_detail(
+        aggregated,
+        config.detail_weights,
+        strongest_weight=float(config.detail_strongest_weight),
+        average_weight=float(config.detail_average_weight),
+    )
     if detail.size == 0:
         detail = np.zeros((count,), dtype=np.float32)
 
@@ -274,14 +292,14 @@ def evaluate(
     if config.exclude_minors:
         threshold = float(config.minor_threshold)
         # Absolute child evidence that also out-argues the adult reading.
-        looks_minor = (child >= threshold) & (child > adult + 0.10)
+        looks_minor = (child >= threshold) & (child > adult + float(config.child_adult_margin))
         # Overwhelming on its own, whatever the adult axis says.
-        strongly_minor = child >= 0.75
+        strongly_minor = child >= float(config.strongly_minor_threshold)
         # With a real face crop the age read is far more reliable, so a smaller margin
         # is enough to act on.
-        reads_younger = has_face & (child > adult + 0.05) & (child >= threshold * 0.4)
+        reads_younger = has_face & (child > adult + float(config.face_anchored_margin)) & (child >= threshold * 0.4)
         # Positive adult evidence is required before surfacing anything as a match.
-        weak_adult = has_face & (detail >= 0.35) & (adult < float(config.min_adult_confidence))
+        weak_adult = has_face & (detail >= float(config.weak_adult_detail)) & (adult < float(config.min_adult_confidence))
         age_fail = looks_minor | strongly_minor | reads_younger | weak_adult
     else:
         age_fail = np.zeros((count,), dtype=bool)

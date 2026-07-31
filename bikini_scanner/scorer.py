@@ -650,7 +650,11 @@ class BikiniScorer:
         if not train_rows:
             self.learning_outcome = learning.LearningOutcome()
             return self.learning_outcome
-        outcome = learning.fit(np.vstack(train_rows).astype(np.float32), np.asarray(train_labels, dtype=np.int64))
+        outcome = learning.fit(
+            np.vstack(train_rows).astype(np.float32),
+            np.asarray(train_labels, dtype=np.int64),
+            max_weight=float(self.config.max_learning_weight),
+        )
         self.learning_outcome = outcome
         self.classifier = outcome.classifier
         LOGGER.info("Learning: %s", outcome.summary())
@@ -728,9 +732,11 @@ class BikiniScorer:
         if refine is not None and refine.scores.shape[0] == count:
             refined_rows = np.isfinite(refine.scores)
             if refined_rows.any():
-                # The larger model gets the louder vote, but not the only one.
+                # The larger model gets the louder vote, but not the only one. The
+                # legacy CLIP refine path uses refine_weight (default 0.65); the VLM
+                # adjudication path uses vlm_weight. They are separate knobs now.
                 zero_shot = zero_shot.copy()
-                refine_weight = float(self.config.vlm_weight if self.config.vlm_enabled else 0.65)
+                refine_weight = float(self.config.refine_weight)
                 refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
                     (1.0 - refine_weight) * zero_shot[refined_rows]
@@ -1097,8 +1103,13 @@ def compute_vlm_scores(
     pending: dict[str, dict[str, float]] = {}
     uncached_images: list[list[Image.Image]] = []
     uncached_positions: list[int] = []
+    # content_hash_for_path reads and SHA-1s the whole file. It was being called twice
+    # per candidate (once for the cache lookup, once for the save), which doubles the
+    # disk I/O for every VLM judgment. Compute it once per candidate and reuse it.
+    position_hashes: dict[int, str | None] = {}
     for position, (_, index, views) in enumerate(ranked):
         content_hash = store.content_hash_for_path(state.paths[index]) if store is not None else None
+        position_hashes[position] = content_hash
         if content_hash and store is not None:
             key = store.vlm_cache_key(content_hash, scorer.config.vlm_model, VLM_PROMPT_VERSION)
             verdict = store.lookup_vlm_verdict(key)
@@ -1116,8 +1127,7 @@ def compute_vlm_scores(
             if response is None:
                 continue
             cached[position] = response
-            _, index, _ = ranked[position]
-            content_hash = store.content_hash_for_path(state.paths[index]) if store is not None else None
+            content_hash = position_hashes.get(position)
             if content_hash and store is not None:
                 key = store.vlm_cache_key(content_hash, scorer.config.vlm_model, VLM_PROMPT_VERSION)
                 pending[key] = response

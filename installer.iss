@@ -3,7 +3,12 @@
 ; Build end-to-end with make_installer.ps1; this script alone does not run PyInstaller.
 
 #define MyAppName "Bikini Scanner"
-#define MyAppVersion "1.3.0"
+; MyAppVersion can be overridden from the build script (make_installer.ps1 passes
+; /DMyAppVersion=... so the installer and __version__.py never drift). This fallback
+; is used only when ISCC is run standalone without that define.
+#ifndef MyAppVersion
+  #define MyAppVersion "1.3.0"
+#endif
 #define MyAppPublisher "Bikini Scanner"
 #define MyAppExeName "BikiniScanner.exe"
 #define MyAppSource "dist\BikiniScannerApp"

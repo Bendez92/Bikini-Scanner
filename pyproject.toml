@@ -18,18 +18,18 @@ dependencies = [
     "pillow-heif",
     "psutil",
     "opencv-python-headless",
-]
-
-[project.optional-dependencies]
-# Drag-and-drop onto the window, and recycle-bin deletes instead of unlink.
-extras = [
+    # Drag-and-drop onto the window, and recycle-bin deletes instead of unlink.
+    # Listed as required because the GUI depends on both; requirements.txt has
+    # always installed them unconditionally.
     "tkinterdnd2",
     "send2trash",
 ]
+
+[project.optional-dependencies]
 # ONNX Runtime backend; see build_onnx.bat and scripts/export_onnx.py.
 onnx = [
-    "onnx==1.17.0",
-    "onnxruntime==1.19.2",
+    "onnx==1.22.0",
+    "onnxruntime==1.28.0",
     "onnxscript==0.7.1",
 ]
 

@@ -1,13 +1,16 @@
 --index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://pypi.org/simple
-numpy
-Pillow
-transformers
-torch
-pillow-heif
-psutil
-opencv-python-headless
-# Optional drag-and-drop support
-tkinterdnd2
-# Optional recycle-bin support
-send2trash
+# Lower bounds prevent a fresh install from resolving to an incompatible major
+# version (e.g. transformers 3.x or numpy 1.x). The exact known-good set is
+# pinned in requirements.lock.txt; this file is what users install from.
+numpy>=2.0,<3
+Pillow>=10.0
+transformers>=4.40,<6
+torch>=2.0
+pillow-heif>=1.0
+psutil>=5.0
+opencv-python-headless>=4.10
+# Optional drag-and-drop support (unconditional here because the GUI depends on it)
+tkinterdnd2>=0.3
+# Optional recycle-bin support (unconditional here because the GUI depends on it)
+send2trash>=1.8

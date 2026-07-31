@@ -99,6 +99,7 @@ class ResultCard:
     label_label: ttk.Label
     details_label: ttk.Label
     image_ref: ImageTk.PhotoImage
+    score: float = 0.0
 
 
 class BikiniScannerApp:
@@ -238,6 +239,23 @@ class BikiniScannerApp:
         dialog.title(title)
         dialog.transient(self.root)
         dialog.grab_set()
+
+        # Every modal grabs pointer events. If a dialog is closed while an exception is
+        # in flight (or via a bare dialog.destroy button that bypasses a custom close
+        # handler), the grab can be left active and the whole app stays modal-locked.
+        # Attach a safe close to every modal and wire WM_DELETE_WINDOW to it; individual
+        # dialogs that already define their own close handler override this protocol and
+        # are unaffected.
+        def _safe_close() -> None:
+            try:
+                dialog.grab_release()
+            except Exception:  # noqa: BLE001
+                pass
+            dialog.destroy()
+
+        dialog._safe_close = _safe_close  # type: ignore[attr-defined]
+        dialog.protocol("WM_DELETE_WINDOW", _safe_close)
+
         if geometry:
             dialog.geometry(geometry)
         if resizable is not None:
@@ -307,10 +325,10 @@ class BikiniScannerApp:
         preview_buttons = ttk.Frame(self.preview_frame)
         preview_buttons.pack(side=TOP, pady=(6, 0))
         ttk.Button(
-            preview_buttons, text=_("Accept"), width=14, command=lambda: self.label_focused_card(1)
+            preview_buttons, text=_("Accept (A)"), width=14, command=lambda: self.label_focused_card(1)
         ).pack(side=LEFT, padx=(0, 8))
         ttk.Button(
-            preview_buttons, text=_("REJECT"), width=14, command=lambda: self.label_focused_card(0)
+            preview_buttons, text=_("REJECT (D)"), width=14, command=lambda: self.label_focused_card(0)
         ).pack(side=LEFT)
         self.preview_image_label.bind(
             "<Double-Button-1>",
@@ -359,7 +377,7 @@ class BikiniScannerApp:
         self._tooltip(self.run_button, "Scan this folder for bikini, cleavage and midriff photos")
         self.stop_scan_button = ttk.Button(bar, text=_("Stop"), command=self.cancel_scan, state="disabled", width=7)
         self.stop_scan_button.pack(side=LEFT, padx=6)
-        self.update_button = ttk.Button(bar, text=_("Retrain"), command=self.update_algorithm)
+        self.update_button = ttk.Button(bar, text=_("Update rankings"), command=self.update_algorithm)
         self.update_button.pack(side=LEFT, padx=(0, 6))
         self._tooltip(self.update_button, "Re-rank using everything you have accepted and rejected so far")
         ttk.Label(bar, textvariable=self.override_var, style="Muted.TLabel").pack(side=LEFT, padx=(4, 0))
@@ -512,6 +530,11 @@ class BikiniScannerApp:
         status_row.pack(side=TOP, fill="x")
         self._status_row = status_row
         ttk.Label(status_row, textvariable=self.status_var, style="Toolbar.TLabel").pack(side=LEFT, fill="x", expand=True)
+        # VLM badge: visible only when VLM adjudication is enabled, so the user knows
+        # the scan includes a second-opinion stage.
+        self.vlm_badge = ttk.Label(status_row, text="VLM", style="Accent.TLabel", padding=(4, 0))
+        self.vlm_badge.pack(side=LEFT, padx=(6, 0))
+        self._refresh_vlm_badge()
         ttk.Label(status_row, textvariable=self.loading_var, style="Toolbar.TLabel").pack(side=LEFT, padx=(10, 0))
         self.hardware_label = ttk.Label(status_row, textvariable=self.hardware_var, style="Muted.TLabel")
         if psutil is not None:
@@ -579,6 +602,18 @@ class BikiniScannerApp:
             self.scroll.pack_forget()
             self.empty_state.pack(fill=BOTH, expand=True)
 
+    def _refresh_vlm_badge(self) -> None:
+        """Show or hide the VLM badge in the status bar based on config."""
+        if not hasattr(self, "vlm_badge"):
+            return
+        try:
+            if self.config.vlm_enabled:
+                self.vlm_badge.pack(side=LEFT, padx=(6, 0))
+            else:
+                self.vlm_badge.pack_forget()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _show_progress(self, visible: bool) -> None:
         """The progress bar only occupies space while something is running."""
         row = getattr(self, "progress_row", None)
@@ -637,6 +672,9 @@ class BikiniScannerApp:
             if button is None:
                 continue
             label = _("Filters & view") if name == "filters" else _("Queue")
+            # Show a dot when filters are active so the user knows something is hidden.
+            if name == "filters" and self._filters_active():
+                label = f"{label} ●"
             try:
                 button.configure(text=f"{label} ▴" if self._panel_open.get(name) else f"{label} ▾")
             except Exception:  # noqa: BLE001
@@ -940,6 +978,23 @@ class BikiniScannerApp:
             )
         style.configure("Card.TFrame", background=palette["panel"])
         style.configure("FocusedCard.TFrame", background=palette["select_bg"])
+        # Match cards get an accent border so matches stand out from non-matches at a glance.
+        style.configure(
+            "MatchCard.TFrame",
+            background=palette["panel"],
+            bordercolor=palette["accent"],
+            relief="solid",
+            borderwidth=2,
+        )
+        style.configure(
+            "FocusedMatchCard.TFrame",
+            background=palette["select_bg"],
+            bordercolor=palette["accent"],
+            relief="solid",
+            borderwidth=2,
+        )
+        # VLM badge in the status bar: accent background so it reads as an active feature.
+        style.configure("Accent.TLabel", background=palette["accent"], foreground=palette["accent_fg"])
         # Chrome surfaces: toolbars sit a step above the app background.
         style.configure("Toolbar.TFrame", background=palette["toolbar"])
         style.configure("Toolbar.TLabel", background=palette["toolbar"], foreground=palette["fg"])
@@ -1326,10 +1381,24 @@ class BikiniScannerApp:
         if not data:
             return "break"
         paths = self._parse_dropped_paths(data)
-        for path in paths:
-            if Path(path).is_dir():
-                self.open_folder(path, scan=True)
-                break
+        # A directory drop wins outright: scan that folder. When the user drops image
+        # files instead (e.g. straight from a file manager), open the folder that
+        # contains them so the scan picks them up. Without this the drop did nothing
+        # and gave no feedback, which read as "drag-and-drop is broken".
+        folders = [path for path in paths if Path(path).is_dir()]
+        if folders:
+            self.open_folder(folders[0], scan=True)
+            return "break"
+        image_suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
+        image_paths = [
+            path
+            for path in paths
+            if Path(path).is_file() and Path(path).suffix.lower() in image_suffixes
+        ]
+        if image_paths:
+            self.open_folder(str(Path(image_paths[0]).parent), scan=True)
+            return "break"
+        self.status_var.set("Drop a folder or image files to scan them.")
         return "break"
 
     @staticmethod
@@ -1776,11 +1845,25 @@ class BikiniScannerApp:
         if self._scan_cancel_event is not None:
             self._scan_cancel_event.set()
         self.queue_active = False
-        if self._watch_after_id is not None:
-            try:
-                self.root.after_cancel(self._watch_after_id)
-            except Exception:  # noqa: BLE001
-                pass
+        # Every scheduled after() callback must be cancelled before destroy(), or it
+        # fires into a half-torn-down interpreter and raises TclError. _watch_after_id
+        # was the only one cancelled here for a long time; the hardware-status,
+        # threshold-refresh, and preview-resize timers leaked and could crash on exit.
+        for after_id in (
+            self._watch_after_id,
+            self._preview_resize_after_id,
+            self._threshold_refresh_after_id,
+            self._hardware_after_id,
+        ):
+            if after_id is not None:
+                try:
+                    self.root.after_cancel(after_id)
+                except Exception:  # noqa: BLE001
+                    pass
+        self._watch_after_id = None
+        self._preview_resize_after_id = None
+        self._threshold_refresh_after_id = None
+        self._hardware_after_id = None
         self._save_review_session()
         self._save_user_prefs()
         self.root.destroy()
@@ -2351,9 +2434,8 @@ class BikiniScannerApp:
 
         button_row = ttk.Frame(outer)
         button_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        ttk.Button(button_row, text="Close", command=dialog.destroy).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(button_row, text="Close", command=dialog._safe_close).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(button_row, text="Test", command=run_test).pack(side=RIGHT)
-        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         run_test()
 
     def reset_global_learning(self) -> None:
@@ -2526,13 +2608,23 @@ class BikiniScannerApp:
             self._tooltip(combo, tip)
             return combo
 
+        def add_section(row: int, title: str) -> None:
+            """A separator plus a bold header to break up the settings form."""
+            ttk.Separator(form, orient="horizontal").grid(
+                row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4)
+            )
+            ttk.Label(form, text=title, font=("TkDefaultFont", 10, "bold")).grid(
+                row=row + 1, column=0, sticky="w", pady=(0, 4)
+            )
+
+        add_section(0, "Scoring prompts")
         prompt_caption = ttk.Label(form, text="Positive prompts")
-        prompt_caption.grid(row=0, column=0, sticky="w")
+        prompt_caption.grid(row=2, column=0, sticky="w")
         ttk.Label(form, text="Primary scoring uses the canonical Bikini axis defaults.", wraplength=360).grid(
-            row=0, column=1, sticky="e"
+            row=2, column=1, sticky="e"
         )
         positive_text = Text(form, width=58, height=6, wrap="word")
-        positive_text.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        positive_text.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         positive_text.insert("1.0", "\n".join(self.config.positive_prompts))
         positive_tip = (
             "One phrase per line describing what you WANT found. Each is compared against "
@@ -2544,9 +2636,9 @@ class BikiniScannerApp:
         self._tooltip(positive_text, positive_tip)
 
         negative_caption = ttk.Label(form, text="Negative prompts")
-        negative_caption.grid(row=2, column=0, sticky="w")
+        negative_caption.grid(row=4, column=0, sticky="w")
         negative_text = Text(form, width=58, height=6, wrap="word")
-        negative_text.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        negative_text.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         negative_text.insert("1.0", "\n".join(self.config.negative_prompts))
         negative_tip = (
             "One phrase per line for what you do NOT want. A score is positive evidence "
@@ -2556,8 +2648,9 @@ class BikiniScannerApp:
         self._tooltip(negative_caption, negative_tip)
         self._tooltip(negative_text, negative_tip)
 
+        add_section(6, "Model & Hardware")
         backend_combo = add_combo(
-            4,
+            8,
             "Backend",
             backend_var,
             ("clip-torch", "clip-onnx"),
@@ -2566,7 +2659,7 @@ class BikiniScannerApp:
             "this requires a new scan.",
         )
         add_labeled_entry(
-            5,
+            9,
             "Model name",
             model_var,
             tip="The Hugging Face model used for scoring. openai/clip-vit-base-patch32 is the "
@@ -2575,7 +2668,7 @@ class BikiniScannerApp:
             "image. Changing this invalidates cached embeddings and needs a fresh scan.",
         )
         device_combo = add_combo(
-            6,
+            10,
             "Device",
             device_var,
             ("auto", "cpu", "cuda"),
@@ -2583,7 +2676,7 @@ class BikiniScannerApp:
             "back to the CPU otherwise. Force cpu if a GPU driver misbehaves.",
         )
         precision_combo = add_combo(
-            7,
+            11,
             "Precision",
             precision_var,
             ("auto", "fp32", "fp16"),
@@ -2592,7 +2685,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            8,
+            12,
             0,
             "Quantize CPU (int8)",
             quantize_cpu_var,
@@ -2601,7 +2694,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            8,
+            12,
             1,
             "Preload backend on startup",
             preload_backend_var,
@@ -2610,7 +2703,7 @@ class BikiniScannerApp:
             "do not mind waiting at the first scan instead.",
         )
         add_labeled_entry(
-            9,
+            13,
             "Batch size",
             batch_var,
             width=18,
@@ -2618,7 +2711,7 @@ class BikiniScannerApp:
             "memory. 16 suits most machines; drop to 4-8 if scanning runs out of memory.",
         )
         add_labeled_entry(
-            10,
+            14,
             "Zero-shot scale",
             scale_var,
             width=18,
@@ -2628,7 +2721,7 @@ class BikiniScannerApp:
             "unless you are deliberately recalibrating.",
         )
         add_labeled_entry(
-            11,
+            15,
             "Classifier weight",
             classifier_weight_var,
             width=18,
@@ -2637,15 +2730,16 @@ class BikiniScannerApp:
             "learned from your Accept/REJECT decisions, based on its own measured accuracy.",
         )
         add_labeled_entry(
-            12,
+            16,
             "Zero-shot weight",
             zero_shot_weight_var,
             width=18,
             tip="The other half of the legacy blend: how much the prompt-only score counts. "
             "Also unused by the cascade pipeline.",
         )
+        add_section(17, "Detection")
         add_labeled_entry(
-            13,
+            19,
             "Threshold",
             threshold_var,
             width=18,
@@ -2654,7 +2748,7 @@ class BikiniScannerApp:
             "matches. 0.35 suits the current scoring.",
         )
         nsfw_combo = add_combo(
-            14,
+            20,
             "NSFW mode",
             nsfw_mode_var,
             ("include", "exclude", "only"),
@@ -2662,7 +2756,7 @@ class BikiniScannerApp:
             "exclude drops them from results, only shows nothing else.",
         )
         add_labeled_entry(
-            15,
+            21,
             "NSFW threshold",
             nsfw_threshold_var,
             width=18,
@@ -2670,7 +2764,7 @@ class BikiniScannerApp:
             "NSFW mode above. Lower catches more but misjudges more.",
         )
         add_labeled_entry(
-            16,
+            22,
             "Person threshold",
             person_threshold_var,
             width=18,
@@ -2679,7 +2773,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            17,
+            23,
             0,
             "Require person",
             require_person_var,
@@ -2689,7 +2783,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            17,
+            23,
             1,
             "Enable face detection",
             enable_face_detection_var,
@@ -2697,12 +2791,9 @@ class BikiniScannerApp:
             "The deep pass already detects faces for candidate images, so this mainly adds a "
             "face count to the details line.",
         )
-        ttk.Separator(form, orient="horizontal").grid(row=18, column=0, columnspan=2, sticky="ew", pady=(6, 6))
-        ttk.Label(form, text="Detection pipeline", font=("TkDefaultFont", 10, "bold")).grid(
-            row=19, column=0, sticky="w", pady=(0, 4)
-        )
+        add_section(24, "Detection pipeline")
         deep_combo = add_combo(
-            20,
+            26,
             "Deep scan (body-region crops)",
             deep_scan_var,
             ("candidates", "always", "off"),
@@ -2715,7 +2806,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            21,
+            27,
             0,
             "Exclude images that may show a minor",
             exclude_minors_var,
@@ -2724,7 +2815,7 @@ class BikiniScannerApp:
             "Deliberately errs toward excluding.",
         )
         add_inline_entry(
-            21,
+            27,
             "Minor sensitivity (lower = stricter)",
             minor_threshold_var,
             tip="How much child-like evidence triggers the age exclusion to the left. LOWER IS "
@@ -2734,7 +2825,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            22,
+            28,
             0,
             "Prefer female subjects",
             require_female_var,
@@ -2742,7 +2833,7 @@ class BikiniScannerApp:
             "it discards nothing unless you also raise the cut-off to the right.",
         )
         add_inline_entry(
-            22,
+            28,
             "Female cut-off (0 = rank only)",
             female_threshold_var,
             tip="Leave at 0 to only re-order results. Above 0 it becomes a hard filter that "
@@ -2752,7 +2843,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            23,
+            29,
             0,
             "Learn across all folders",
             global_learning_var,
@@ -2762,7 +2853,7 @@ class BikiniScannerApp:
         )
         add_check(
             form,
-            23,
+            29,
             1,
             f"High-accuracy re-check of borderline images ({HIGH_ACCURACY_MODEL.split('/')[-1]}, ~1.7 GB download)",
             refine_var,
@@ -2771,9 +2862,10 @@ class BikiniScannerApp:
             "mistakes live, so the accuracy is worth it there. Costs a one-time ~1.7 GB "
             "download and adds minutes to a scan; the rest of the images are untouched.",
         )
+        add_section(30, "VLM adjudication")
         add_check(
             form,
-            24,
+            32,
             0,
             "Use local vision-LLM adjudication",
             vlm_enabled_var,
@@ -2782,7 +2874,7 @@ class BikiniScannerApp:
             "stays fast. The server must already be running.",
         )
         add_labeled_entry(
-            25,
+            33,
             "VLM server URL",
             vlm_base_url_var,
             width=36,
@@ -2790,14 +2882,14 @@ class BikiniScannerApp:
             "The stage is skipped if it cannot reach this address.",
         )
         add_labeled_entry(
-            26,
+            34,
             "VLM model",
             vlm_model_var,
             width=36,
             tip="Model name served by Ollama or llama.cpp, for example qwen2.5vl:7b.",
         )
         add_labeled_entry(
-            27,
+            35,
             "VLM concurrency",
             vlm_concurrency_var,
             width=18,
@@ -2805,7 +2897,7 @@ class BikiniScannerApp:
             "has enough CPU/GPU memory; 4 is a sensible starting point.",
         )
         add_labeled_entry(
-            28,
+            36,
             "VLM borderline band",
             vlm_band_var,
             width=18,
@@ -2813,7 +2905,7 @@ class BikiniScannerApp:
             "uncertain age calls. Wider is more accurate but costs more requests.",
         )
         add_labeled_entry(
-            29,
+            37,
             "VLM maximum images",
             vlm_max_images_var,
             width=18,
@@ -2821,7 +2913,7 @@ class BikiniScannerApp:
             "images inside the eligible band; it never excludes an eligible image by itself.",
         )
         face_row = ttk.Frame(form)
-        face_row.grid(row=30, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        face_row.grid(row=38, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         face_status = ttk.Label(face_row, text=self._face_model_status())
         face_status.pack(side=LEFT)
         face_button = ttk.Button(
@@ -2839,9 +2931,9 @@ class BikiniScannerApp:
         )
         self._tooltip(face_status, "Whether face-anchored crops are available right now.")
 
-        ttk.Separator(form, orient="horizontal").grid(row=31, column=0, columnspan=2, sticky="ew", pady=(6, 6))
+        add_section(39, "Advanced")
         add_labeled_entry(
-            32,
+            41,
             "Thumbnail cache entries",
             thumbnail_cache_var,
             width=18,
@@ -2849,9 +2941,9 @@ class BikiniScannerApp:
             "and resizing smoother at the cost of RAM. Lower it if the app feels heavy.",
         )
         url_caption = ttk.Label(form, text="Update manifest URL (optional)")
-        url_caption.grid(row=33, column=0, sticky="w", pady=(0, 4))
+        url_caption.grid(row=42, column=0, sticky="w", pady=(0, 4))
         update_url_entry = ttk.Entry(form, textvariable=self.update_url_var, width=48)
-        update_url_entry.grid(row=33, column=1, sticky="ew", pady=(0, 8))
+        update_url_entry.grid(row=42, column=1, sticky="ew", pady=(0, 8))
         url_tip = (
             "Optional address of a JSON file listing the newest version, used by Help > Check "
             "for updates. Leave empty and the app never contacts anything for updates."
@@ -2860,7 +2952,7 @@ class BikiniScannerApp:
         self._tooltip(update_url_entry, url_tip)
 
         button_row = ttk.Frame(form)
-        button_row.grid(row=34, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        button_row.grid(row=43, column=0, columnspan=2, sticky="e", pady=(10, 0))
 
         def close_dialog() -> None:
             dialog.grab_release()
@@ -3063,6 +3155,7 @@ class BikiniScannerApp:
                 self.global_config = ScannerConfig.from_mapping(self.config.to_dict())
             self.threshold_var.set(threshold)
             self.nsfw_only_var.set(self.config.nsfw_filter == "only")
+            self._refresh_vlm_badge()
             self._refresh_summary()
 
             if backend_changed:
@@ -3321,7 +3414,7 @@ class BikiniScannerApp:
         ttk.Button(buttons, text="Apply", command=apply).pack(side=LEFT)
         ttk.Button(buttons, text="Save as...", command=save_as).pack(side=LEFT, padx=6)
         ttk.Button(buttons, text="Delete", command=delete).pack(side=LEFT)
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=RIGHT)
+        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
 
     def run_scan(self) -> None:
         if self._scan_active:
@@ -3338,6 +3431,24 @@ class BikiniScannerApp:
             return
         if not Path(folder).is_dir():
             messagebox.showerror("No folder", f"This folder does not exist:\n{folder}")
+            return
+        # Pre-scan check: count supported images so we don't run a full scan on an
+        # empty folder or one with only unsupported files (e.g. all .txt or .pdf).
+        image_suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
+        try:
+            image_count = sum(
+                1
+                for entry in Path(folder).rglob("*")
+                if entry.is_file() and entry.suffix.lower() in image_suffixes
+            )
+        except OSError:
+            image_count = 0
+        if image_count == 0:
+            messagebox.showinfo(
+                "No images found",
+                f"No supported image files were found in this folder:\n{folder}\n\n"
+                "Supported formats: JPG, PNG, BMP, GIF, WEBP, TIFF, HEIC.",
+            )
             return
         # The folder box is editable and callers may set it directly, so the store
         # can lag behind the path shown. Bind it here rather than assert later.
@@ -3490,7 +3601,35 @@ class BikiniScannerApp:
         self._retrain_pending = False
         self.status_var.set("Scan failed.")
         LOGGER.error("Scan failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
-        messagebox.showerror("Scan failed", str(exc))
+        # Map common failures to user-friendly text with a suggested action.
+        friendly = self._friendly_error(exc)
+        messagebox.showerror("Scan failed", friendly)
+
+    @staticmethod
+    def _friendly_error(exc: Exception) -> str:
+        """Translate common exceptions into user-readable text with a suggested fix."""
+        msg = str(exc).lower()
+        if "out of memory" in msg or "cuda oom" in msg or "memoryerror" in msg:
+            return (
+                "The scanner ran out of memory. Try reducing the batch size in Settings "
+                "(e.g. from 16 to 4), or use a smaller model."
+            )
+        if "connection" in msg or "download" in msg or "timeout" in msg or "urlopen" in msg or "ssl" in msg:
+            return (
+                "Could not download the model. Check your internet connection and try "
+                "again. The model is downloaded once and then cached locally."
+            )
+        if "no such file" in msg or "filenotfound" in msg or "permission" in msg or "access" in msg:
+            return (
+                f"A file could not be read. This may be a permission issue or a file that "
+                f"was moved during the scan.\n\nDetails: {exc}"
+            )
+        if "cuda" in msg or "device" in msg or "gpu" in msg:
+            return (
+                "There was a problem with the GPU. Try switching the device to 'cpu' in "
+                f"Settings if this keeps happening.\n\nDetails: {exc}"
+            )
+        return f"An unexpected error occurred during the scan.\n\nDetails: {exc}"
 
     def _scan_completed(
         self,
@@ -3528,13 +3667,25 @@ class BikiniScannerApp:
         if full_rescan:
             LOGGER.info("Scan completed for %s: %d images, %d matches", self.folder_var.get().strip(), len(state.paths), matches)
             self.root.bell()
-            self.status_var.set(f"Scan complete — {len(state.paths)} images, {matches} matches")
+            self.status_var.set(f"Scan complete — {len(state.paths)} images, {matches} matches. Use J/K to navigate, A to accept, D to reject.")
             excluded = int(np.count_nonzero(state.excluded)) if state.excluded is not None else 0
             age_gated = sum(1 for stage in state.cascade_stage if stage == "minor")
+            # Read skipped count from the scan metadata so the user knows some files
+            # could not be read (corrupt, moved, unsupported encoding).
+            skipped_count = 0
+            if self.store is not None and self.store.metadata_path.exists():
+                try:
+                    import json
+                    metadata = json.loads(self.store.metadata_path.read_text(encoding="utf-8"))
+                    skipped_count = len(metadata.get("skipped", []))
+                except Exception:  # noqa: BLE001
+                    pass
             filtered_note = ""
             if excluded:
                 filtered_note = f"\n{excluded} filtered out by the detection gates"
                 filtered_note += f" ({age_gated} as possible minors)." if age_gated else "."
+            if skipped_count:
+                filtered_note += f"\n{skipped_count} file{'s' if skipped_count != 1 else ''} could not be read (corrupt or unsupported)."
             if matches:
                 detail = (
                     "The detected files are listed below, grouped by what was detected.\n"
@@ -3730,10 +3881,16 @@ class BikiniScannerApp:
         self._apply_focus_visuals()
 
     def _apply_focus_visuals(self) -> None:
+        threshold = float(self.threshold_var.get())
         for path, card in self.cards.items():
             focused = path == self.focused_path
+            is_match = card.score >= threshold
             try:
-                card.frame.configure(style="FocusedCard.TFrame" if focused else "Card.TFrame")
+                if focused:
+                    style = "FocusedMatchCard.TFrame" if is_match else "FocusedCard.TFrame"
+                else:
+                    style = "MatchCard.TFrame" if is_match else "Card.TFrame"
+                card.frame.configure(style=style)
             except Exception:  # noqa: BLE001
                 pass
             card.name_label.configure(text=f"▶ {Path(path).name}" if focused else Path(path).name)
@@ -3796,7 +3953,7 @@ class BikiniScannerApp:
                 with Image.open(path) as image:
                     photo = ImageTk.PhotoImage(self._preview_letterbox(image, width, height))
             except Exception:  # noqa: BLE001
-                photo = ImageTk.PhotoImage(Image.new("RGB", (width // 2, height), color="gray"))
+                photo = ImageTk.PhotoImage(Image.new("RGB", (width // 2, height), color=self._palette()["button_bg"]))
             self.preview_cache[cache_key] = photo
             while len(self.preview_cache) > 8:
                 self.preview_cache.popitem(last=False)
@@ -3942,7 +4099,9 @@ class BikiniScannerApp:
         show_actions: bool = True,
         info_width: int = CARD_INFO_WIDTH,
     ) -> ImageTk.PhotoImage:
-        frame = ttk.Frame(container, padding=8, style="Card.TFrame")
+        threshold = float(self.threshold_var.get())
+        is_match = score >= threshold
+        frame = ttk.Frame(container, padding=8, style="MatchCard.TFrame" if is_match else "Card.TFrame")
         frame.grid(row=row, column=column, columnspan=columnspan, sticky="nsew", padx=10, pady=6)
         frame.columnconfigure(1, weight=1)
         thumb_size = max(120, int(self.thumbnail_size_var.get()))
@@ -3960,7 +4119,7 @@ class BikiniScannerApp:
                 self.thumbnail_cache.move_to_end(cache_key)
             self._trim_thumbnail_cache()
         except Exception:  # noqa: BLE001
-            photo = ImageTk.PhotoImage(Image.new("RGB", (thumb_size, thumb_size), color="gray"))
+            photo = ImageTk.PhotoImage(Image.new("RGB", (thumb_size, thumb_size), color=self._palette()["button_bg"]))
             self.thumbnail_cache[cache_key] = photo
             self._trim_thumbnail_cache()
 
@@ -4023,6 +4182,7 @@ class BikiniScannerApp:
                 label_label=label_label,
                 details_label=details_label,
                 image_ref=photo,
+                score=score,
             )
             self.photo_refs.append(photo)
         for widget in (frame, image_label, right, info, name_label, score_label, label_label, details_label):
@@ -4318,7 +4478,7 @@ class BikiniScannerApp:
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Refresh", command=lambda: self._refresh_log_text(text)).pack(side=LEFT)
         ttk.Button(buttons, text="Open log folder", command=lambda: self.reveal_in_file_manager(str(path))).pack(side=LEFT, padx=8)
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=RIGHT)
+        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
 
     @staticmethod
     def _refresh_log_text(text: Text) -> None:
@@ -4350,7 +4510,7 @@ class BikiniScannerApp:
         ttk.Button(buttons, text="Keep first, trash rest", command=lambda: self._trash_duplicate_remainders(groups, dialog)).pack(
             side=LEFT
         )
-        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side=RIGHT)
+        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
 
     def _trash_duplicate_remainders(self, groups: dict[str, list[str]], dialog: Toplevel) -> None:
         duplicates = [path for paths in groups.values() for path in paths[1:]]
@@ -4466,10 +4626,10 @@ class BikiniScannerApp:
         text.configure(state="disabled")
         button_row = ttk.Frame(outer)
         button_row.pack(side=TOP, fill=BOTH, pady=(10, 0))
-        ttk.Button(button_row, text="Cancel", command=dialog.destroy).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(button_row, text="Cancel", command=dialog._safe_close).pack(side=RIGHT, padx=(8, 0))
 
         def proceed() -> None:
-            dialog.destroy()
+            dialog._safe_close()
             on_confirm()
 
         ttk.Button(button_row, text=confirm_text, command=proceed).pack(side=RIGHT)

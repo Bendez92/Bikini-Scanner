@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import re
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,12 +35,37 @@ class VLMCancelled(Exception):
 
 
 def parse_axis_json(text: str, axes: tuple[str, ...] = VLM_AXES) -> dict[str, float]:
-    """Extract and clamp an axis confidence object from permissive model output."""
-    cleaned = re.sub(r"```(?:json)?", "", str(text), flags=re.IGNORECASE).replace("```", "")
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match is None:
+    """Extract and clamp an axis confidence object from permissive model output.
+
+    The model is asked for JSON only, so the fast path is a direct ``json.loads`` of
+    the cleaned text. When the model wraps the JSON in prose or markdown, we fall back
+    to a brace search. The original greedy ``\\{.*\\}`` regex captured from the first
+    ``{`` to the *last* ``}`` in the whole response, so any extra braces in trailing
+    prose swallowed non-JSON text and made ``json.loads`` fail. The fallback now tries
+    the smallest balanced-looking object first and expands only if that fails to parse.
+    """
+    cleaned = re.sub(r"```(?:json)?", "", str(text), flags=re.IGNORECASE).replace("```", "").strip()
+    payload: object | None = None
+    try:
+        payload = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError):
+        payload = None
+    if payload is None:
+        # Find every '{' and try to parse from there to each subsequent '}'. The
+        # shortest parseable object wins, which avoids grabbing prose that happens to
+        # contain braces after the real JSON.
+        for start in (i for i, char in enumerate(cleaned) if char == "{"):
+            tail = cleaned[start:]
+            for end in (j for j, char in enumerate(tail) if char == "}"):
+                try:
+                    payload = json.loads(tail[: end + 1])
+                    break
+                except (json.JSONDecodeError, ValueError):
+                    continue
+            if payload is not None:
+                break
+    if payload is None:
         raise ValueError("VLM response did not contain a JSON object")
-    payload = json.loads(match.group(0))
     if not isinstance(payload, Mapping):
         raise TypeError("VLM response JSON was not an object")
     result: dict[str, float] = {}
@@ -140,6 +166,15 @@ class VLMClient:
                     content = message.get("content", "")
                     text = content if isinstance(content, str) else json.dumps(content)
             return parse_axis_json(text)
+        except urllib.error.HTTPError as exc:
+            # A 401/403 (bad API key) or 429 (rate limited) is a configuration or
+            # capacity problem, not a transient blip. Log it at ERROR with the status so
+            # the user can tell their key is wrong from the log viewer instead of seeing
+            # every image silently "fail to judge". We still return None so the scan
+            # continues with the CLIP result rather than aborting the whole folder.
+            level = LOGGER.error if exc.code in (401, 403, 429) else LOGGER.warning
+            level("VLM server returned HTTP %d for %s: %s", exc.code, self.base_url, exc.reason)
+            return None
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("VLM judgment failed: %s", exc)
             return None

@@ -8,6 +8,9 @@ __pycache__/
 build/
 dist/
 installer-output/
+# Exported ONNX graphs are build artifacts (python -m scripts.export_onnx),
+# not source. They are ~600MB and regenerated on demand.
+models/
 *.manifest
 *.toc
 *.spec

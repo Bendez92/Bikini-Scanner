@@ -26,6 +26,10 @@ DEFAULT_BIKINI_NEGATIVE_PROMPTS = [
     "a photo of food",
     "an indoor scene with no people",
     "a close-up of an object",
+    "lingerie and intimate apparel",
+    "underwear and bra and panties",
+    "a sports bra and athletic wear",
+    "a man in swim trunks",
 ]
 # Compatibility aliases for callers that imported the original names.
 DEFAULT_POSITIVE_PROMPTS = DEFAULT_BIKINI_POSITIVE_PROMPTS
@@ -70,10 +74,19 @@ DEFAULT_EXCLUDE_MINORS = True
 DEFAULT_MINOR_THRESHOLD = 0.30
 DEFAULT_MIN_ADULT_CONFIDENCE = 0.25
 DEFAULT_MAX_FACES = 3
+# Age-gate internal constants. These were hardcoded in cascade.py; exposing them as
+# config fields (with safe minimums) lets a user tighten the gate without code edits.
+# The minimums below are enforced in from_mapping and prevent weakening the gate
+# to the point of uselessness. Raising any of these makes the scanner LESS careful.
+DEFAULT_CHILD_ADULT_MARGIN = 0.10      # child must out-argue adult by this much
+DEFAULT_STRONGLY_MINOR_THRESHOLD = 0.75  # overwhelming child evidence, standalone
+DEFAULT_FACE_ANCHORED_MARGIN = 0.05    # smaller margin when a real face crop exists
+DEFAULT_WEAK_ADULT_DETAIL = 0.35       # detail score above which adult evidence is required
 # Opt-in second opinion from a larger model on borderline images only.
 DEFAULT_REFINE_MODEL = ""
 DEFAULT_REFINE_BAND = 0.18
 DEFAULT_REFINE_MAX_IMAGES = 400
+DEFAULT_REFINE_WEIGHT = 0.65
 DEFAULT_VLM_ENABLED = False
 DEFAULT_VLM_BASE_URL = "http://localhost:11434/v1"
 DEFAULT_VLM_MODEL = "qwen2.5vl:7b"
@@ -86,8 +99,14 @@ DEFAULT_VLM_WEIGHT = 0.65
 HIGH_ACCURACY_MODEL = "openai/clip-vit-large-patch14"
 # Accept/REJECT decisions are pooled across folders unless this is turned off.
 DEFAULT_GLOBAL_LEARNING = True
+# Cap on the learned model's share of the final score. Below 1.0 so zero-shot
+# prompts always retain a voice even when the classifier is highly trusted.
+DEFAULT_MAX_LEARNING_WEIGHT = 0.85
 # How the detail axes combine into the headline score (soft OR, so two weak signals
-# reinforce instead of one having to carry the image alone).
+# reinforce instead of one having to carry the image alone). The strongest single
+# axis gets the larger share; the average of all axes adds corroboration.
+DEFAULT_DETAIL_STRONGEST_WEIGHT = 0.65
+DEFAULT_DETAIL_AVERAGE_WEIGHT = 0.35
 DEFAULT_DETAIL_WEIGHTS = {
     "bikini": 1.0,
     "cleavage": 0.85,
@@ -138,9 +157,16 @@ class ScannerConfig:
     minor_threshold: float = DEFAULT_MINOR_THRESHOLD
     min_adult_confidence: float = DEFAULT_MIN_ADULT_CONFIDENCE
     max_faces: int = DEFAULT_MAX_FACES
+    # Age-gate internal constants (see DEFAULT_* docs above). Safe minimums are
+    # enforced in from_mapping so a profile or override cannot weaken the gate.
+    child_adult_margin: float = DEFAULT_CHILD_ADULT_MARGIN
+    strongly_minor_threshold: float = DEFAULT_STRONGLY_MINOR_THRESHOLD
+    face_anchored_margin: float = DEFAULT_FACE_ANCHORED_MARGIN
+    weak_adult_detail: float = DEFAULT_WEAK_ADULT_DETAIL
     refine_model: str = DEFAULT_REFINE_MODEL
     refine_band: float = DEFAULT_REFINE_BAND
     refine_max_images: int = DEFAULT_REFINE_MAX_IMAGES
+    refine_weight: float = DEFAULT_REFINE_WEIGHT
     vlm_enabled: bool = DEFAULT_VLM_ENABLED
     vlm_base_url: str = DEFAULT_VLM_BASE_URL
     vlm_model: str = DEFAULT_VLM_MODEL
@@ -151,6 +177,9 @@ class ScannerConfig:
     vlm_timeout: float = DEFAULT_VLM_TIMEOUT
     vlm_weight: float = DEFAULT_VLM_WEIGHT
     global_learning: bool = DEFAULT_GLOBAL_LEARNING
+    max_learning_weight: float = DEFAULT_MAX_LEARNING_WEIGHT
+    detail_strongest_weight: float = DEFAULT_DETAIL_STRONGEST_WEIGHT
+    detail_average_weight: float = DEFAULT_DETAIL_AVERAGE_WEIGHT
     detail_weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_DETAIL_WEIGHTS))
 
     def to_dict(self) -> dict[str, Any]:
@@ -212,11 +241,26 @@ class ScannerConfig:
             mapping.get("min_adult_confidence"), config.min_adult_confidence, 0.0, 1.0
         )
         config.max_faces = _coerce_int(mapping.get("max_faces"), config.max_faces, minimum=1, maximum=32)
+        # Age-gate constants: minimums prevent a profile from weakening the safety gate
+        # to the point of uselessness. Upper bound is 1.0 for all (evidence space).
+        config.child_adult_margin = _coerce_float(
+            mapping.get("child_adult_margin"), config.child_adult_margin, 0.05, 1.0
+        )
+        config.strongly_minor_threshold = _coerce_float(
+            mapping.get("strongly_minor_threshold"), config.strongly_minor_threshold, 0.50, 1.0
+        )
+        config.face_anchored_margin = _coerce_float(
+            mapping.get("face_anchored_margin"), config.face_anchored_margin, 0.02, 1.0
+        )
+        config.weak_adult_detail = _coerce_float(
+            mapping.get("weak_adult_detail"), config.weak_adult_detail, 0.20, 1.0
+        )
         config.refine_model = _coerce_str(mapping.get("refine_model"), config.refine_model)
         config.refine_band = _coerce_float(mapping.get("refine_band"), config.refine_band, 0.0, 1.0)
         config.refine_max_images = _coerce_int(
             mapping.get("refine_max_images"), config.refine_max_images, minimum=0, maximum=1_000_000
         )
+        config.refine_weight = _coerce_float(mapping.get("refine_weight"), config.refine_weight, 0.0, 1.0)
         config.vlm_enabled = _coerce_bool(mapping.get("vlm_enabled"), config.vlm_enabled)
         config.vlm_base_url = _coerce_str(mapping.get("vlm_base_url"), config.vlm_base_url)
         config.vlm_model = _coerce_str(mapping.get("vlm_model"), config.vlm_model)
@@ -227,6 +271,15 @@ class ScannerConfig:
         config.vlm_timeout = _coerce_float(mapping.get("vlm_timeout"), config.vlm_timeout, 1.0, 600.0)
         config.vlm_weight = _coerce_float(mapping.get("vlm_weight"), config.vlm_weight, 0.0, 1.0)
         config.global_learning = _coerce_bool(mapping.get("global_learning"), config.global_learning)
+        config.max_learning_weight = _coerce_float(
+            mapping.get("max_learning_weight"), config.max_learning_weight, 0.0, 0.95
+        )
+        config.detail_strongest_weight = _coerce_float(
+            mapping.get("detail_strongest_weight"), config.detail_strongest_weight, 0.0, 1.0
+        )
+        config.detail_average_weight = _coerce_float(
+            mapping.get("detail_average_weight"), config.detail_average_weight, 0.0, 1.0
+        )
         config.detail_weights = _coerce_weights(mapping.get("detail_weights"), config.detail_weights)
         return config
 
@@ -259,6 +312,10 @@ def _default_axis_prompts() -> dict[str, AxisConfig]:
                 "a blouse or dress",
                 "a bra under clothing",
                 "a photo with no people",
+                "a sports bra and athletic tank top",
+                "a compression shirt and workout top",
+                "lingerie and intimate apparel",
+                "underwear and a bra",
             ],
         ),
         "bikini_bottom": AxisConfig(
@@ -274,6 +331,10 @@ def _default_axis_prompts() -> dict[str, AxisConfig]:
                 "shorts",
                 "a long skirt or dress",
                 "a photo with no people",
+                "a man in swim trunks",
+                "a man in board shorts",
+                "lingerie and intimate apparel",
+                "underwear and panties",
             ],
         ),
         "midriff": AxisConfig(
@@ -290,6 +351,9 @@ def _default_axis_prompts() -> dict[str, AxisConfig]:
                 "a shirt tucked into trousers",
                 "a landscape photo",
                 "a photo with no people",
+                "a sports bra and athletic wear",
+                "yoga clothing and workout clothes",
+                "a gym outfit and exercise top",
             ],
         ),
         "cleavage": AxisConfig(
