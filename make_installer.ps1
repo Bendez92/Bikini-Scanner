@@ -103,9 +103,14 @@ if (-not $SkipDeps) {
     if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 }
 
+# Read the version once so the PyInstaller banner and the installer match.
+$Version = & $VenvPython -c "from bikini_scanner.__version__ import __version__; print(__version__)"
+if ($LASTEXITCODE -ne 0 -or -not $Version) { throw "Could not read __version__ from bikini_scanner" }
+$Version = $Version.Trim()
+
 # --- 3. PyInstaller ---------------------------------------------------------
 if (-not $SkipBuild) {
-    Write-Step "Building application bundle (this takes several minutes)"
+    Write-Step "Building application bundle v$Version (this takes several minutes)"
     & $VenvPython -m PyInstaller bikini_scanner.spec --noconfirm
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 }
@@ -126,12 +131,7 @@ if (-not $Iscc) {
     if (-not $Iscc) { throw "Inno Setup install did not produce ISCC.exe" }
 }
 
-Write-Step "Compiling installer"
-# Read the version from the single source of truth so the installer and the app
-# can never drift. installer.iss has a fallback #define for standalone ISCC runs.
-$Version = & $VenvPython -c "from bikini_scanner.__version__ import __version__; print(__version__)"
-if ($LASTEXITCODE -ne 0 -or -not $Version) { throw "Could not read __version__ from bikini_scanner" }
-$Version = $Version.Trim()
+Write-Step "Compiling installer v$Version"
 & $Iscc "/DMyAppVersion=$Version" "installer.iss"
 if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed" }
 Invoke-SignFile $SetupExe

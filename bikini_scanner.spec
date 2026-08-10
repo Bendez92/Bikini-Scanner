@@ -14,12 +14,22 @@
 #   * scikit-learn and scipy are gone entirely - bikini_scanner.linear_model implements the
 #     handful of primitives that were used, in numpy.
 
+import sys
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
 block_cipher = None
 ROOT = Path(SPECPATH).resolve()
+
+# Keep the built .exe version in sync with the package's single source of truth.
+sys.path.insert(0, str(ROOT))
+from bikini_scanner.__version__ import __version__
+
+_version_parts = [int(p) for p in __version__.split(".")]
+while len(_version_parts) < 4:
+    _version_parts.append(0)
+_VERSION_QUAD = tuple(_version_parts[:4])
 
 # Packages with real data files or compiled extensions still need collecting.
 pillow_datas, pillow_bins, pillow_hidden = collect_all("PIL")
@@ -146,6 +156,47 @@ a = Analysis(
 a.datas = [entry for entry in a.datas if _keep(entry)]
 a.binaries = [entry for entry in a.binaries if _keep(entry)]
 
+# Windows version resource for the built .exe so its file properties show the
+# same version that the package and the installer report.
+_version_info_path = ROOT / "build" / "bikini_scanner_version_info.txt"
+_version_info_path.parent.mkdir(parents=True, exist_ok=True)
+_version_info_path.write_text(
+    f"""VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers={_VERSION_QUAD},
+        prodvers={_VERSION_QUAD},
+        mask=0x3f,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0)
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    '040904B0',
+                    [
+                        StringStruct('CompanyName', 'Bikini Scanner'),
+                        StringStruct('FileDescription', 'Bikini Scanner'),
+                        StringStruct('FileVersion', '{__version__}'),
+                        StringStruct('InternalName', 'BikiniScanner'),
+                        StringStruct('LegalCopyright', 'Bikini Scanner'),
+                        StringStruct('OriginalFilename', 'BikiniScanner.exe'),
+                        StringStruct('ProductName', 'Bikini Scanner'),
+                        StringStruct('ProductVersion', '{__version__}')
+                    ]
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct('Translation', [1033, 1200])])
+    ]
+)
+""",
+    encoding="utf-8",
+)
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 exe = EXE(
@@ -164,6 +215,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version=str(_version_info_path) if sys.platform == "win32" else None,
 )
 
 coll = COLLECT(

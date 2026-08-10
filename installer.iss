@@ -7,7 +7,7 @@
 ; /DMyAppVersion=... so the installer and __version__.py never drift). This fallback
 ; is used only when ISCC is run standalone without that define.
 #ifndef MyAppVersion
-  #define MyAppVersion "1.3.0"
+  #define MyAppVersion "1.4.0"
 #endif
 #define MyAppPublisher "Bikini Scanner"
 #define MyAppExeName "BikiniScanner.exe"
