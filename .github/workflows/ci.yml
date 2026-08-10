@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: lint + tests (${{ matrix.os }}, py${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      # The suite runs against tests/fake_backend.py, so neither torch nor the CLIP
+      # weights are needed. Installing them would add ~600 MB and several minutes per
+      # job for no extra coverage; the real-backend path is exercised locally with
+      # BIKINI_SCANNER_REAL_BACKEND=1.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy>=2.0,<3" "Pillow>=10.0" "ruff>=0.6,<1"
+
+      - name: Lint
+        run: python -m ruff check bikini_scanner scripts tests
+
+      - name: Format check
+        run: python -m ruff format --check bikini_scanner scripts tests
+        continue-on-error: true
+
+      - name: Tests
+        env:
+          PYTHONPATH: .
+        run: python tests/test_functional.py
+
+      - name: Scoring baseline unchanged
+        env:
+          PYTHONPATH: .
+        run: python scripts/score_baseline.py --compare tests/baseline_scores.json

@@ -16,9 +16,10 @@ import logging
 import pickle
 import re
 import threading
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -144,7 +145,7 @@ class GlobalLearningStore:
                         np.savez(handle, **features)
 
                 atomic_replace(self.features_path, write_npz)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 LOGGER.exception("Could not persist global learning memory")
             return len(index)
 
@@ -169,7 +170,7 @@ class GlobalLearningStore:
                         np.savez(handle, **features)
 
                 atomic_replace(self.features_path, write_npz)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 LOGGER.exception("Could not update global learning memory")
 
     def training_set(self, expected_dim: int | None = None) -> TrainingSet:
@@ -233,7 +234,7 @@ class GlobalLearningStore:
         data["feature_version"] = FEATURE_VERSION
         try:
             atomic_replace(self.classifier_path, lambda tmp: tmp.write_bytes(pickle.dumps(data)))
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("Could not persist the global classifier")
 
     def stats(self) -> dict[str, int]:

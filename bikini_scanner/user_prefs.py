@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .safe_io import atomic_write_json, quarantine_broken_file
 

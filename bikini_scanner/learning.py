@@ -99,7 +99,7 @@ class LearningOutcome:
         if self.classifier is not None:
             try:
                 classifier_scores = self.classifier.predict_proba(features)[:, 1].astype(np.float32)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 LOGGER.exception("Learned classifier failed to score; falling back to the prototype")
                 classifier_scores = None
         if classifier_scores is None:
@@ -211,7 +211,7 @@ def fit(features: np.ndarray, labels: np.ndarray, max_weight: float = 0.85) -> L
         outcome.cv_auc = auc
         try:
             outcome.classifier = _calibrate(_make_estimator(chosen_c), features, labels)
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("Classifier training failed; keeping the prototype model")
             outcome.classifier = None
 

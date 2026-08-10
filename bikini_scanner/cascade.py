@@ -21,8 +21,8 @@ Without that, five neutral 0.5 axes would soft-OR their way to a near-perfect sc
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Mapping, Sequence
 
 import numpy as np
 

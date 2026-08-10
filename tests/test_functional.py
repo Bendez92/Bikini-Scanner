@@ -7,7 +7,11 @@ are all redirected into a temporary directory first.
     PYTHONPATH=. python tests/test_functional.py            # everything
     PYTHONPATH=. python tests/test_functional.py Scoring    # one class
 
-The CLIP backend is loaded once and shared, so the whole suite costs about one scan.
+By default the suite runs against `tests.fake_backend.FakeBackend`: deterministic,
+content-derived embeddings that need no model weights and no network, so the whole run
+costs seconds instead of minutes. Set BIKINI_SCANNER_REAL_BACKEND=1 to run the same
+tests against the real CLIP model (slow, downloads ~600 MB on first use) when you want
+to check that a change behaves the same way against real embeddings.
 """
 
 from __future__ import annotations
@@ -26,6 +30,7 @@ import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Redirect every user-state path before importing anything that reads them.
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="bikini_state_"))
@@ -36,21 +41,32 @@ os.environ["XDG_STATE_HOME"] = str(_STATE_DIR)
 os.environ["HOME"] = str(_STATE_DIR)
 os.environ["USERPROFILE"] = str(_STATE_DIR)
 
-from bikini_scanner import cascade, learning, linear_model, output_ops, regions  # noqa: E402
-from bikini_scanner import scorer as scorer_module  # noqa: E402
-from bikini_scanner import store as store_module  # noqa: E402
-from bikini_scanner.clip_backend import get_backend  # noqa: E402
-from bikini_scanner.config import ScannerConfig  # noqa: E402
-from bikini_scanner import config_profiles  # noqa: E402
-from bikini_scanner.config_profiles import BUILTIN_PROFILES, profile_config, profile_names  # noqa: E402
-from bikini_scanner.global_store import GlobalLearningStore  # noqa: E402
-from bikini_scanner.regions import plan_regions  # noqa: E402
-from bikini_scanner.scorer import BikiniScorer, bucketed_sampling, scan_and_score_folder  # noqa: E402
-from bikini_scanner.scorer import RefineResult, ScoreState, compute_vlm_scores  # noqa: E402
-from bikini_scanner.skin import skin_fraction  # noqa: E402
-from bikini_scanner.store import FolderStore, collect_image_paths  # noqa: E402
-from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, parse_axis_json  # noqa: E402
-from bikini_scanner.vision_analysis import FaceBox, detect_face_count  # noqa: E402
+from bikini_scanner import (
+    cascade,
+    config_profiles,
+    learning,
+    linear_model,
+    output_ops,
+    regions,
+)
+from bikini_scanner import scorer as scorer_module
+from bikini_scanner import store as store_module
+from bikini_scanner.config import ScannerConfig
+from bikini_scanner.config_profiles import BUILTIN_PROFILES, profile_config, profile_names
+from bikini_scanner.global_store import GlobalLearningStore
+from bikini_scanner.regions import plan_regions
+from bikini_scanner.scorer import (
+    BikiniScorer,
+    RefineResult,
+    ScoreState,
+    bucketed_sampling,
+    compute_vlm_scores,
+    scan_and_score_folder,
+)
+from bikini_scanner.skin import skin_fraction
+from bikini_scanner.store import FolderStore, collect_image_paths
+from bikini_scanner.vision_analysis import FaceBox, detect_face_count
+from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, parse_axis_json
 
 IMAGE_COUNT = 8
 _SHARED: dict[str, object] = {}
@@ -81,12 +97,27 @@ def _make_images(folder: Path, count: int = IMAGE_COUNT) -> list[Path]:
     return paths
 
 
+def _use_real_backend() -> bool:
+    return os.environ.get("BIKINI_SCANNER_REAL_BACKEND", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _build_backend(config: ScannerConfig):
+    """The real CLIP backend only when asked for; torch is imported lazily either way."""
+    if _use_real_backend():
+        from bikini_scanner.clip_backend import get_backend
+
+        return get_backend(config)
+    from fake_backend import FakeBackend
+
+    return FakeBackend()
+
+
 def _shared():
     if "backend" not in _SHARED:
         config = ScannerConfig()
         config.preload_backend = False
         _SHARED["config"] = config
-        _SHARED["backend"] = get_backend(config)
+        _SHARED["backend"] = _build_backend(config)
         root = Path(tempfile.mkdtemp(prefix="bikini_scan_"))
         _SHARED["root"] = root
         _make_images(root)
@@ -708,7 +739,7 @@ class OutputOperations(unittest.TestCase):
         options = output_ops.OutputOptions()
         plan = output_ops.build_transfer_plan(self.sources, destination, self.scores, self.labels, options)
         self.assertEqual(len(plan), len(self.sources))
-        processed, skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=False)
+        processed, _skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=False)
         self.assertEqual(processed, len(self.sources))
         self.assertEqual(failed, 0)
         self.assertEqual(len(list(destination.rglob("*.jpg"))), len(self.sources))
@@ -724,7 +755,7 @@ class OutputOperations(unittest.TestCase):
         plan = output_ops.build_transfer_plan(
             [missing, *sources], destination, self.scores, self.labels, output_ops.OutputOptions()
         )
-        processed, skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=False)
+        processed, _skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=False)
         self.assertEqual(failed, 1)
         self.assertEqual(processed, len(sources))
         self.assertEqual(len(list(destination.rglob("*.jpg"))), len(sources))
@@ -744,7 +775,7 @@ class OutputOperations(unittest.TestCase):
         plan = output_ops.build_transfer_plan(
             [str(source)], blocker / "out", {str(source): 0.5}, {}, output_ops.OutputOptions(), move=True
         )
-        processed, skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=True)
+        processed, _skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=True)
         self.assertEqual(failed, 1)
         self.assertEqual(processed, 0)
         self.assertTrue(source.exists(), "a failed move must not delete the source")

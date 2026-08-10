@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
@@ -55,14 +56,14 @@ class ClipOnnxBackend:
         return self.image_embedding_dim_value
 
     @classmethod
-    def from_config(cls, config: ScannerConfig) -> "ClipOnnxBackend":
+    def from_config(cls, config: ScannerConfig) -> ClipOnnxBackend:
         if config.model_name != DEFAULT_MODEL_NAME:
             raise ValueError(
                 "The clip-onnx backend currently supports the default CLIP model only: " f"{DEFAULT_MODEL_NAME}"
             )
         try:
             import onnxruntime as ort
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RuntimeError("clip-onnx requires onnxruntime. Install requirements-onnx.txt first.") from exc
         model_dir = onnx_model_dir()
         vision_path = model_dir / VISION_ONNX_NAME
@@ -143,7 +144,7 @@ class ClipOnnxBackend:
         return (array / norms).astype(np.float32)
 
 
-@lru_cache(maxsize=None)
+@cache
 def load_onnx_backend(model_name: str) -> ClipOnnxBackend:
     config = ScannerConfig(backend="clip-onnx", model_name=model_name)
     return ClipOnnxBackend.from_config(config)

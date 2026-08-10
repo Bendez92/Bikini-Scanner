@@ -1,12 +1,16 @@
+"""The PyTorch CLIP backend, plus the registry that maps a config to a backend.
+
+`ImageEmbeddingBackend` and `ClipBackendBase` live in `backend_utils` (which does not
+import torch) and are re-exported here so existing imports keep working.
+"""
+
 from __future__ import annotations
 
 import logging
 import os
 import threading
-from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable, Iterator, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -15,84 +19,26 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 from transformers.utils import logging as hf_logging
 
-from .backend_utils import DecodedImage, iter_decoded_image_batches
+from .backend_utils import ClipBackendBase, DecodedImage, ImageEmbeddingBackend
 from .config import ScannerConfig
 from .image_formats import register_heif_support
+
+__all__ = [
+    "BACKENDS",
+    "ClipBackendBase",
+    "ClipTorchBackend",
+    "DecodedImage",
+    "ImageEmbeddingBackend",
+    "get_backend",
+]
 
 register_heif_support()
 
 LOGGER = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 _BACKEND_LOAD_LOCK = threading.Lock()
-_TORCH_BACKEND_CACHE: dict[tuple[str, str, str, bool], "ClipTorchBackend"] = {}
-_ONNX_BACKEND_CACHE: dict[str, "ClipBackendBase"] = {}
-
-
-class ImageEmbeddingBackend(Protocol):
-    @property
-    def image_embedding_dim(self) -> int: ...
-
-    @property
-    def active_device(self) -> str: ...
-
-    @property
-    def active_precision(self) -> str: ...
-
-    def embed_images(self, paths: Sequence[str | Path], batch_size: int = 16) -> np.ndarray: ...
-
-    def embed_pil_images(self, images: Sequence[Image.Image]) -> np.ndarray: ...
-
-    def iter_image_batches(
-        self, paths: Iterable[str | Path], batch_size: int = 16
-    ) -> Iterator[list[DecodedImage]]: ...
-
-    def embed_texts(self, prompts: Sequence[str]) -> np.ndarray: ...
-
-
-class ClipBackendBase(ABC):
-    active_device_value: str = "cpu"
-    active_precision_value: str = "fp32"
-
-    @property
-    @abstractmethod
-    def image_embedding_dim(self) -> int:
-        raise NotImplementedError
-
-    @property
-    def active_device(self) -> str:
-        return self.active_device_value
-
-    @property
-    def active_precision(self) -> str:
-        return self.active_precision_value
-
-    def embed_images(self, paths: Sequence[str | Path], batch_size: int = 16) -> np.ndarray:
-        embeddings: list[np.ndarray] = []
-        for batch in self.iter_image_batches(paths, batch_size=batch_size):
-            valid_images = [record.image for record in batch if record.image is not None]
-            if valid_images:
-                embeddings.append(self.embed_pil_images(valid_images))
-        if not embeddings:
-            return np.empty((0, self.image_embedding_dim), dtype=np.float32)
-        return np.vstack(embeddings).astype(np.float32)
-
-    def embed_pil_images(self, images: Sequence[Image.Image]) -> np.ndarray:
-        if not images:
-            return np.empty((0, self.image_embedding_dim), dtype=np.float32)
-        return np.vstack(self._embed_image_batch(images)).astype(np.float32)
-
-    def iter_image_batches(
-        self, paths: Iterable[str | Path], batch_size: int = 16
-    ) -> Iterator[list[DecodedImage]]:
-        yield from iter_decoded_image_batches(paths, batch_size=batch_size)
-
-    @abstractmethod
-    def _embed_image_batch(self, images: Sequence[Image.Image]) -> list[np.ndarray]:
-        raise NotImplementedError
-
-    @abstractmethod
-    def embed_texts(self, prompts: Sequence[str]) -> np.ndarray:
-        raise NotImplementedError
+_TORCH_BACKEND_CACHE: dict[tuple[str, str, str, bool], ClipTorchBackend] = {}
+_ONNX_BACKEND_CACHE: dict[str, ClipBackendBase] = {}
 
 
 @dataclass(slots=True)

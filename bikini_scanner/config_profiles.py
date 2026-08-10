@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import logging
 import json
+import logging
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .config import ScannerConfig
 from .safe_io import atomic_write_json, quarantine_broken_file
@@ -70,10 +71,7 @@ def profile_names() -> list[str]:
 
 
 def profile_config(name: str) -> ScannerConfig | None:
-    if name in BUILTIN_PROFILES:
-        mapping = BUILTIN_PROFILES[name]
-    else:
-        mapping = load_profiles().get(name)
+    mapping = BUILTIN_PROFILES[name] if name in BUILTIN_PROFILES else load_profiles().get(name)
     return ScannerConfig.from_mapping(mapping) if mapping is not None else None
 
 

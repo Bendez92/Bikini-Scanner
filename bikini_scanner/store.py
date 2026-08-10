@@ -6,10 +6,11 @@ import logging
 import os
 import pickle
 import shutil
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -75,7 +76,7 @@ def _legacy_cache_key(path: Path) -> str | None:
     if stat is None:
         return None
     # path.resolve() is part of the key: changing it would invalidate every legacy cache.
-    token = f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}".encode("utf-8")
+    token = f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}".encode()
     return hashlib.sha1(token).hexdigest()
 
 

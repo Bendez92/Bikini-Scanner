@@ -100,7 +100,7 @@ def _detector() -> object | None:
     if path is None:
         return None
     with _LOCK:
-        if _DETECTOR is not None and _DETECTOR_PATH == path:
+        if _DETECTOR is not None and path == _DETECTOR_PATH:
             return _DETECTOR
         try:
             detector = cv2.FaceDetectorYN.create(
@@ -111,7 +111,7 @@ def _detector() -> object | None:
                 0.3,
                 50,
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("Face model %s could not be loaded", path)
             return None
         _DETECTOR = detector
@@ -120,7 +120,7 @@ def _detector() -> object | None:
         return detector
 
 
-def detect_face_boxes(image: "Image.Image") -> list[FaceBox]:
+def detect_face_boxes(image: Image.Image) -> list[FaceBox]:
     """Faces in full-resolution coordinates, largest first.
 
     An empty list means "no faces found *or* no detector installed" - it is not
@@ -148,7 +148,7 @@ def detect_face_boxes(image: "Image.Image") -> list[FaceBox]:
     try:
         detector.setInputSize((bgr.shape[1], bgr.shape[0]))
         _, detections = detector.detect(bgr)
-    except Exception:  # noqa: BLE001
+    except Exception:
         LOGGER.exception("Face detection failed")
         return []
     if detections is None:
@@ -171,7 +171,7 @@ def detect_face_boxes(image: "Image.Image") -> list[FaceBox]:
     return faces
 
 
-def detect_face_count(image: "Image.Image") -> int | None:
+def detect_face_count(image: Image.Image) -> int | None:
     """Face count, or None when no detector is installed (unknown, not zero)."""
     if not face_detection_available():
         return None

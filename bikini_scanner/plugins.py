@@ -34,6 +34,6 @@ def apply_plugins(state: Any, samples: list[dict[str, object]]) -> list[dict[str
             if updated is not None:
                 result = list(updated)
             LOGGER.info("Applied plugin %s", path.name)
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("Skipping failed plugin %s", path)
     return result

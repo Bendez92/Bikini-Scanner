@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 LOGGER = logging.getLogger(__name__)
 
@@ -186,7 +187,7 @@ class ScannerConfig:
         return asdict(self)
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, Any] | None) -> "ScannerConfig":
+    def from_mapping(cls, mapping: Mapping[str, Any] | None) -> ScannerConfig:
         config = cls()
         if not mapping:
             return config

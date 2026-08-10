@@ -29,18 +29,20 @@ from tkinter import (
     Text,
     Tk,
     Toplevel,
+    filedialog,
+    messagebox,
+    ttk,
 )
 from tkinter import font as tkfont
-from tkinter import filedialog, messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
 
 from . import cascade, vision_analysis
-from .config import HIGH_ACCURACY_MODEL, ScannerConfig
-from .global_store import GlobalLearningStore
 from .__version__ import __version__
+from .config import HIGH_ACCURACY_MODEL, ScannerConfig
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
+from .global_store import GlobalLearningStore
 from .i18n import _
 from .logging_setup import configure_logging, log_path, read_log_tail
 from .output_ops import (
@@ -53,7 +55,7 @@ from .output_ops import (
     write_image_metadata,
 )
 from .plugins import apply_plugins
-from .update_checker import check_for_update
+from .safe_io import atomic_write_json, quarantine_broken_file
 from .scorer import (
     PHASE_EMBED,
     BikiniScorer,
@@ -64,8 +66,8 @@ from .scorer import (
     scan_and_score_folder,
     state_disagreement,
 )
-from .store import FolderStore, MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES
-from .safe_io import atomic_write_json, quarantine_broken_file
+from .store import MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES, FolderStore
+from .update_checker import check_for_update
 from .user_prefs import load_user_prefs, prefs_path, save_user_prefs
 
 try:
@@ -415,7 +417,8 @@ class BikiniScannerApp:
         label_combo.pack(side=LEFT, padx=(0, 12))
         ttk.Label(row_one, text=_("Score"), style="Muted.TLabel").pack(side=LEFT)
         ttk.Entry(row_one, textvariable=self.score_min_var, width=5).pack(side=LEFT, padx=(4, 2))
-        ttk.Label(row_one, text="–", style="Muted.TLabel").pack(side=LEFT)
+        # An en dash is the correct typography for a numeric range separator here.
+        ttk.Label(row_one, text="–", style="Muted.TLabel").pack(side=LEFT)  # noqa: RUF001
         ttk.Entry(row_one, textvariable=self.score_max_var, width=5).pack(side=LEFT, padx=(2, 12))
         ttk.Checkbutton(
             row_one, text=_("Only NSFW"), variable=self.nsfw_only_var, command=self._toggle_nsfw_only
@@ -1468,7 +1471,7 @@ class BikiniScannerApp:
                 from .clip_backend import get_backend
             self.backend = get_backend(self.config)
             return True
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             LOGGER.exception("Backend load failed")
             if show_errors:
                 messagebox.showerror("Could not load the scanning model", self._model_error_text(exc))
@@ -1672,9 +1675,7 @@ class BikiniScannerApp:
         counts["unlabeled"] = unlabeled
         quality = None
         if self.scorer is not None:
-            embeddings_by_path = {
-                path: embedding for path, embedding in zip(self.current_state.paths, self.current_state.embeddings, strict=False)
-            }
+            embeddings_by_path = dict(zip(self.current_state.paths, self.current_state.embeddings, strict=False))
             quality = self.scorer.estimate_quality(embeddings_by_path, labels)
         if record_history and quality is not None:
             self.quality_history.append(quality)
@@ -2021,7 +2022,7 @@ class BikiniScannerApp:
             return list(samples)
         try:
             processed = apply_plugins(self.current_state, list(samples))
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("Review sample plugin processing failed; using unmodified samples.")
             return list(samples)
         return list(processed)
@@ -2093,9 +2094,7 @@ class BikiniScannerApp:
             return False
         if score_max is not None and score > score_max:
             return False
-        if score_min is not None and score_max is not None and score_min > score_max:
-            return False
-        return True
+        return not (score_min is not None and score_max is not None and score_min > score_max)
 
     def _apply_display_filters(self, samples: list[dict[str, object]]) -> list[dict[str, object]]:
         filtered = [sample for sample in samples if self._sample_visible(sample)]
@@ -2260,7 +2259,7 @@ class BikiniScannerApp:
         if anchor_norm <= 0:
             return []
         ranked: list[tuple[str, float]] = []
-        for index, (path, embedding, include) in enumerate(
+        for _index, (path, embedding, include) in enumerate(
             zip(self.current_state.paths, self.current_state.embeddings, visibility, strict=False)
         ):
             if not include or path == anchor_path:
@@ -2497,10 +2496,10 @@ class BikiniScannerApp:
                 request = urllib.request.Request(
                     vision_analysis.MODEL_URL, headers={"User-Agent": "bikini-scanner"}
                 )
-                with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
+                with urllib.request.urlopen(request, timeout=60) as response:
                     payload = response.read()
                 target = vision_analysis.install_model_from_bytes(payload)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 LOGGER.exception("Face model download failed")
                 # Bound as a default: Python unbinds `exc` when the except block ends,
                 # so a lambda that closed over it raised NameError instead of showing
@@ -2667,7 +2666,7 @@ class BikiniScannerApp:
             "noticeably more accurate but a ~1.7 GB download and several times slower per "
             "image. Changing this invalidates cached embeddings and needs a fresh scan.",
         )
-        device_combo = add_combo(
+        add_combo(
             10,
             "Device",
             device_var,
@@ -2675,7 +2674,7 @@ class BikiniScannerApp:
             "Where the model runs. auto picks your NVIDIA GPU when one is usable and falls "
             "back to the CPU otherwise. Force cpu if a GPU driver misbehaves.",
         )
-        precision_combo = add_combo(
+        add_combo(
             11,
             "Precision",
             precision_var,
@@ -2792,7 +2791,7 @@ class BikiniScannerApp:
             "face count to the details line.",
         )
         add_section(24, "Detection pipeline")
-        deep_combo = add_combo(
+        add_combo(
             26,
             "Deep scan (body-region crops)",
             deep_scan_var,
@@ -4334,7 +4333,7 @@ class BikiniScannerApp:
         ):
             return
         self._apply_label_batch(
-            {path: label for path in paths},
+            dict.fromkeys(paths, label),
             status=f"{verb}ed {len(paths)} shown images.",
             retrain=True,
         )

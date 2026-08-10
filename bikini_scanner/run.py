@@ -12,11 +12,16 @@ from pathlib import Path
 from .config import ScannerConfig
 from .config_profiles import profile_config
 from .logging_setup import configure_logging
-from .output_ops import OutputOptions, build_html_report, build_transfer_plan, execute_transfer_plan, write_image_metadata
+from .output_ops import (
+    OutputOptions,
+    build_html_report,
+    build_transfer_plan,
+    execute_transfer_plan,
+    write_image_metadata,
+)
 from .plugins import apply_plugins
 from .scorer import BikiniScorer, ScanCancelled, scan_and_score_folder
 from .store import FolderStore
-
 
 LOGGER = logging.getLogger(__name__)
 

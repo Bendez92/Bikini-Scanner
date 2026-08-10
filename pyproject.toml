@@ -42,5 +42,53 @@ packages = ["bikini_scanner"]
 [tool.setuptools.dynamic]
 version = { attr = "bikini_scanner.__version__.__version__" }
 
+[project.optional-dependencies.dev]
+dev = [
+    "ruff>=0.6,<1",
+    "mypy>=1.11,<2",
+    "pytest>=8.0,<9",
+]
+
 [tool.ruff]
-line-length = 100
+line-length = 120
+target-version = "py310"
+exclude = ["dist", "build", "installer-output", ".venv"]
+
+[tool.ruff.lint]
+# Previously nothing was selected, so the ~130 `# noqa: BLE001` suppressions scattered
+# through the codebase were inert and nothing was actually being checked. These are the
+# rule families that catch real defects rather than formatting opinions.
+select = ["E4", "E7", "E9", "F", "W", "I", "B", "C4", "SIM", "UP", "BLE", "RUF"]
+ignore = [
+    # Line length is a formatting concern and reflowing ~55 lines would bury real
+    # changes in diff noise. Tracked as a follow-up, not enforced.
+    "E501",
+    # `try/except/pass` is deliberate in the decode and cache-recovery paths, and
+    # contextlib.suppress allocates a context manager in loops that run per image.
+    "SIM105",
+    # int(round(x)) states the intent (round then narrow) more clearly than round(x).
+    "RUF046",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite must redirect user-state environment variables before importing anything
+# that reads them, so its imports cannot come first.
+"tests/*" = ["E402"]
+"scripts/score_baseline.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+# tests/ is on the path so the suite and the baseline script share fake_backend.
+pythonpath = [".", "tests"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["bikini_scanner"]
+ignore_missing_imports = true
+warn_unused_configs = true
+warn_redundant_casts = true
+# The codebase is broadly annotated but not strictly; these are the checks it can pass
+# today. Tightening to --strict is a follow-up, not a prerequisite.
+check_untyped_defs = true
+exclude = "^(dist|build)/"

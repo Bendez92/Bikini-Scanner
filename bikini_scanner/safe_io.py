@@ -4,8 +4,9 @@ import json
 import logging
 import os
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 
 def atomic_write_text(path: str | Path, text: str, encoding: str = "utf-8") -> None:

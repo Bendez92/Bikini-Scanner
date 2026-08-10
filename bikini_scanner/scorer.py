@@ -1,32 +1,34 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import inspect
 import json
 import logging
 import re
 import threading
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterable, Sequence
+from typing import TYPE_CHECKING
 
 import numpy as np
 from PIL import Image
-
-from .linear_model import LogisticRegression, PlattCalibrator, roc_auc, sigmoid as expit, stratified_split
 
 from . import cascade as cascade_module
 from . import learning
 from .cascade import RegionScoreTable
 from .config import (
-    AxisConfig,
     DEFAULT_CLASSIFIER_WEIGHT,
     DEFAULT_ZERO_SHOT_SCALE,
     DEFAULT_ZERO_SHOT_WEIGHT,
+    AxisConfig,
     ScannerConfig,
 )
 from .global_store import GlobalLearningStore
+from .linear_model import LogisticRegression, PlattCalibrator, roc_auc, stratified_split
+from .linear_model import sigmoid as expit
+from .logging_setup import configure_logging
 from .regions import (
     FULL_REGION,
     KIND_FACE,
@@ -36,10 +38,9 @@ from .regions import (
     plan_regions,
     region_kind,
 )
+from .skin import skin_fraction
 from .store import FolderStore, collect_image_paths, safe_stat
 from .vision_analysis import detect_face_boxes, detect_face_count
-from .logging_setup import configure_logging
-from .skin import skin_fraction
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,7 +64,7 @@ FEATURE_AXIS_ORDER = (
 )
 
 if TYPE_CHECKING:
-    from .clip_backend import ImageEmbeddingBackend
+    from .backend_utils import ImageEmbeddingBackend
 
 
 @dataclass(slots=True)
@@ -88,7 +89,7 @@ class ScoreState:
     learning_summary: str = ""
     deep_scanned: int = 0
     detail_regions: list[str] = field(default_factory=list)
-    refine: "RefineResult | None" = None
+    refine: RefineResult | None = None
 
 
 class ScanCancelled(Exception):
@@ -248,7 +249,7 @@ class _ProgressReporter:
                 self._callback(self._done, self._total, rate, eta)
             else:
                 self._callback(progress)
-        except Exception:  # noqa: BLE001
+        except Exception:
             LOGGER.exception("Progress callback failed; continuing the scan")
             self._callback = None
 
@@ -592,7 +593,7 @@ class BikiniScorer:
         if self._global_cache is None:
             try:
                 self._global_cache = GlobalLearningStore(model_name=self.config.model_name)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 LOGGER.exception("Global learning memory unavailable; using folder labels only")
                 return None
         return self._global_cache
@@ -622,17 +623,17 @@ class BikiniScorer:
         store = self._global_store()
         if store is not None:
             signature = hashlib.sha1(
-                json.dumps(sorted(zip(local_paths, local_labels)), separators=(",", ":")).encode("utf-8")
+                json.dumps(sorted(zip(local_paths, local_labels, strict=False)), separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             if signature != self._global_signature:
                 try:
                     store.record(
-                        zip(local_paths, local_labels, local_rows),
+                        zip(local_paths, local_labels, local_rows, strict=False),
                         sequence=int(datetime.now(timezone.utc).timestamp()),
                     )
                     # A cleared label must stop teaching the model.
                     store.forget(str(path) for path in paths if labels.get(str(path)) not in (0, 1))
-                except Exception:  # noqa: BLE001
+                except Exception:
                     LOGGER.exception("Could not update global learning memory")
                 self._global_signature = signature
 
@@ -699,7 +700,7 @@ class BikiniScorer:
         detail_embeddings: np.ndarray | None = None,
         deep_scanned: int = 0,
         detail_regions: Sequence[str] | None = None,
-        refine: "RefineResult | None" = None,
+        refine: RefineResult | None = None,
     ) -> ScoreState:
         embeddings = np.asarray(embeddings, dtype=np.float32)
         if face_counts is not None:
@@ -707,7 +708,7 @@ class BikiniScorer:
         count = len(list(paths))
 
         if self.config.pipeline == "legacy":
-            embeddings_by_path = {path: embedding for path, embedding in zip(paths, embeddings, strict=False)}
+            embeddings_by_path = dict(zip(paths, embeddings, strict=False))
             label_count = self.train_classifier(embeddings_by_path, labels, store=store)
             axis_scores = self.axis_zero_shot_scores(embeddings)
             scores = self.final_scores(embeddings, axis_scores=axis_scores)
@@ -870,7 +871,7 @@ def _candidate_mask(
 
 
 def run_deep_pass(
-    backend: "ImageEmbeddingBackend",
+    backend: ImageEmbeddingBackend,
     scorer: BikiniScorer,
     store: FolderStore | None,
     paths: Sequence[str],
@@ -1122,7 +1123,8 @@ def compute_vlm_scores(
         try:
             responses = client.score_images(uncached_images, cancel_event=cancel_event, on_progress=on_progress)
         except VLMCancelled:
-            raise ScanCancelled
+            # A cancellation is the user's own signal, not an error worth chaining.
+            raise ScanCancelled from None
         for position, response in zip(uncached_positions, responses, strict=False):
             if response is None:
                 continue
@@ -1200,7 +1202,7 @@ def compute_refine_scores(
         refine_config = dataclass_replace(scorer.config, model_name=model_name, refine_model="")
         refine_backend = get_backend(refine_config)
         refine_scorer = BikiniScorer(backend=refine_backend, config=refine_config)
-    except Exception:  # noqa: BLE001
+    except Exception:
         LOGGER.exception("Refine model %s could not be loaded; keeping the base scores", model_name)
         return None
 

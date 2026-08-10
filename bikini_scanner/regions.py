@@ -11,8 +11,9 @@ for the body below it. With no faces, it falls back to fixed bands of the frame.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING
 
 from .vision_analysis import FaceBox
 
@@ -139,9 +140,9 @@ def plan_regions(size: tuple[int, int], faces: Sequence[FaceBox], max_faces: int
     return regions
 
 
-def crop_regions(image: "Image.Image", regions: Sequence[ImageRegion]) -> list[tuple[str, "Image.Image"]]:
+def crop_regions(image: Image.Image, regions: Sequence[ImageRegion]) -> list[tuple[str, Image.Image]]:
     """Materialise the planned crops. Unreadable crops are dropped, never faked."""
-    crops: list[tuple[str, "Image.Image"]] = []
+    crops: list[tuple[str, Image.Image]] = []
     for region in regions:
         if region.box is None:
             crops.append((region.key, image))

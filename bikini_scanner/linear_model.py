@@ -72,7 +72,7 @@ class StandardScaler:
     mean: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     scale: np.ndarray = field(default_factory=lambda: np.ones(0, dtype=np.float32))
 
-    def fit(self, features: np.ndarray) -> "StandardScaler":
+    def fit(self, features: np.ndarray) -> StandardScaler:
         features = np.asarray(features, dtype=np.float64)
         self.mean = features.mean(axis=0).astype(np.float32)
         deviation = features.std(axis=0)
@@ -104,7 +104,7 @@ class LogisticRegression:
     intercept: float = 0.0
     fitted: bool = False
 
-    def fit(self, features: np.ndarray, labels: np.ndarray) -> "LogisticRegression":
+    def fit(self, features: np.ndarray, labels: np.ndarray) -> LogisticRegression:
         features = np.asarray(features, dtype=np.float32)
         labels = np.asarray(labels).astype(np.float64).ravel()
         if features.ndim != 2 or features.shape[0] != labels.shape[0]:
@@ -181,7 +181,7 @@ class PlattCalibrator:
     slope: float = 1.0
     bias: float = 0.0
 
-    def fit(self, features: np.ndarray, labels: np.ndarray) -> "PlattCalibrator":
+    def fit(self, features: np.ndarray, labels: np.ndarray) -> PlattCalibrator:
         scores = self.model.decision_function(features).astype(np.float64).reshape(-1, 1)
         calibrator = LogisticRegression(C=1e6, max_iter=400)
         calibrator.fit(scores.astype(np.float32), labels)

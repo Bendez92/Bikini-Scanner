@@ -7,11 +7,11 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Mapping, Sequence
 
 from PIL import Image, ImageOps
 
@@ -141,10 +141,7 @@ def build_transfer_plan(
         filename = format_output_name(source, score, label, index, timestamp, options.filename_template)
         destination_dir = root.joinpath(*parts) if parts else root
         destination = destination_dir / filename
-        if options.duplicate_policy not in DUPLICATE_POLICIES:
-            duplicate_policy = "rename"
-        else:
-            duplicate_policy = options.duplicate_policy
+        duplicate_policy = "rename" if options.duplicate_policy not in DUPLICATE_POLICIES else options.duplicate_policy
         collision = destination in seen or destination.exists()
         action = "move" if move else "copy"
         reason = ""
@@ -423,7 +420,8 @@ def _inject_jpeg_xmp(path: Path, keyword: str, score: float | None) -> None:
 def _write_pyexiv2_metadata(source: Path, keyword: str, score: float | None) -> bool:
     try:
         import pyexiv2
-    except Exception:
+    except ImportError:
+        # pyexiv2 is an optional extra; its absence is the normal case, not an error.
         return False
     tmp = None
     try:
