@@ -2044,7 +2044,9 @@ class BikiniScannerApp:
         if self.current_state is None or not samples:
             return list(samples)
         try:
-            processed = apply_plugins(self.current_state, list(samples))
+            processed = apply_plugins(
+                self.current_state, list(samples), enabled=self.config.enable_plugins
+            )
         except Exception:
             LOGGER.exception("Review sample plugin processing failed; using unmodified samples.")
             return list(samples)

@@ -97,6 +97,7 @@ DEFAULT_VLM_MAX_IMAGES = 400
 DEFAULT_VLM_CONCURRENCY = 4
 DEFAULT_VLM_TIMEOUT = 60.0
 DEFAULT_VLM_WEIGHT = 0.65
+DEFAULT_ENABLE_PLUGINS = False
 HIGH_ACCURACY_MODEL = "openai/clip-vit-large-patch14"
 # Accept/REJECT decisions are pooled across folders unless this is turned off.
 DEFAULT_GLOBAL_LEARNING = True
@@ -177,6 +178,7 @@ class ScannerConfig:
     vlm_concurrency: int = DEFAULT_VLM_CONCURRENCY
     vlm_timeout: float = DEFAULT_VLM_TIMEOUT
     vlm_weight: float = DEFAULT_VLM_WEIGHT
+    enable_plugins: bool = DEFAULT_ENABLE_PLUGINS
     global_learning: bool = DEFAULT_GLOBAL_LEARNING
     max_learning_weight: float = DEFAULT_MAX_LEARNING_WEIGHT
     detail_strongest_weight: float = DEFAULT_DETAIL_STRONGEST_WEIGHT
@@ -271,6 +273,7 @@ class ScannerConfig:
         config.vlm_concurrency = _coerce_int(mapping.get("vlm_concurrency"), config.vlm_concurrency, 1, 64)
         config.vlm_timeout = _coerce_float(mapping.get("vlm_timeout"), config.vlm_timeout, 1.0, 600.0)
         config.vlm_weight = _coerce_float(mapping.get("vlm_weight"), config.vlm_weight, 0.0, 1.0)
+        config.enable_plugins = _coerce_bool(mapping.get("enable_plugins"), config.enable_plugins)
         config.global_learning = _coerce_bool(mapping.get("global_learning"), config.global_learning)
         config.max_learning_weight = _coerce_float(
             mapping.get("max_learning_weight"), config.max_learning_weight, 0.0, 0.95

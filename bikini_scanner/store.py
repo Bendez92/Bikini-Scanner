@@ -17,6 +17,27 @@ import numpy as np
 from .image_formats import DECODE_VERSION
 from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
 
+# Pickle is used only for the classifier cache. Rather than deleting legacy caches, a
+# restricted unpickler limits what can be loaded to the few scanner-owned classes and
+# basic building blocks a trained model legitimately contains.
+_CLASSIFIER_PICKLE_ALLOWLIST: set[str] = {
+    "builtins",
+    "collections.abc",
+    "copyreg",
+    "numpy",
+    "numpy.core.multiarray",
+    "numpy.core.numeric",
+    "numpy.dtypes",
+    "bikini_scanner.linear_model",
+}
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if module not in _CLASSIFIER_PICKLE_ALLOWLIST and not module.startswith("numpy."):
+            raise pickle.UnpicklingError(f"Refusing to unpickle {module}.{name}")
+        return super().find_class(module, name)
+
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".heic", ".heif"}
 MATCHES_DIR_NAME = "bikini_matches"
 SCAN_METADATA_FILENAME = "scan_metadata.json"
@@ -517,7 +538,7 @@ class FolderStore:
             return None
         try:
             with self.classifier_path.open("rb") as handle:
-                payload = pickle.load(handle)
+                payload = RestrictedUnpickler(handle).load()
         except Exception:  # noqa: BLE001
             return None
         if not isinstance(payload, dict):

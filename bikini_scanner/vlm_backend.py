@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from threading import Event
+from urllib.parse import urlparse
 
 import numpy as np
 from PIL import Image
@@ -91,12 +92,33 @@ class VLMClient:
         timeout: float = 60.0,
         concurrency: int = 4,
     ) -> None:
+        parsed = urlparse(base_url)
+        if not parsed.scheme or not parsed.netloc:
+            raise ValueError(f"VLM base URL must be a valid http/https URL: {base_url}")
+        if parsed.scheme == "http" and api_key.strip():
+            raise ValueError("Refusing to send the VLM API key over plain HTTP")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key.strip()
         self.timeout = max(1.0, float(timeout))
         self.concurrency = max(1, int(concurrency))
         self._cancel_event: Event | None = None
+        if not self._is_loopback(parsed.netloc):
+            LOGGER.warning(
+                "VLM endpoint %s is not on localhost; images will leave this machine", base_url
+            )
+
+    @staticmethod
+    def _is_loopback(netloc: str) -> bool:
+        """Best-effort loopback detection for the URL warning."""
+        host = netloc.split(":", 1)[0].lower().strip("[]")
+        if host in {"localhost", "127.0.0.1", "::1"}:
+            return True
+        try:
+            parts = [int(part) for part in host.split(".")]
+            return len(parts) == 4 and parts[0] == 127
+        except ValueError:
+            return False
 
     def probe(self) -> bool:
         try:

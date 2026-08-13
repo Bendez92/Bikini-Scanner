@@ -144,7 +144,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         return 130
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
-    samples = apply_plugins(state, samples)
+    samples = apply_plugins(state, samples, enabled=config.enable_plugins)
     threshold = float(config.threshold)
     # state_visibility also applies the cascade exclusions (age gate, sex gate).
     visible_mask = scorer.state_visibility(state)
