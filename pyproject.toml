@@ -18,6 +18,7 @@ dependencies = [
     "pillow-heif",
     "psutil",
     "opencv-python-headless",
+    "filelock>=3.0",
     # Drag-and-drop onto the window, and recycle-bin deletes instead of unlink.
     # Listed as required because the GUI depends on both; requirements.txt has
     # always installed them unconditionally.

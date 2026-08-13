@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
@@ -1384,6 +1385,28 @@ def bucketed_sampling(
 
 
 def scan_and_score_folder(
+    backend: ImageEmbeddingBackend,
+    store: FolderStore,
+    scorer: BikiniScorer,
+    threshold: float = 0.5,
+    progress_callback: Callable[[int, int, float, float | None], None] | None = None,
+    batch_size: int = 16,
+    cancel_event: threading.Event | None = None,
+) -> tuple[ScoreState, list[dict[str, object]]]:
+    lock = store.lock() if store is not None else contextlib.nullcontext()
+    with lock:
+        return _scan_and_score_folder_impl(
+            backend,
+            store,
+            scorer,
+            threshold=threshold,
+            progress_callback=progress_callback,
+            batch_size=batch_size,
+            cancel_event=cancel_event,
+        )
+
+
+def _scan_and_score_folder_impl(
     backend: ImageEmbeddingBackend,
     store: FolderStore,
     scorer: BikiniScorer,

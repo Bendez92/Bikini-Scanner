@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Any
 
 
+def _fsync_and_replace(tmp_path: Path, destination: Path) -> None:
+    """Flush the temporary file to disk, then atomically move it into place."""
+    try:
+        with tmp_path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+    os.replace(tmp_path, destination)
+
+
 def atomic_write_text(path: str | Path, text: str, encoding: str = "utf-8") -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -17,7 +27,7 @@ def atomic_write_text(path: str | Path, text: str, encoding: str = "utf-8") -> N
     tmp_path = Path(tmp_name)
     try:
         tmp_path.write_text(text, encoding=encoding)
-        os.replace(tmp_path, destination)
+        _fsync_and_replace(tmp_path, destination)
     except Exception:
         try:
             tmp_path.unlink()
@@ -38,7 +48,7 @@ def atomic_replace(path: str | Path, writer: Callable[[Path], None]) -> None:
     tmp_path = Path(tmp_name)
     try:
         writer(tmp_path)
-        os.replace(tmp_path, destination)
+        _fsync_and_replace(tmp_path, destination)
     except Exception:
         try:
             tmp_path.unlink()

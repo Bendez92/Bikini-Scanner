@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -13,6 +14,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+try:
+    from filelock import FileLock
+
+    _FILELOCK_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _FILELOCK_AVAILABLE = False
 
 from .image_formats import DECODE_VERSION
 from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
@@ -132,12 +140,14 @@ class FolderStore:
     region_embeddings_path: Path = field(init=False)
     vlm_verdicts_path: Path = field(init=False)
     cache_meta_path: Path = field(init=False)
+    lock_path: Path = field(init=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
     _face_count_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _region_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
     _vlm_cache: dict[str, dict[str, float]] | None = field(init=False, default=None, repr=False)
+    _lock: Any = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.folder = self.folder.expanduser().resolve()
@@ -154,7 +164,16 @@ class FolderStore:
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
         self.vlm_verdicts_path = self.cache_dir / VLM_VERDICTS_FILENAME
         self.cache_meta_path = self.cache_dir / CACHE_META_FILENAME
+        self.lock_path = self.cache_dir / ".bikini_scanner.lock"
+        if _FILELOCK_AVAILABLE:
+            self._lock = FileLock(str(self.lock_path))
         self._discard_stale_derived_caches()
+
+    def lock(self, timeout: float = -1) -> Any:
+        """Advisory lock for this folder. Use in a `with` statement."""
+        if self._lock is None:
+            return contextlib.nullcontext()
+        return self._lock.acquire(timeout=timeout)
 
     def _discard_stale_derived_caches(self) -> None:
         """Drop cached work that an older build derived from different pixels.
