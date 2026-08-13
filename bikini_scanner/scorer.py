@@ -27,7 +27,7 @@ from .config import (
 )
 from .global_store import GlobalLearningStore
 from .image_formats import open_oriented
-from .linear_model import LogisticRegression, PlattCalibrator, roc_auc, stratified_split
+from .linear_model import LogisticRegression, PlattCalibrator, logit, roc_auc, stratified_split
 from .linear_model import sigmoid as expit
 from .logging_setup import configure_logging
 from .regions import (
@@ -299,7 +299,9 @@ class BikiniScorer:
             negative_weights=negative_weights,
         )
 
-    def _classifier_signature(self, labeled_paths: Sequence[tuple[str, int]]) -> str:
+    def _classifier_signature(
+        self, labeled_paths: Sequence[tuple[str, int]], feature_width: int | None = None
+    ) -> str:
         labeled_entries: list[dict[str, object]] = []
         for path, label in sorted((str(path), int(label)) for path, label in labeled_paths if label in (0, 1)):
             entry: dict[str, object] = {"path": path, "label": int(label)}
@@ -311,10 +313,12 @@ class BikiniScorer:
                 entry["mtime_ns"] = int(stat.st_mtime_ns)
                 entry["size"] = int(stat.st_size)
             labeled_entries.append(entry)
-        payload = {
+        payload: dict[str, object] = {
             "version": 1,
             "backend": getattr(self.backend, "__class__", type(self.backend)).__name__,
             "model_name": self.config.model_name,
+            "feature_width": feature_width,
+            "feature_layout": list(FEATURE_AXIS_ORDER),
             "labels": labeled_entries,
         }
         return hashlib.sha1(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
@@ -388,7 +392,9 @@ class BikiniScorer:
             self.classifier = None
             return label_count
 
-        signature = self._classifier_signature(labeled_pairs)
+        first_embedding = next(iter(embeddings_by_path.values()))
+        feature_width = int(first_embedding.shape[0]) * 2 + len(FEATURE_AXIS_ORDER)
+        signature = self._classifier_signature(labeled_pairs, feature_width)
         if store is not None:
             cached = store.load_classifier_cache()
             if cached is not None and cached.get("signature") == signature:
@@ -514,7 +520,12 @@ class BikiniScorer:
         if axis_scores is None:
             axis_scores = self.axis_zero_shot_scores(embeddings)
         zero_shot = axis_scores.get("bikini", np.empty((0,), dtype=np.float32))
-        if self.classifier is None or embeddings.size == 0:
+        if (
+            self.classifier is None
+            or embeddings.size == 0
+            or getattr(self.classifier, "coef", None) is None
+            or int(embeddings.shape[1]) != int(self.classifier.coef.shape[0])
+        ):
             return zero_shot
         classifier_scores = self.classifier.predict_proba(embeddings)[:, 1].astype(np.float32)
         return (self.classifier_weight * classifier_scores + self.zero_shot_weight * zero_shot).astype(np.float32)
@@ -676,7 +687,11 @@ class BikiniScorer:
                 mask &= nsfw_scores >= float(self.config.nsfw_threshold)
         person_scores = axis_scores.get("person")
         if self.config.require_person and person_scores is not None:
-            mask &= person_scores >= float(self.config.person_threshold)
+            # The cascade uses evidence-space values, but person_scores are sigmoid outputs.
+            # Compare in evidence space so the same threshold maps to the same gate.
+            mask &= logit(np.asarray(person_scores, dtype=np.float32)) >= logit(
+                float(self.config.person_threshold)
+            )
         if excluded is not None and len(excluded) == len(mask):
             mask &= ~np.asarray(excluded, dtype=bool)
         return mask
@@ -1147,7 +1162,10 @@ def compute_vlm_scores(
             image_count=1,
             full_row=np.array([0], dtype=np.int64),
         )
-        result = cascade_module.evaluate(table, config, None)
+        face_count = None
+        if state.face_counts is not None and index < len(state.face_counts):
+            face_count = np.asarray([state.face_counts[index]], dtype=np.int32)
+        result = cascade_module.evaluate(table, config, face_count)
         if result.score.size:
             scores[index] = float(result.score[0])
             minor[index] = bool(result.stage and result.stage[0] == cascade_module.STAGE_MINOR)

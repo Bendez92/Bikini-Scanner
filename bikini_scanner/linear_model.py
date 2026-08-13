@@ -12,9 +12,12 @@ the shapes the scanner produces (a few hundred labelled rows, ~1k features).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import numpy as np
+
+LOGGER = logging.getLogger(__name__)
 
 
 def sigmoid(values: np.ndarray) -> np.ndarray:
@@ -28,14 +31,23 @@ def sigmoid(values: np.ndarray) -> np.ndarray:
     return out.astype(np.float32)
 
 
+def logit(values: np.ndarray) -> np.ndarray:
+    """Inverse of sigmoid, clamped to keep finite values away from 0 and 1."""
+    values = np.asarray(values, dtype=np.float64)
+    clamped = np.clip(values, 1e-7, 1 - 1e-7)
+    return (np.log(clamped) - np.log1p(-clamped)).astype(np.float32)
+
+
 def roc_auc(labels: np.ndarray, scores: np.ndarray) -> float:
     """Rank-based ROC AUC with tie handling (replaces sklearn.metrics.roc_auc_score)."""
     labels = np.asarray(labels).astype(np.int64).ravel()
     scores = np.asarray(scores, dtype=np.float64).ravel()
     positives = int((labels == 1).sum())
     negatives = int((labels == 0).sum())
-    if positives == 0 or negatives == 0:
-        raise ValueError("ROC AUC needs both classes")
+    if len(labels) < 4 or positives == 0 or negatives == 0:
+        # Too few points or a single class make the AUC an unreliable model-selection
+        # signal; leave it to the caller to fall back to an uninformative score.
+        raise ValueError("ROC AUC needs at least four samples from both classes")
     order = np.argsort(scores, kind="mergesort")
     ranked = scores[order]
     ranks = np.empty(len(scores), dtype=np.float64)
@@ -103,6 +115,7 @@ class LogisticRegression:
     coef: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     intercept: float = 0.0
     fitted: bool = False
+    converged: bool = field(init=False, default=False)
 
     def fit(self, features: np.ndarray, labels: np.ndarray) -> LogisticRegression:
         features = np.asarray(features, dtype=np.float32)
@@ -131,6 +144,8 @@ class LogisticRegression:
         v_int = 0.0
         beta1, beta2, epsilon, step = 0.9, 0.999, 1e-8, 0.1
         previous_loss = np.inf
+        last_loss = np.nan
+        converged = False
         for iteration in range(1, int(self.max_iter) + 1):
             logits = x @ coef + intercept
             probabilities = sigmoid(logits).astype(np.float64)
@@ -153,13 +168,22 @@ class LogisticRegression:
                     -(weights * (labels * np.log(clipped) + (1 - labels) * np.log(1 - clipped))).mean()
                     + 0.5 * penalty * float(coef @ coef) / n
                 )
+                last_loss = loss
                 if abs(previous_loss - loss) < self.tol:
+                    converged = True
                     break
                 previous_loss = loss
 
         self.coef = coef.astype(np.float32)
         self.intercept = float(intercept)
+        self.converged = converged
         self.fitted = True
+        if not converged:
+            LOGGER.warning(
+                "Logistic regression did not converge within %d iterations (final loss change %.3g)",
+                self.max_iter,
+                abs(previous_loss - last_loss) if previous_loss != np.inf else np.nan,
+            )
         return self
 
     def decision_function(self, features: np.ndarray) -> np.ndarray:
@@ -181,7 +205,10 @@ class PlattCalibrator:
     slope: float = 1.0
     bias: float = 0.0
 
-    def fit(self, features: np.ndarray, labels: np.ndarray) -> PlattCalibrator:
+    def fit(self, features: np.ndarray, labels: np.ndarray, min_samples: int = 8) -> PlattCalibrator:
+        labels = np.asarray(labels).astype(np.int64).ravel()
+        if labels.size < min_samples or len(set(labels.tolist())) < 2:
+            raise ValueError("Platt calibration needs at least min_samples from both classes")
         scores = self.model.decision_function(features).astype(np.float64).reshape(-1, 1)
         calibrator = LogisticRegression(C=1e6, max_iter=400)
         calibrator.fit(scores.astype(np.float32), labels)
@@ -221,6 +248,9 @@ def stratified_split(labels: np.ndarray, test_size: int, seed: int = 42) -> tupl
         members = np.nonzero(labels == value)[0]
         rng.shuffle(members)
         share = max(1, int(round(test_size * len(members) / max(total, 1))))
+        # Leave at least one member of the class in the training set if possible,
+        # so a tiny class does not disappear from the training fold entirely.
+        share = min(share, max(0, len(members) - 1))
         test.extend(int(index) for index in members[:share])
     test_index = np.asarray(sorted(set(test)), dtype=np.int64)
     mask = np.ones(total, dtype=bool)

@@ -679,7 +679,9 @@ class NumericPrimitives(unittest.TestCase):
     def test_roc_auc_known_values(self) -> None:
         self.assertAlmostEqual(linear_model.roc_auc([0, 0, 1, 1], [0.1, 0.2, 0.3, 0.4]), 1.0)
         self.assertAlmostEqual(linear_model.roc_auc([0, 0, 1, 1], [0.4, 0.3, 0.2, 0.1]), 0.0)
-        self.assertAlmostEqual(linear_model.roc_auc([0, 1], [0.5, 0.5]), 0.5)
+        # Four samples are required for a reliable estimate; a perfectly tied ranking
+        # should still evaluate to chance.
+        self.assertAlmostEqual(linear_model.roc_auc([0, 0, 1, 1], [0.5, 0.5, 0.5, 0.5]), 0.5)
 
     def test_logistic_regression_separates(self) -> None:
         rng = np.random.default_rng(3)
