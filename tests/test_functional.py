@@ -44,6 +44,7 @@ os.environ["USERPROFILE"] = str(_STATE_DIR)
 from bikini_scanner import (
     cascade,
     config_profiles,
+    image_formats,
     learning,
     linear_model,
     output_ops,
@@ -202,15 +203,7 @@ class VLMAdjudication(unittest.TestCase):
             with self.lock:
                 type(self).calls += 1
             body = json.dumps(
-                {
-                    "choices": [
-                        {
-                            "message": {
-                                "content": '```json\n{"bikini": 1.4, "child": 0.1, "adult": 0.9}\n```'
-                            }
-                        }
-                    ]
-                }
+                {"choices": [{"message": {"content": '```json\n{"bikini": 1.4, "child": 0.1, "adult": 0.9}\n```'}}]}
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -389,9 +382,9 @@ class AgeGate(unittest.TestCase):
             for widget in walk(dialog):
                 info = widget.grid_info() if hasattr(widget, "grid_info") else None
                 if info:
-                    cells[(int(info["row"]), int(info["column"]))] = cells.get(
-                        (int(info["row"]), int(info["column"])), 0
-                    ) + 1
+                    cells[(int(info["row"]), int(info["column"]))] = (
+                        cells.get((int(info["row"]), int(info["column"])), 0) + 1
+                    )
                 try:
                     if "may show a minor" in str(widget.cget("text")):
                         age_box = widget
@@ -461,9 +454,7 @@ class Learning(unittest.TestCase):
         cls.scorer = BikiniScorer(backend=shared["backend"], config=cls.config)
         cls.folder = Path(str(shared["root"]))
         cls.store = FolderStore(cls.folder)
-        cls.state, _ = scan_and_score_folder(
-            shared["backend"], cls.store, cls.scorer, threshold=cls.config.threshold
-        )
+        cls.state, _ = scan_and_score_folder(shared["backend"], cls.store, cls.scorer, threshold=cls.config.threshold)
 
     def _labels(self) -> dict[str, int]:
         ranked = np.argsort(-np.asarray(self.state.zero_shot_scores))
@@ -725,7 +716,6 @@ class ReviewSampling(unittest.TestCase):
         self.assertIn("Model disagrees", {str(sample["bucket"]) for sample in samples})
 
 
-
 class OutputOperations(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -970,6 +960,50 @@ class Robustness(unittest.TestCase):
         with Image.open(sorted(collect_image_paths(Path(str(_shared()["root"]))))[0]) as image:
             count = detect_face_count(image)
         self.assertTrue(count is None or isinstance(count, int))
+
+
+class ImageDecoding(unittest.TestCase):
+    """Orientation-aware loading is central to scoring and display consistency."""
+
+    def test_exif_orientation_tag_is_applied(self) -> None:
+        """A portrait JPEG stored on its side must report portrait dimensions and pixels."""
+        folder = Path(tempfile.mkdtemp(prefix="bikini_exif_"))
+        try:
+            source = folder / "oriented.jpg"
+            # Camera held sideways: raster is 200 wide, 100 tall, but tag says "rotate 90 CW".
+            image = Image.new("RGB", (200, 100), color="blue")
+            exif = image.getexif()
+            exif[0x0112] = 6  # rotate 90 CW -> displayed 100x200
+            image.save(source, exif=exif.tobytes())
+
+            self.assertEqual(image_formats.oriented_size(source), (100, 200))
+
+            opened = image_formats.open_oriented(source)
+            self.assertEqual(opened.size, (100, 200))
+            self.assertEqual(opened.mode, "RGB")
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_decode_version_invalidates_derived_caches(self) -> None:
+        """When the decoder changes, derived caches are discarded once per folder."""
+        folder = Path(tempfile.mkdtemp(prefix="bikini_inval_"))
+        try:
+            store = FolderStore(folder)
+            # Simulate an old decoder version having been recorded.
+            store.cache_meta_path.write_text(json.dumps({"decode_version": 1}), encoding="utf-8")
+            # Pretend derived caches exist.
+            store.embeddings_path.write_bytes(b"x")
+            store.region_embeddings_path.write_bytes(b"x")
+
+            # Creating a new FolderStore should notice the version mismatch and clear
+            # stale derived files while keeping user-owned files such as labels.
+            store2 = FolderStore(folder)
+            self.assertFalse(store2.embeddings_path.exists())
+            self.assertFalse(store2.region_embeddings_path.exists())
+            payload = json.loads(store2.cache_meta_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["decode_version"], image_formats.DECODE_VERSION)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def _cleanup() -> None:

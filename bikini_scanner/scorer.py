@@ -26,6 +26,7 @@ from .config import (
     ScannerConfig,
 )
 from .global_store import GlobalLearningStore
+from .image_formats import open_oriented
 from .linear_model import LogisticRegression, PlattCalibrator, roc_auc, stratified_split
 from .linear_model import sigmoid as expit
 from .logging_setup import configure_logging
@@ -365,7 +366,9 @@ class BikiniScorer:
         return expit(raw).astype(np.float32)
 
     def axis_zero_shot_scores(self, embeddings: np.ndarray) -> dict[str, np.ndarray]:
-        return {axis_name: self._axis_zero_shot_scores(embeddings, axis) for axis_name, axis in self.axis_embeddings.items()}
+        return {
+            axis_name: self._axis_zero_shot_scores(embeddings, axis) for axis_name, axis in self.axis_embeddings.items()
+        }
 
     def zero_shot_scores(self, embeddings: np.ndarray) -> np.ndarray:
         return self.axis_zero_shot_scores(embeddings).get("bikini", np.empty((0,), dtype=np.float32))
@@ -377,9 +380,7 @@ class BikiniScorer:
         store: FolderStore | None = None,
     ) -> int:
         labeled_pairs = [
-            (path, label)
-            for path, label in labels.items()
-            if path in embeddings_by_path and label in (0, 1)
+            (path, label) for path, label in labels.items() if path in embeddings_by_path and label in (0, 1)
         ]
         label_count = len(labeled_pairs)
         label_values = {label for _, label in labeled_pairs}
@@ -429,9 +430,7 @@ class BikiniScorer:
         if self.learning_outcome.cv_auc is not None:
             return float(self.learning_outcome.cv_auc)
         labeled_pairs = [
-            (path, label)
-            for path, label in labels.items()
-            if path in embeddings_by_path and label in (0, 1)
+            (path, label) for path, label in labels.items() if path in embeddings_by_path and label in (0, 1)
         ]
         if len(labeled_pairs) < 6:
             return None
@@ -518,9 +517,7 @@ class BikiniScorer:
         if self.classifier is None or embeddings.size == 0:
             return zero_shot
         classifier_scores = self.classifier.predict_proba(embeddings)[:, 1].astype(np.float32)
-        return (
-            self.classifier_weight * classifier_scores + self.zero_shot_weight * zero_shot
-        ).astype(np.float32)
+        return (self.classifier_weight * classifier_scores + self.zero_shot_weight * zero_shot).astype(np.float32)
 
     # --- cascade plumbing ---------------------------------------------------
     def full_region_table(self, embeddings: np.ndarray) -> RegionScoreTable:
@@ -740,8 +737,7 @@ class BikiniScorer:
                 refine_weight = float(self.config.refine_weight)
                 refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
-                    (1.0 - refine_weight) * zero_shot[refined_rows]
-                    + refine_weight * refine.scores[refined_rows]
+                    (1.0 - refine_weight) * zero_shot[refined_rows] + refine_weight * refine.scores[refined_rows]
                 ).astype(np.float32)
             for index in np.nonzero(refine.minor)[0]:
                 position = int(index)
@@ -777,7 +773,8 @@ class BikiniScorer:
             excluded=result.excluded,
             features=features,
             learning_summary=outcome.summary(),
-            deep_scanned=int(deep_scanned) or (0 if region_table is None else int(max(0, region_table.owner.size - count))),
+            deep_scanned=int(deep_scanned)
+            or (0 if region_table is None else int(max(0, region_table.owner.size - count))),
             detail_regions=list(detail_regions) if detail_regions else [FULL_REGION] * count,
             refine=refine,
         )
@@ -812,7 +809,9 @@ class BikiniScorer:
             [path for path, include in zip(new_state.paths, visible_mask, strict=False) if include],
             [score for score, include in zip(new_state.scores, visible_mask, strict=False) if include],
             labels.keys(),
-            embeddings=[embedding for embedding, include in zip(new_state.embeddings, visible_mask, strict=False) if include],
+            embeddings=[
+                embedding for embedding, include in zip(new_state.embeddings, visible_mask, strict=False) if include
+            ],
             threshold=threshold,
             disagreement=state_disagreement(new_state, visible_mask),
         )
@@ -929,32 +928,30 @@ def run_deep_pass(
         crops: list[tuple[str, np.ndarray]] = []
         if cached:
             # "__faces__" is a sidecar entry, not a region: it must never become a row.
-            crops = [
-                (key, value)
-                for key, value in cached.items()
-                if key != FULL_REGION and not key.startswith("__")
-            ]
+            crops = [(key, value) for key, value in cached.items() if key != FULL_REGION and not key.startswith("__")]
             face_marker = cached.get("__faces__")
             if face_marker is not None and np.asarray(face_marker).size:
                 updated_faces[index] = int(np.asarray(face_marker).ravel()[0])
         else:
             try:
-                with Image.open(path) as handle:
-                    image = handle.convert("RGB")
-                    faces = detect_face_boxes(image)
-                    updated_faces[index] = len(faces)
-                    planned = [
-                        region
-                        for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
-                        if region.key != FULL_REGION
+                # Full resolution on purpose: this pass crops before the model sees
+                # anything, so a scaled decode would throw away the very detail the
+                # crops exist to recover.
+                image = open_oriented(path)
+                faces = detect_face_boxes(image)
+                updated_faces[index] = len(faces)
+                planned = [
+                    region
+                    for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
+                    if region.key != FULL_REGION
+                ]
+                materialised = crop_regions(image, planned)
+                if materialised:
+                    vectors = backend.embed_pil_images([crop for _, crop in materialised])
+                    crops = [
+                        (key, np.asarray(vector, dtype=np.float32))
+                        for (key, _), vector in zip(materialised, vectors, strict=False)
                     ]
-                    materialised = crop_regions(image, planned)
-                    if materialised:
-                        vectors = backend.embed_pil_images([crop for _, crop in materialised])
-                        crops = [
-                            (key, np.asarray(vector, dtype=np.float32))
-                            for (key, _), vector in zip(materialised, vectors, strict=False)
-                        ]
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Deep pass skipped %s: %s", path, exc)
                 crops = []
@@ -990,9 +987,7 @@ def run_deep_pass(
     # Keep, per image, the crop with the strongest detail evidence: that is the view the
     # learned model should train on. Each row only votes on the axes its position allows,
     # so a bottom-of-frame band cannot win the slot by "detecting cleavage".
-    row_detail = cascade_module.combine_detail_rows(
-        table.axis_scores, scorer.config.detail_weights, list(table.kinds)
-    )
+    row_detail = cascade_module.combine_detail_rows(table.axis_scores, scorer.config.detail_weights, list(table.kinds))
     if row_detail.size == matrix.shape[0]:
         for index, rows in detail_rows.items():
             if not rows:
@@ -1076,24 +1071,23 @@ def compute_vlm_scores(
     ranked: list[tuple[float, int, list[Image.Image]]] = []
     for distance, index in candidates:
         try:
-            with Image.open(state.paths[index]) as handle:
-                image = handle.convert("RGB")
-                views = [image.copy()]
-                wanted = detail_regions[index] if index < len(detail_regions) else FULL_REGION
-                if wanted != FULL_REGION:
-                    faces = detect_face_boxes(image)
-                    planned = {
-                        region.key: region
-                        for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
-                    }
-                    region = planned.get(wanted)
-                    if region is not None and region.box is not None:
-                        views.append(image.crop(region.box))
-                skin = skin_fraction(views[-1])
-                # Skin only breaks ties within the eligible band; it never filters.
-                priority = 0 if distance <= band else 1
-                normalized = distance / max(band, 1e-6)
-                ranked.append((priority * 10.0 + normalized - 0.5 * skin, index, views))
+            image = open_oriented(state.paths[index])
+            views = [image]
+            wanted = detail_regions[index] if index < len(detail_regions) else FULL_REGION
+            if wanted != FULL_REGION:
+                faces = detect_face_boxes(image)
+                planned = {
+                    region.key: region
+                    for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
+                }
+                region = planned.get(wanted)
+                if region is not None and region.box is not None:
+                    views.append(image.crop(region.box))
+            skin = skin_fraction(views[-1])
+            # Skin only breaks ties within the eligible band; it never filters.
+            priority = 0 if distance <= band else 1
+            normalized = distance / max(band, 1e-6)
+            ranked.append((priority * 10.0 + normalized - 0.5 * skin, index, views))
         except (OSError, ValueError) as exc:
             LOGGER.warning("VLM pass skipped %s: %s", state.paths[index], exc)
     ranked.sort(key=lambda item: item[0])
@@ -1215,20 +1209,19 @@ def compute_refine_scores(
             raise ScanCancelled
         path = str(state.paths[index])
         try:
-            with Image.open(path) as handle:
-                image = handle.convert("RGB")
-                views: list[tuple[str, Image.Image]] = [(FULL_REGION, image)]
-                wanted = detail_regions[index] if index < len(detail_regions) else FULL_REGION
-                if wanted != FULL_REGION:
-                    faces = detect_face_boxes(image)
-                    planned = {
-                        region.key: region
-                        for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
-                    }
-                    region = planned.get(wanted)
-                    if region is not None and region.box is not None:
-                        views.append((wanted, image.crop(region.box)))
-                vectors = refine_backend.embed_pil_images([view for _, view in views])
+            image = open_oriented(path)
+            views: list[tuple[str, Image.Image]] = [(FULL_REGION, image)]
+            wanted = detail_regions[index] if index < len(detail_regions) else FULL_REGION
+            if wanted != FULL_REGION:
+                faces = detect_face_boxes(image)
+                planned = {
+                    region.key: region
+                    for region in plan_regions(image.size, faces, max_faces=int(scorer.config.max_faces))
+                }
+                region = planned.get(wanted)
+                if region is not None and region.box is not None:
+                    views.append((wanted, image.crop(region.box)))
+            vectors = refine_backend.embed_pil_images([view for _, view in views])
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Refine pass skipped %s: %s", path, exc)
             continue
@@ -1294,7 +1287,9 @@ def bucketed_sampling(
         similarity = float(np.dot(a, b) / (a_norm * b_norm))
         return 1.0 - max(-1.0, min(1.0, similarity))
 
-    def _take(items: list[dict[str, object]], bucket_name: str, sort_key, reverse: bool = False) -> list[dict[str, object]]:
+    def _take(
+        items: list[dict[str, object]], bucket_name: str, sort_key, reverse: bool = False
+    ) -> list[dict[str, object]]:
         ranked = sorted(items, key=sort_key, reverse=reverse)
         selected: list[dict[str, object]] = []
         selected_vectors: list[np.ndarray] = []
@@ -1395,13 +1390,13 @@ def scan_and_score_folder(
     ordered_paths: list[str] = []
     face_counts: list[int | None] = []
     uncached_paths = [path for path in paths if path not in cached_records]
-    LOGGER.info("Scan cache contains %d/%d images; %d require embedding", len(cached_records), len(paths), len(uncached_paths))
+    LOGGER.info(
+        "Scan cache contains %d/%d images; %d require embedding", len(cached_records), len(paths), len(uncached_paths)
+    )
     processed = 0
     scan_timestamp = datetime.now(timezone.utc).isoformat()
     runs_detail_pass = scorer.config.pipeline != "legacy" and scorer.config.deep_scan != "off"
-    reporter = _ProgressReporter(
-        progress_callback, PHASE_SHARES if runs_detail_pass else PHASE_SHARES_NO_DETAIL
-    )
+    reporter = _ProgressReporter(progress_callback, PHASE_SHARES if runs_detail_pass else PHASE_SHARES_NO_DETAIL)
     reporter.start_phase(PHASE_EMBED, len(paths))
 
     def _notify() -> None:
@@ -1480,8 +1475,7 @@ def scan_and_score_folder(
                 content_face_counts[content_hash] = cached_face_count
             elif scorer.config.enable_face_detection:
                 try:
-                    with Image.open(path) as image:
-                        face_count = detect_face_count(image)
+                    face_count = detect_face_count(open_oriented(path))
                 except Exception:  # noqa: BLE001
                     face_count = None
                 if face_count is not None:
@@ -1547,8 +1541,7 @@ def scan_and_score_folder(
                     face_count = None
                     if first_path is not None:
                         try:
-                            with Image.open(first_path) as image:
-                                face_count = detect_face_count(image)
+                            face_count = detect_face_count(open_oriented(first_path))
                         except Exception:  # noqa: BLE001
                             face_count = None
                     if face_count is not None:
@@ -1625,9 +1618,7 @@ def scan_and_score_folder(
     labels = store.load_labels()
 
     # --- deep pass: face and body-region crops for the candidates -------------
-    ordered_hashes = [
-        str(path_records.get(Path(path), {}).get("content_hash") or "") or None for path in ordered_paths
-    ]
+    ordered_hashes = [str(path_records.get(Path(path), {}).get("content_hash") or "") or None for path in ordered_paths]
     deep_started = False
 
     def _deep_progress(done: int, total: int) -> None:
@@ -1732,7 +1723,9 @@ def scan_and_score_folder(
                 "axis_scores": {
                     axis_name: float(axis_scores[idx]) for axis_name, axis_scores in state.axis_scores.items()
                 },
-                "face_count": int(state.face_counts[idx]) if state.face_counts is not None and state.face_counts[idx] >= 0 else None,
+                "face_count": int(state.face_counts[idx])
+                if state.face_counts is not None and state.face_counts[idx] >= 0
+                else None,
                 "label_state": int(labels.get(path)) if path in labels else None,
                 "matched": bool(score >= threshold and visible_mask[idx]),
                 "cascade_stage": state.cascade_stage[idx] if idx < len(state.cascade_stage) else "",

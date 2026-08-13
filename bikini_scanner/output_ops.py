@@ -13,7 +13,9 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
-from PIL import Image, ImageOps
+from PIL import Image
+
+from .image_formats import apply_orientation, open_oriented
 
 LABEL_NAMES = {1: "good", 0: "bad", 2: "skip"}
 OUTPUT_ORGANIZATIONS = {"flat", "score_band", "label", "score_band_label"}
@@ -319,7 +321,7 @@ body {{ font-family: sans-serif; background: #111; color: #eee; margin: 0; paddi
 <body>
 <h1>{html.escape(title)}</h1>
 <div class="grid">
-{''.join(rows)}
+{"".join(rows)}
 </div>
 </body>
 </html>"""
@@ -340,11 +342,10 @@ def _write_thumbnail(destination: Path, path: Path, thumb_size: int) -> None:
 
 
 def _thumbnail_bytes(path: Path, thumb_size: int) -> bytes:
-    with Image.open(path) as image:
-        image = ImageOps.exif_transpose(image).convert("RGB")
-        image.thumbnail((thumb_size, thumb_size))
-        buffer = BytesIO()
-        image.save(buffer, format="JPEG", quality=75)
+    image = open_oriented(path)
+    image.thumbnail((thumb_size, thumb_size))
+    buffer = BytesIO()
+    image.save(buffer, format="JPEG", quality=75)
     return buffer.getvalue()
 
 
@@ -359,8 +360,8 @@ def write_image_metadata(path: str | Path, keyword: str, score: float | None = N
         return True
     tmp = None
     try:
-        with Image.open(source) as image:
-            image = ImageOps.exif_transpose(image)
+        with Image.open(source) as handle:
+            image = apply_orientation(handle)
             exif = image.getexif()
             exif[40094] = keyword.encode("utf-16le")
             if score is not None:
@@ -400,7 +401,7 @@ def _xmp_packet(keyword: str, score: float | None) -> bytes:
         f"<dc:subject><rdf:Bag><rdf:li>{escaped_keyword}</rdf:li></rdf:Bag></dc:subject>"
         f"<lr:hierarchicalSubject><rdf:Bag><rdf:li>{escaped_keyword}</rdf:li></rdf:Bag></lr:hierarchicalSubject>"
         f"{score_property}"
-        "</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end=\"w\"?>"
+        '</rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>'
     )
     return b"http://ns.adobe.com/xap/1.0/\x00" + xml.encode("utf-8")
 

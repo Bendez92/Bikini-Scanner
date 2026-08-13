@@ -32,6 +32,11 @@ onnx = [
     "onnxruntime==1.28.0",
     "onnxscript==0.7.1",
 ]
+dev = [
+    "ruff>=0.6,<1",
+    "mypy>=1.11,<2",
+    "pytest>=8.0,<9",
+]
 
 [project.scripts]
 bikini-scanner = "bikini_scanner.run:main"
@@ -41,13 +46,6 @@ packages = ["bikini_scanner"]
 
 [tool.setuptools.dynamic]
 version = { attr = "bikini_scanner.__version__.__version__" }
-
-[project.optional-dependencies.dev]
-dev = [
-    "ruff>=0.6,<1",
-    "mypy>=1.11,<2",
-    "pytest>=8.0,<9",
-]
 
 [tool.ruff]
 line-length = 120
@@ -83,7 +81,7 @@ python_files = ["test_*.py"]
 pythonpath = [".", "tests"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 files = ["bikini_scanner"]
 ignore_missing_imports = true
 warn_unused_configs = true
@@ -92,3 +90,8 @@ warn_redundant_casts = true
 # today. Tightening to --strict is a follow-up, not a prerequisite.
 check_untyped_defs = true
 exclude = "^(dist|build)/"
+
+[[tool.mypy.overrides]]
+module = "numpy.*"
+# NumPy 2.x stubs use Python 3.12+ `type` syntax that mypy --python-version 3.10 cannot parse.
+follow_imports = "skip"

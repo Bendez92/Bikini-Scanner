@@ -54,8 +54,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--copy", action="store_true", help="Copy matches to the output destination")
     parser.add_argument("--move", action="store_true", help="Move matches to the output destination")
     parser.add_argument("--html-report", default="", help="Write an HTML report to this path")
-    parser.add_argument("--dry-run", action="store_true", help="Print the transfer plan without copying or moving files")
-    parser.add_argument("--write-metadata", action="store_true", help="Write bikini keyword metadata into matched images")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the transfer plan without copying or moving files"
+    )
+    parser.add_argument(
+        "--write-metadata", action="store_true", help="Write bikini keyword metadata into matched images"
+    )
     parser.add_argument("--profile", default="", help="Saved or built-in profile name")
     return parser
 
@@ -159,7 +163,9 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         if not path:
             continue
         state_index = path_index.get(path, -1)
-        axes = {name: float(values[state_index]) for name, values in state.axis_scores.items()} if state_index >= 0 else {}
+        axes = (
+            {name: float(values[state_index]) for name, values in state.axis_scores.items()} if state_index >= 0 else {}
+        )
         records.append(
             {
                 "path": path,
@@ -201,11 +207,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         )
         emit(f"HTML report written to {report_path}")
     if args.write_metadata:
-        written = sum(
-            1
-            for path in visible_matches
-            if write_image_metadata(path, "bikini", score=scores.get(path))
-        )
+        written = sum(1 for path in visible_matches if write_image_metadata(path, "bikini", score=scores.get(path)))
         emit(f"Metadata written to {written}/{len(visible_matches)} matched files.")
     if args.copy or args.move or args.dry_run:
         if args.copy and args.move:

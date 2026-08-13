@@ -16,7 +16,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from io import BytesIO
 from itertools import islice
 from pathlib import Path
 from typing import Protocol
@@ -24,7 +23,19 @@ from typing import Protocol
 import numpy as np
 from PIL import Image
 
+from .image_formats import apply_orientation, register_heif_support
+
+# Decoding happens here, so HEIC/HEIF support is registered here rather than depending
+# on whichever backend module happened to be imported first.
+register_heif_support()
+
 LOGGER = logging.getLogger(__name__)
+
+# CLIP resamples to 224x224. Decoding at 448 leaves headroom for the processor's
+# resize-and-centre-crop (which trims the long edge) while still letting libjpeg skip
+# most of the work on a large photo.
+DECODE_TARGET_PX = 448
+_HASH_CHUNK_BYTES = 1024 * 1024
 
 
 @dataclass(slots=True)
@@ -35,14 +46,38 @@ class DecodedImage:
     error: str | None = None
 
 
-def decode_image(path: Path) -> DecodedImage:
+def decode_image(path: Path, target_size: int | None = DECODE_TARGET_PX) -> DecodedImage:
+    """Read, hash and decode one image ready for embedding.
+
+    Three things this deliberately does not do any more:
+
+    * It no longer slurps the whole file into memory to hash it. A 40 MP JPEG was being
+      held twice over - once as raw bytes for the SHA-1, once as the decoded raster -
+      across every decode thread at once. The hash is streamed in chunks instead.
+    * It no longer decodes at full resolution. CLIP resamples to 224x224, so decoding a
+      24 MP frame produces a 72 MB buffer that is immediately thrown away. `draft()`
+      asks libjpeg for the nearest DCT-scaled size at or above the target, which is
+      several times faster and costs nothing in accuracy at the model's input size.
+      It is a no-op for formats that cannot do scaled decoding.
+    * It no longer ignores EXIF orientation - see `image_formats`.
+
+    `target_size` is the shortest edge we want to keep. None decodes at full size, which
+    the region pass needs because it crops before the model sees anything.
+    """
     try:
-        data = path.read_bytes()
-        content_hash = hashlib.sha1(data).hexdigest()
-        with Image.open(BytesIO(data)) as image:
+        digest = hashlib.sha1()
+        with path.open("rb") as handle:
+            while chunk := handle.read(_HASH_CHUNK_BYTES):
+                digest.update(chunk)
+        content_hash = digest.hexdigest()
+        with Image.open(path) as image:
+            if target_size:
+                # draft() only ever picks a size >= the request, so this cannot
+                # under-resolve the model input.
+                image.draft("RGB", (target_size, target_size))
             return DecodedImage(
                 path=path,
-                image=image.convert("RGB").copy(),
+                image=apply_orientation(image).convert("RGB"),
                 content_hash=content_hash,
             )
     except Exception as exc:  # noqa: BLE001
@@ -101,9 +136,7 @@ class ImageEmbeddingBackend(Protocol):
 
     def embed_pil_images(self, images: Sequence[Image.Image]) -> np.ndarray: ...
 
-    def iter_image_batches(
-        self, paths: Iterable[str | Path], batch_size: int = 16
-    ) -> Iterator[list[DecodedImage]]: ...
+    def iter_image_batches(self, paths: Iterable[str | Path], batch_size: int = 16) -> Iterator[list[DecodedImage]]: ...
 
     def embed_texts(self, prompts: Sequence[str]) -> np.ndarray: ...
 
@@ -140,9 +173,7 @@ class ClipBackendBase(ABC):
             return np.empty((0, self.image_embedding_dim), dtype=np.float32)
         return np.vstack(self._embed_image_batch(images)).astype(np.float32)
 
-    def iter_image_batches(
-        self, paths: Iterable[str | Path], batch_size: int = 16
-    ) -> Iterator[list[DecodedImage]]:
+    def iter_image_batches(self, paths: Iterable[str | Path], batch_size: int = 16) -> Iterator[list[DecodedImage]]:
         yield from iter_decoded_image_batches(paths, batch_size=batch_size)
 
     @abstractmethod

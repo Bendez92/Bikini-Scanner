@@ -135,12 +135,8 @@ class RegionScoreTable:
 
         anchored = full.copy()
         unanchored = full.copy()
-        anchored_mask = np.array(
-            [kind in eligible and kind not in UNANCHORED_KINDS for kind in self.kinds], dtype=bool
-        )
-        unanchored_mask = np.array(
-            [kind in eligible and kind in UNANCHORED_KINDS for kind in self.kinds], dtype=bool
-        )
+        anchored_mask = np.array([kind in eligible and kind not in UNANCHORED_KINDS for kind in self.kinds], dtype=bool)
+        unanchored_mask = np.array([kind in eligible and kind in UNANCHORED_KINDS for kind in self.kinds], dtype=bool)
         if anchored_mask.any():
             np.maximum.at(anchored, self.owner[anchored_mask], scores[anchored_mask])
         if unanchored_mask.any():
@@ -272,9 +268,7 @@ def evaluate(
     else:
         person_pass = np.ones((count,), dtype=bool)
     female_pass = (
-        np.ones((count,), dtype=bool)
-        if not config.require_female
-        else female >= float(config.female_threshold)
+        np.ones((count,), dtype=bool) if not config.require_female else female >= float(config.female_threshold)
     )
 
     detail = combine_detail(
@@ -299,7 +293,9 @@ def evaluate(
         # is enough to act on.
         reads_younger = has_face & (child > adult + float(config.face_anchored_margin)) & (child >= threshold * 0.4)
         # Positive adult evidence is required before surfacing anything as a match.
-        weak_adult = has_face & (detail >= float(config.weak_adult_detail)) & (adult < float(config.min_adult_confidence))
+        weak_adult = (
+            has_face & (detail >= float(config.weak_adult_detail)) & (adult < float(config.min_adult_confidence))
+        )
         age_fail = looks_minor | strongly_minor | reads_younger | weak_adult
     else:
         age_fail = np.zeros((count,), dtype=bool)
@@ -310,7 +306,9 @@ def evaluate(
     else:
         person_conf = np.ones((count,), dtype=np.float32)
     if config.require_female:
-        female_conf = _ramp(female, max(0.0, float(config.female_threshold) - 0.05), float(config.female_threshold) + 0.35)
+        female_conf = _ramp(
+            female, max(0.0, float(config.female_threshold) - 0.05), float(config.female_threshold) + 0.35
+        )
         # Never zero out on the sex axis alone: it is the least reliable read on a crop
         # that does not include a face.
         female_conf = np.maximum(female_conf, 0.25)

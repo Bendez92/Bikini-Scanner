@@ -44,6 +44,7 @@ from .config import HIGH_ACCURACY_MODEL, ScannerConfig
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
 from .global_store import GlobalLearningStore
 from .i18n import _
+from .image_formats import open_oriented, oriented_size
 from .logging_setup import configure_logging, log_path, read_log_tail
 from .output_ops import (
     OutputOptions,
@@ -144,7 +145,9 @@ class BikiniScannerApp:
         self.output_duplicate_var = StringVar(value=str(self.user_prefs.get("output_duplicate", "rename")))
         self.output_score_low_var = DoubleVar(value=float(self.user_prefs.get("output_score_low", 0.35)))
         self.output_score_high_var = DoubleVar(value=float(self.user_prefs.get("output_score_high", 0.7)))
-        self.recent_folders: list[str] = [str(item) for item in self.user_prefs.get("recent_folders", []) if isinstance(item, str)]
+        self.recent_folders: list[str] = [
+            str(item) for item in self.user_prefs.get("recent_folders", []) if isinstance(item, str)
+        ]
         self.move_files_var = BooleanVar(value=False)
         self.nsfw_only_var = BooleanVar(value=self.config.nsfw_filter == "only")
         self.hardware_var = StringVar(value="")
@@ -326,12 +329,12 @@ class BikiniScannerApp:
         ).pack(side=TOP, pady=(4, 0))
         preview_buttons = ttk.Frame(self.preview_frame)
         preview_buttons.pack(side=TOP, pady=(6, 0))
-        ttk.Button(
-            preview_buttons, text=_("Accept (A)"), width=14, command=lambda: self.label_focused_card(1)
-        ).pack(side=LEFT, padx=(0, 8))
-        ttk.Button(
-            preview_buttons, text=_("REJECT (D)"), width=14, command=lambda: self.label_focused_card(0)
-        ).pack(side=LEFT)
+        ttk.Button(preview_buttons, text=_("Accept (A)"), width=14, command=lambda: self.label_focused_card(1)).pack(
+            side=LEFT, padx=(0, 8)
+        )
+        ttk.Button(preview_buttons, text=_("REJECT (D)"), width=14, command=lambda: self.label_focused_card(0)).pack(
+            side=LEFT
+        )
         self.preview_image_label.bind(
             "<Double-Button-1>",
             lambda _event: self.view_image(self.focused_path) if self.focused_path else None,
@@ -420,9 +423,9 @@ class BikiniScannerApp:
         # An en dash is the correct typography for a numeric range separator here.
         ttk.Label(row_one, text="–", style="Muted.TLabel").pack(side=LEFT)  # noqa: RUF001
         ttk.Entry(row_one, textvariable=self.score_max_var, width=5).pack(side=LEFT, padx=(2, 12))
-        ttk.Checkbutton(
-            row_one, text=_("Only NSFW"), variable=self.nsfw_only_var, command=self._toggle_nsfw_only
-        ).pack(side=LEFT)
+        ttk.Checkbutton(row_one, text=_("Only NSFW"), variable=self.nsfw_only_var, command=self._toggle_nsfw_only).pack(
+            side=LEFT
+        )
         clear_button = ttk.Button(row_one, text=_("Clear filters"), command=self.clear_filters)
         clear_button.pack(side=RIGHT)
 
@@ -448,7 +451,10 @@ class BikiniScannerApp:
         ttk.Button(row, text=_("Run queue"), command=self.run_queue).pack(side=LEFT, padx=6)
         ttk.Button(row, text=_("Stop queue"), command=self.stop_queue).pack(side=LEFT)
         ttk.Checkbutton(
-            row, text=_("Watch this folder for new photos"), variable=self.watch_enabled_var, command=self._toggle_watch_mode
+            row,
+            text=_("Watch this folder for new photos"),
+            variable=self.watch_enabled_var,
+            command=self._toggle_watch_mode,
         ).pack(side=LEFT, padx=16)
         self.queue_listbox = Listbox(panel, height=3)
         self.queue_listbox.pack(side=TOP, fill="x", pady=(8, 0))
@@ -525,14 +531,16 @@ class BikiniScannerApp:
         )
         self.progress_bar.pack(side=LEFT, fill="x", expand=True)
         # Fixed width so the bar does not twitch as the percentage text changes length.
-        ttk.Label(
-            bar_row, textvariable=self.progress_text_var, width=6, anchor="e", style="Toolbar.TLabel"
-        ).pack(side=LEFT, padx=(8, 0))
+        ttk.Label(bar_row, textvariable=self.progress_text_var, width=6, anchor="e", style="Toolbar.TLabel").pack(
+            side=LEFT, padx=(8, 0)
+        )
 
         status_row = ttk.Frame(outer, style="Toolbar.TFrame")
         status_row.pack(side=TOP, fill="x")
         self._status_row = status_row
-        ttk.Label(status_row, textvariable=self.status_var, style="Toolbar.TLabel").pack(side=LEFT, fill="x", expand=True)
+        ttk.Label(status_row, textvariable=self.status_var, style="Toolbar.TLabel").pack(
+            side=LEFT, fill="x", expand=True
+        )
         # VLM badge: visible only when VLM adjudication is enabled, so the user knows
         # the scan includes a second-opinion stage.
         self.vlm_badge = ttk.Label(status_row, text="VLM", style="Accent.TLabel", padding=(4, 0))
@@ -671,7 +679,10 @@ class BikiniScannerApp:
         self._sync_panel_buttons()
 
     def _sync_panel_buttons(self) -> None:
-        for name, button in (("filters", getattr(self, "filter_toggle", None)), ("queue", getattr(self, "queue_toggle", None))):
+        for name, button in (
+            ("filters", getattr(self, "filter_toggle", None)),
+            ("queue", getattr(self, "queue_toggle", None)),
+        ):
             if button is None:
                 continue
             label = _("Filters & view") if name == "filters" else _("Queue")
@@ -684,9 +695,7 @@ class BikiniScannerApp:
                 continue
 
     def _theme_button_text(self) -> str:
-        return {"dark": "Theme: Dark", "light": "Theme: Light"}.get(
-            self.theme_var.get().strip().lower(), "Theme: Auto"
-        )
+        return {"dark": "Theme: Dark", "light": "Theme: Light"}.get(self.theme_var.get().strip().lower(), "Theme: Auto")
 
     def cycle_theme(self) -> None:
         order = ["dark", "light", "system"]
@@ -910,7 +919,9 @@ class BikiniScannerApp:
             lightcolor=palette["entry_bg"],
             darkcolor=palette["entry_bg"],
         )
-        style.map("TEntry", fieldbackground=[("disabled", palette["panel"])], foreground=[("disabled", palette["muted"])])
+        style.map(
+            "TEntry", fieldbackground=[("disabled", palette["panel"])], foreground=[("disabled", palette["muted"])]
+        )
         # Combobox: the field, the arrow, and the popdown list are three separate surfaces.
         style.configure(
             "TCombobox",
@@ -942,7 +953,9 @@ class BikiniScannerApp:
             lightcolor=palette["entry_bg"],
             darkcolor=palette["entry_bg"],
         )
-        style.map("TSpinbox", fieldbackground=[("disabled", palette["panel"])], foreground=[("disabled", palette["muted"])])
+        style.map(
+            "TSpinbox", fieldbackground=[("disabled", palette["panel"])], foreground=[("disabled", palette["muted"])]
+        )
         for scale_style in ("Horizontal.TScale", "Vertical.TScale"):
             # `background` is the draggable thumb here, not the strip behind it.
             style.configure(
@@ -1030,7 +1043,11 @@ class BikiniScannerApp:
         )
         style.map(
             "Accent.TButton",
-            background=[("active", palette["accent_active"]), ("pressed", palette["accent_active"]), ("disabled", palette["button_bg"])],
+            background=[
+                ("active", palette["accent_active"]),
+                ("pressed", palette["accent_active"]),
+                ("disabled", palette["button_bg"]),
+            ],
             foreground=[("disabled", palette["muted"]), ("active", palette["accent_fg"])],
             lightcolor=[("active", palette["accent_active"]), ("pressed", palette["accent_active"])],
             darkcolor=[("active", palette["accent_active"]), ("pressed", palette["accent_active"])],
@@ -1354,7 +1371,9 @@ class BikiniScannerApp:
             (_("Tools"), tools_menu),
             (_("Help"), help_menu),
         ):
-            button = ttk.Menubutton(self.menu_bar_frame, text=label, menu=menu, direction="below", style="MenuBar.TMenubutton")
+            button = ttk.Menubutton(
+                self.menu_bar_frame, text=label, menu=menu, direction="below", style="MenuBar.TMenubutton"
+            )
             button.pack(side=LEFT, padx=(0, 2))
         self.recent_menu = recent_menu
         self._rebuild_recent_menu()
@@ -1393,11 +1412,7 @@ class BikiniScannerApp:
             self.open_folder(folders[0], scan=True)
             return "break"
         image_suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
-        image_paths = [
-            path
-            for path in paths
-            if Path(path).is_file() and Path(path).suffix.lower() in image_suffixes
-        ]
+        image_paths = [path for path in paths if Path(path).is_file() and Path(path).suffix.lower() in image_suffixes]
         if image_paths:
             self.open_folder(str(Path(image_paths[0]).parent), scan=True)
             return "break"
@@ -1670,7 +1685,11 @@ class BikiniScannerApp:
             self.notice_var.set("")
             return
         labels = self.store.load_labels() if self.store is not None else {}
-        counts = self.scorer.label_counts(labels) if self.scorer is not None else {"good": 0, "bad": 0, "skip": 0, "unlabeled": 0}
+        counts = (
+            self.scorer.label_counts(labels)
+            if self.scorer is not None
+            else {"good": 0, "bad": 0, "skip": 0, "unlabeled": 0}
+        )
         unlabeled = sum(1 for path in self.current_state.paths if path not in labels)
         counts["unlabeled"] = unlabeled
         quality = None
@@ -1962,7 +1981,9 @@ class BikiniScannerApp:
     def _show_update_result(self, result: dict[str, str] | None) -> None:
         self.status_var.set("Update check complete.")
         if result is None:
-            messagebox.showinfo("Check for updates", f"You are up to date ({__version__}), or the update server was unreachable.")
+            messagebox.showinfo(
+                "Check for updates", f"You are up to date ({__version__}), or the update server was unreachable."
+            )
             return
         download_url = result.get("download_url", "")
         message = f"Version {result['latest_version']} is available."
@@ -2003,7 +2024,9 @@ class BikiniScannerApp:
         mask = self._result_visibility_mask()
         paths = [path for path, include in zip(self.current_state.paths, mask, strict=False) if include]
         scores = [score for score, include in zip(self.current_state.scores, mask, strict=False) if include]
-        embeddings = [embedding for embedding, include in zip(self.current_state.embeddings, mask, strict=False) if include]
+        embeddings = [
+            embedding for embedding, include in zip(self.current_state.embeddings, mask, strict=False) if include
+        ]
         labels = self.store.load_labels().keys() if self.store is not None else []
         return bucketed_sampling(
             paths,
@@ -2239,8 +2262,7 @@ class BikiniScannerApp:
         self.view_mode = "similar"
         self.similar_anchor_path = anchor_path
         self.current_samples = [
-            {"path": path, "score": similarity, "bucket": "Similar"}
-            for path, similarity in ranking
+            {"path": path, "score": similarity, "bucket": "Similar"} for path, similarity in ranking
         ]
         self.status_var.set(f"Showing similar images to {Path(anchor_path).name}.")
         self._refresh_displayed_results()
@@ -2277,7 +2299,7 @@ class BikiniScannerApp:
             return
         viewer, outer = self._create_modal(Path(path).name, padding=0, geometry="1000x800")
         try:
-            image = Image.open(path).convert("RGB")
+            image = open_oriented(path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("View failed", str(exc), parent=viewer)
             viewer.destroy()
@@ -2290,7 +2312,9 @@ class BikiniScannerApp:
         ttk.Label(top, text=info).pack(side=LEFT, padx=10)
         canvas = Canvas(outer, highlightthickness=0, bg=self._palette()["bg"])
         canvas.pack(fill=BOTH, expand=True)
-        overlay = canvas.create_text(10, 10, anchor="nw", text=self._axis_details_text(path), fill=self._palette()["fg"])
+        overlay = canvas.create_text(
+            10, 10, anchor="nw", text=self._axis_details_text(path), fill=self._palette()["fg"]
+        )
         state = {"zoom": 1.0, "offset_x": 0, "offset_y": 0}
         photo_ref: list[ImageTk.PhotoImage] = []
 
@@ -2339,8 +2363,10 @@ class BikiniScannerApp:
     def _file_info_text(self, path: str) -> str:
         try:
             stat = Path(path).stat()
-            with Image.open(path) as image:
-                size_text = f"{image.width}x{image.height}"
+            # Displayed dimensions, so a portrait phone photo does not report itself as
+            # landscape. Reads the header only; the raster is never decoded.
+            width, height = oriented_size(path)
+            size_text = f"{width}x{height}"
         except Exception:  # noqa: BLE001
             return path
         modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
@@ -2424,11 +2450,15 @@ class BikiniScannerApp:
                 child.destroy()
             preview_refs.clear()
             if not ranked:
-                ttk.Label(scroll_frame, text="No results matched the current filters.").grid(row=0, column=0, padx=10, pady=10)
+                ttk.Label(scroll_frame, text="No results matched the current filters.").grid(
+                    row=0, column=0, padx=10, pady=10
+                )
                 status_label.configure(text="No results.")
                 return
             for row, (path, score) in enumerate(ranked):
-                preview_refs.append(self._render_card(scroll_frame, path, score, row, register=False, show_actions=False))
+                preview_refs.append(
+                    self._render_card(scroll_frame, path, score, row, register=False, show_actions=False)
+                )
             status_label.configure(text=f"Computed prompt scores for {len(ranked)} images.")
 
         button_row = ttk.Frame(outer)
@@ -2493,9 +2523,7 @@ class BikiniScannerApp:
             import urllib.request
 
             try:
-                request = urllib.request.Request(
-                    vision_analysis.MODEL_URL, headers={"User-Agent": "bikini-scanner"}
-                )
+                request = urllib.request.Request(vision_analysis.MODEL_URL, headers={"User-Agent": "bikini-scanner"})
                 with urllib.request.urlopen(request, timeout=60) as response:
                     payload = response.read()
                 target = vision_analysis.install_model_from_bytes(payload)
@@ -2609,9 +2637,7 @@ class BikiniScannerApp:
 
         def add_section(row: int, title: str) -> None:
             """A separator plus a bold header to break up the settings form."""
-            ttk.Separator(form, orient="horizontal").grid(
-                row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4)
-            )
+            ttk.Separator(form, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
             ttk.Label(form, text=title, font=("TkDefaultFont", 10, "bold")).grid(
                 row=row + 1, column=0, sticky="w", pady=(0, 4)
             )
@@ -2989,10 +3015,14 @@ class BikiniScannerApp:
             try:
                 thumbnail_cache_size = int(thumbnail_cache_var.get().strip())
             except Exception:  # noqa: BLE001
-                messagebox.showerror("Invalid settings", "Thumbnail cache entries must be an integer from 32 to 2048.", parent=dialog)
+                messagebox.showerror(
+                    "Invalid settings", "Thumbnail cache entries must be an integer from 32 to 2048.", parent=dialog
+                )
                 return
             if not 32 <= thumbnail_cache_size <= 2048:
-                messagebox.showerror("Invalid settings", "Thumbnail cache entries must be from 32 to 2048.", parent=dialog)
+                messagebox.showerror(
+                    "Invalid settings", "Thumbnail cache entries must be from 32 to 2048.", parent=dialog
+                )
                 return
             try:
                 zero_shot_scale = float(scale_var.get().strip())
@@ -3105,9 +3135,10 @@ class BikiniScannerApp:
             )
             # A deep-scan or refine change needs a fresh scan, not just a re-filter:
             # both change what gets embedded.
-            rescan_needed = deep_scan != self.config.deep_scan or (
-                HIGH_ACCURACY_MODEL if bool(refine_var.get()) else ""
-            ) != self.config.refine_model
+            rescan_needed = (
+                deep_scan != self.config.deep_scan
+                or (HIGH_ACCURACY_MODEL if bool(refine_var.get()) else "") != self.config.refine_model
+            )
             vlm_changed = (
                 bool(vlm_enabled_var.get()) != self.config.vlm_enabled
                 or vlm_base_url != self.config.vlm_base_url
@@ -3192,8 +3223,7 @@ class BikiniScannerApp:
         reset_override.pack(side=LEFT)
         self._tooltip(
             reset_override,
-            "Discard the settings saved just for the current folder, so it goes back to using "
-            "your normal settings.",
+            "Discard the settings saved just for the current folder, so it goes back to using your normal settings.",
         )
         save_override = ttk.Button(button_row, text="Save folder override", command=self._save_folder_override)
         save_override.pack(side=LEFT, padx=6)
@@ -3254,7 +3284,9 @@ class BikiniScannerApp:
         template_entry = ttk.Entry(form, textvariable=template_var, width=46)
         template_entry.grid(row=1, column=1, sticky="ew", pady=(0, 8))
         ttk.Label(form, text="Duplicate policy").grid(row=2, column=0, sticky="w", pady=(0, 4))
-        dup_combo = ttk.Combobox(form, textvariable=duplicate_var, values=("skip", "rename", "overwrite"), state="readonly")
+        dup_combo = ttk.Combobox(
+            form, textvariable=duplicate_var, values=("skip", "rename", "overwrite"), state="readonly"
+        )
         dup_combo.grid(row=2, column=1, sticky="ew", pady=(0, 8))
         ttk.Label(form, text="Score band low").grid(row=3, column=0, sticky="w", pady=(0, 4))
         low_entry = ttk.Entry(form, textvariable=low_var, width=18)
@@ -3291,7 +3323,9 @@ class BikiniScannerApp:
                 messagebox.showerror("Invalid settings", "Score cutoffs must be numeric.", parent=dialog)
                 return
             if not (0.0 <= low_value <= 1.0 and 0.0 <= high_value <= 1.0 and low_value <= high_value):
-                messagebox.showerror("Invalid settings", "Score cutoffs must be between 0 and 1 and low <= high.", parent=dialog)
+                messagebox.showerror(
+                    "Invalid settings", "Score cutoffs must be between 0 and 1 and low <= high.", parent=dialog
+                )
                 return
             template = template_var.get().strip()
             if not template:
@@ -3366,9 +3400,10 @@ class BikiniScannerApp:
         profile_var = StringVar(value=profile_names()[0] if profile_names() else "")
         combo = ttk.Combobox(outer, textvariable=profile_var, values=profile_names(), state="readonly", width=30)
         combo.pack(side=TOP, anchor="w", pady=(0, 10))
-        ttk.Label(outer, text="Built-in profiles cannot be deleted. Apply a profile, then save it as a custom profile if desired.").pack(
-            side=TOP, anchor="w", pady=(0, 10)
-        )
+        ttk.Label(
+            outer,
+            text="Built-in profiles cannot be deleted. Apply a profile, then save it as a custom profile if desired.",
+        ).pack(side=TOP, anchor="w", pady=(0, 10))
         buttons = self._modal_button_row(outer, pady=(0, 0))
 
         def refresh() -> None:
@@ -3436,9 +3471,7 @@ class BikiniScannerApp:
         image_suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
         try:
             image_count = sum(
-                1
-                for entry in Path(folder).rglob("*")
-                if entry.is_file() and entry.suffix.lower() in image_suffixes
+                1 for entry in Path(folder).rglob("*") if entry.is_file() and entry.suffix.lower() in image_suffixes
             )
         except OSError:
             image_count = 0
@@ -3564,11 +3597,13 @@ class BikiniScannerApp:
                 return
             self._after(
                 0,
-                lambda token=generation, new_state=state, new_samples=samples, is_full=full_rescan: self._scan_completed(
-                    token,
-                    new_state,
-                    new_samples,
-                    is_full,
+                lambda token=generation, new_state=state, new_samples=samples, is_full=full_rescan: (
+                    self._scan_completed(
+                        token,
+                        new_state,
+                        new_samples,
+                        is_full,
+                    )
                 ),
             )
 
@@ -3659,14 +3694,16 @@ class BikiniScannerApp:
         threshold = float(self.threshold_var.get())
         visible_mask = self._result_visibility_mask()
         matches = sum(
-            1
-            for score, include in zip(state.scores, visible_mask, strict=False)
-            if include and score >= threshold
+            1 for score, include in zip(state.scores, visible_mask, strict=False) if include and score >= threshold
         )
         if full_rescan:
-            LOGGER.info("Scan completed for %s: %d images, %d matches", self.folder_var.get().strip(), len(state.paths), matches)
+            LOGGER.info(
+                "Scan completed for %s: %d images, %d matches", self.folder_var.get().strip(), len(state.paths), matches
+            )
             self.root.bell()
-            self.status_var.set(f"Scan complete — {len(state.paths)} images, {matches} matches. Use J/K to navigate, A to accept, D to reject.")
+            self.status_var.set(
+                f"Scan complete — {len(state.paths)} images, {matches} matches. Use J/K to navigate, A to accept, D to reject."
+            )
             excluded = int(np.count_nonzero(state.excluded)) if state.excluded is not None else 0
             age_gated = sum(1 for stage in state.cascade_stage if stage == "minor")
             # Read skipped count from the scan metadata so the user knows some files
@@ -3675,6 +3712,7 @@ class BikiniScannerApp:
             if self.store is not None and self.store.metadata_path.exists():
                 try:
                     import json
+
                     metadata = json.loads(self.store.metadata_path.read_text(encoding="utf-8"))
                     skipped_count = len(metadata.get("skipped", []))
                 except Exception:  # noqa: BLE001
@@ -3899,7 +3937,9 @@ class BikiniScannerApp:
         self._save_review_session()
 
     def _preview_caption_text(self, path: str) -> str:
-        return f"{Path(path).name}  —  score {self._match_score_for_path(path):.3f}  —  {self._label_display_text(path)}"
+        return (
+            f"{Path(path).name}  —  score {self._match_score_for_path(path):.3f}  —  {self._label_display_text(path)}"
+        )
 
     def _preview_size(self) -> tuple[int, int]:
         """Size of the enlarged active picture, scaled to the current window."""
@@ -3949,8 +3989,7 @@ class BikiniScannerApp:
         photo = self.preview_cache.get(cache_key)
         if photo is None:
             try:
-                with Image.open(path) as image:
-                    photo = ImageTk.PhotoImage(self._preview_letterbox(image, width, height))
+                photo = ImageTk.PhotoImage(self._preview_letterbox(open_oriented(path), width, height))
             except Exception:  # noqa: BLE001
                 photo = ImageTk.PhotoImage(Image.new("RGB", (width // 2, height), color=self._palette()["button_bg"]))
             self.preview_cache[cache_key] = photo
@@ -4111,8 +4150,7 @@ class BikiniScannerApp:
         try:
             photo = self.thumbnail_cache.get(cache_key)
             if photo is None:
-                with Image.open(path) as image:
-                    photo = ImageTk.PhotoImage(self._letterbox(image, thumb_size, thumb_size))
+                photo = ImageTk.PhotoImage(self._letterbox(open_oriented(path), thumb_size, thumb_size))
                 self.thumbnail_cache[cache_key] = photo
             else:
                 self.thumbnail_cache.move_to_end(cache_key)
@@ -4253,7 +4291,9 @@ class BikiniScannerApp:
         # preview sits on the image you just judged and the click looks like it did
         # nothing. Captured before labelling, because the retrain re-renders the grid.
         advance_from = path if path == self.focused_path else None
-        self._apply_label_batch({path: int(label)}, status=f"Saved label for {Path(path).name}. Retraining...", retrain=True)
+        self._apply_label_batch(
+            {path: int(label)}, status=f"Saved label for {Path(path).name}. Retraining...", retrain=True
+        )
         if advance_from is not None:
             self._advance_focus_after(advance_from)
 
@@ -4346,7 +4386,12 @@ class BikiniScannerApp:
         if not isinstance(before, dict):
             return
         self.redo_stack.append(action)
-        self._apply_label_batch({str(path): value for path, value in before.items()}, status="Undo label change.", retrain=True, record_undo=False)
+        self._apply_label_batch(
+            {str(path): value for path, value in before.items()},
+            status="Undo label change.",
+            retrain=True,
+            record_undo=False,
+        )
 
     def redo_last_label(self) -> None:
         if self.store is None or not self.redo_stack:
@@ -4356,7 +4401,12 @@ class BikiniScannerApp:
         if not isinstance(after, dict):
             return
         self.undo_stack.append(action)
-        self._apply_label_batch({str(path): value for path, value in after.items()}, status="Redo label change.", retrain=True, record_undo=False)
+        self._apply_label_batch(
+            {str(path): value for path, value in after.items()},
+            status="Redo label change.",
+            retrain=True,
+            record_undo=False,
+        )
 
     def _refresh_label_state(self, path: str) -> None:
         card = self.cards.get(path)
@@ -4422,7 +4472,11 @@ class BikiniScannerApp:
         scores = self._score_map()
         labels = self._label_map()
         axis_scores = {
-            path: {axis_name: float(values[idx]) for axis_name, values in self.current_state.axis_scores.items() if idx < len(values)}
+            path: {
+                axis_name: float(values[idx])
+                for axis_name, values in self.current_state.axis_scores.items()
+                if idx < len(values)
+            }
             for idx, path in enumerate(self.current_state.paths)
         }
         build_html_report(out_path, samples, labels, scores, axis_scores=axis_scores, title="Bikini Scanner report")
@@ -4476,7 +4530,9 @@ class BikiniScannerApp:
         buttons = ttk.Frame(dialog, padding=(10, 0, 10, 10))
         buttons.pack(fill="x")
         ttk.Button(buttons, text="Refresh", command=lambda: self._refresh_log_text(text)).pack(side=LEFT)
-        ttk.Button(buttons, text="Open log folder", command=lambda: self.reveal_in_file_manager(str(path))).pack(side=LEFT, padx=8)
+        ttk.Button(buttons, text="Open log folder", command=lambda: self.reveal_in_file_manager(str(path))).pack(
+            side=LEFT, padx=8
+        )
         ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
 
     @staticmethod
@@ -4506,9 +4562,9 @@ class BikiniScannerApp:
         text.configure(state="disabled")
         buttons = ttk.Frame(dialog, padding=(10, 0, 10, 10))
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Keep first, trash rest", command=lambda: self._trash_duplicate_remainders(groups, dialog)).pack(
-            side=LEFT
-        )
+        ttk.Button(
+            buttons, text="Keep first, trash rest", command=lambda: self._trash_duplicate_remainders(groups, dialog)
+        ).pack(side=LEFT)
         ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
 
     def _trash_duplicate_remainders(self, groups: dict[str, list[str]], dialog: Toplevel) -> None:
@@ -4527,7 +4583,9 @@ class BikiniScannerApp:
             messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {reason}", parent=dialog)
             return
         LOGGER.info("Moved %d duplicate files to trash", len(duplicates))
-        messagebox.showinfo("Duplicates removed", f"Moved {len(duplicates)} duplicate files to the recycle bin/trash.", parent=dialog)
+        messagebox.showinfo(
+            "Duplicates removed", f"Moved {len(duplicates)} duplicate files to the recycle bin/trash.", parent=dialog
+        )
         dialog.destroy()
 
     def clear_cache(self) -> None:
@@ -4560,7 +4618,9 @@ class BikiniScannerApp:
     def _score_map(self) -> dict[str, float]:
         if self.current_state is None:
             return {}
-        return {path: float(score) for path, score in zip(self.current_state.paths, self.current_state.scores, strict=False)}
+        return {
+            path: float(score) for path, score in zip(self.current_state.paths, self.current_state.scores, strict=False)
+        }
 
     def _label_map(self) -> dict[str, int]:
         return self.store.load_labels() if self.store is not None else {}
@@ -4663,7 +4723,13 @@ class BikiniScannerApp:
             writer.writerow(["path", "filename", "score", "label", "timestamp"])
             for item in plan:
                 writer.writerow(
-                    [str(item.source), item.source.name, f"{item.score:.6f}", item.label, self.current_state.scan_timestamp]
+                    [
+                        str(item.source),
+                        item.source.name,
+                        f"{item.score:.6f}",
+                        item.label,
+                        self.current_state.scan_timestamp,
+                    ]
                 )
         processed, skipped, retained, failed = execute_transfer_plan(plan, move=self.move_files_var.get())
         retained_text = f" {retained} source(s) remained in place." if retained else ""

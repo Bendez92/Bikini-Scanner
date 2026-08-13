@@ -92,13 +92,17 @@ def _resolve_torch_precision(config: ScannerConfig, device: torch.device) -> str
     return "fp16" if device.type == "cuda" else "fp32"
 
 
-def _load_clip_torch_backend(model_name: str, device_mode: str, precision_mode: str, quantize_cpu: bool) -> ClipTorchBackend:
+def _load_clip_torch_backend(
+    model_name: str, device_mode: str, precision_mode: str, quantize_cpu: bool
+) -> ClipTorchBackend:
     cache_key = (model_name, device_mode, precision_mode, bool(quantize_cpu))
     with _BACKEND_LOAD_LOCK:
         cached = _TORCH_BACKEND_CACHE.get(cache_key)
         if cached is not None:
             return cached
-        device_config = ScannerConfig(model_name=model_name, device=device_mode, precision=precision_mode, quantize_cpu=quantize_cpu)
+        device_config = ScannerConfig(
+            model_name=model_name, device=device_mode, precision=precision_mode, quantize_cpu=quantize_cpu
+        )
         device = _resolve_torch_device(device_config)
         precision = _resolve_torch_precision(device_config, device)
         LOGGER.info("Loading CLIP model %s on %s (%s)", model_name, device.type, precision)

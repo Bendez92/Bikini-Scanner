@@ -59,7 +59,7 @@ class ClipOnnxBackend:
     def from_config(cls, config: ScannerConfig) -> ClipOnnxBackend:
         if config.model_name != DEFAULT_MODEL_NAME:
             raise ValueError(
-                "The clip-onnx backend currently supports the default CLIP model only: " f"{DEFAULT_MODEL_NAME}"
+                f"The clip-onnx backend currently supports the default CLIP model only: {DEFAULT_MODEL_NAME}"
             )
         try:
             import onnxruntime as ort
@@ -69,9 +69,7 @@ class ClipOnnxBackend:
         vision_path = model_dir / VISION_ONNX_NAME
         text_path = model_dir / TEXT_ONNX_NAME
         if not vision_path.exists() or not text_path.exists():
-            raise FileNotFoundError(
-                f"Missing ONNX graphs in {model_dir}. Run python -m scripts.export_onnx first."
-            )
+            raise FileNotFoundError(f"Missing ONNX graphs in {model_dir}. Run python -m scripts.export_onnx first.")
         try:
             from transformers import CLIPProcessor
         except Exception as exc:
@@ -113,9 +111,7 @@ class ClipOnnxBackend:
             return np.empty((0, self.image_embedding_dim), dtype=np.float32)
         return np.vstack(self._embed_image_batch(images)).astype(np.float32)
 
-    def iter_image_batches(
-        self, paths: Iterable[str | Path], batch_size: int = 16
-    ) -> Iterator[list[DecodedImage]]:
+    def iter_image_batches(self, paths: Iterable[str | Path], batch_size: int = 16) -> Iterator[list[DecodedImage]]:
         yield from iter_decoded_image_batches(paths, batch_size=batch_size)
 
     def embed_texts(self, prompts: Sequence[str]) -> np.ndarray:

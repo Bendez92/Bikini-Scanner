@@ -211,9 +211,7 @@ def stratified_folds(labels: np.ndarray, folds: int, seed: int = 42) -> list[np.
     return [np.asarray(sorted(bucket), dtype=np.int64) for bucket in buckets]
 
 
-def stratified_split(
-    labels: np.ndarray, test_size: int, seed: int = 42
-) -> tuple[np.ndarray, np.ndarray]:
+def stratified_split(labels: np.ndarray, test_size: int, seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
     """Train/test indices keeping both classes on both sides where possible."""
     labels = np.asarray(labels).astype(np.int64).ravel()
     rng = np.random.default_rng(seed)

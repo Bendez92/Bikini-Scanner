@@ -75,6 +75,11 @@ def build_corpus(folder: Path) -> list[Path]:
     duplicate = folder / "corpus_duplicate.jpg"
     shutil.copyfile(paths[0], duplicate)
     paths.append(duplicate)
+    # One frame comfortably above the decode target, so scaled decoding (`draft`) is
+    # actually exercised; every other image here is small enough for it to be a no-op.
+    large = folder / "corpus_large.jpg"
+    _gradient_image(CORPUS_SIZE, 1600, 1200).save(large, quality=70)
+    paths.append(large)
     return sorted(paths)
 
 
@@ -90,9 +95,7 @@ def collect_baseline() -> dict[str, object]:
         backend = FakeBackend()
         scorer = BikiniScorer(backend, config)
         store = FolderStore(folder)
-        state, samples = scan_and_score_folder(
-            backend, store, scorer, threshold=float(config.threshold), batch_size=8
-        )
+        state, samples = scan_and_score_folder(backend, store, scorer, threshold=float(config.threshold), batch_size=8)
         visible = scorer.state_visibility(state)
         rows = []
         for index, path in enumerate(state.paths):
@@ -103,9 +106,7 @@ def collect_baseline() -> dict[str, object]:
                     "zero_shot": round(float(state.zero_shot_scores[index]), 6),
                     "stage": state.cascade_stage[index] if index < len(state.cascade_stage) else "",
                     "visible": bool(visible[index]) if index < len(visible) else True,
-                    "detail_region": (
-                        state.detail_regions[index] if index < len(state.detail_regions) else "full"
-                    ),
+                    "detail_region": (state.detail_regions[index] if index < len(state.detail_regions) else "full"),
                     "axes": {
                         axis: round(float(values[index]), 6)
                         for axis, values in sorted(state.axis_scores.items())
@@ -139,7 +140,7 @@ def compare(current: dict[str, object], previous: dict[str, object], tolerance: 
             delta = abs(float(new_row[field]) - float(old_row[field]))
             if delta > tolerance:
                 differences.append(
-                    f"  ~ {name}.{field}: {old_row[field]:.6f} -> {new_row[field]:.6f}  (Δ {delta:.6f})"
+                    f"  ~ {name}.{field}: {old_row[field]:.6f} -> {new_row[field]:.6f}  (delta {delta:.6f})"
                 )
         for field in ("stage", "visible", "detail_region"):
             if new_row[field] != old_row[field]:
@@ -152,7 +153,7 @@ def compare(current: dict[str, object], previous: dict[str, object], tolerance: 
             elif abs(new_value - old_value) > tolerance:
                 differences.append(
                     f"  ~ {name}.axes.{axis}: {old_value:.6f} -> {new_value:.6f}"
-                    f"  (Δ {abs(new_value - old_value):.6f})"
+                    f"  (delta {abs(new_value - old_value):.6f})"
                 )
     if current["buckets"] != previous["buckets"]:
         differences.append(f"  ~ review buckets: {previous['buckets']} -> {current['buckets']}")

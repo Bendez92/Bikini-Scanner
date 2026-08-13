@@ -128,10 +128,7 @@ class VLMClient:
             + ". Use 0.5 when uncertain. Return exactly those keys when possible."
         )
         content = [{"type": "text", "text": user}]
-        content.extend(
-            {"type": "image_url", "image_url": {"url": self._image_data_url(image)}}
-            for image in images
-        )
+        content.extend({"type": "image_url", "image_url": {"url": self._image_data_url(image)}} for image in images)
         payload = {
             "model": self.model,
             # Deterministic JSON is the calibration contract; compatible local
@@ -194,9 +191,7 @@ class VLMClient:
         completed = 0
         try:
             with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-                futures = {
-                    executor.submit(self._request, image): index for index, image in enumerate(images)
-                }
+                futures = {executor.submit(self._request, image): index for index, image in enumerate(images)}
                 for future in as_completed(futures):
                     if cancel_event is not None and cancel_event.is_set():
                         for pending in futures:

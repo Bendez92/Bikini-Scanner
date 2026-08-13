@@ -14,6 +14,7 @@ from typing import Any
 
 import numpy as np
 
+from .image_formats import DECODE_VERSION
 from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".heic", ".heif"}
@@ -24,7 +25,11 @@ CLASSIFIER_FILENAME = "classifier.pkl"
 CONFIG_OVERRIDE_FILENAME = "config_override.json"
 REGION_EMBEDDINGS_FILENAME = "region_embeddings.npz"
 VLM_VERDICTS_FILENAME = "vlm_verdicts.json"
+CACHE_META_FILENAME = "cache_meta.json"
 CLASSIFIER_CACHE_VERSION = 1
+# Directories the app creates for its own output carry this marker so a later scan of
+# the parent folder does not re-ingest, re-rank and re-copy its own copies.
+IGNORE_MARKER_FILENAME = ".bikini_scanner_ignore"
 LOGGER = logging.getLogger(__name__)
 
 
@@ -94,6 +99,7 @@ class FolderStore:
     review_session_path: Path = field(init=False)
     region_embeddings_path: Path = field(init=False)
     vlm_verdicts_path: Path = field(init=False)
+    cache_meta_path: Path = field(init=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
@@ -115,6 +121,64 @@ class FolderStore:
         self.review_session_path = self.cache_dir / "review_session.json"
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
         self.vlm_verdicts_path = self.cache_dir / VLM_VERDICTS_FILENAME
+        self.cache_meta_path = self.cache_dir / CACHE_META_FILENAME
+        self._discard_stale_derived_caches()
+
+    def _discard_stale_derived_caches(self) -> None:
+        """Drop cached work that an older build derived from different pixels.
+
+        Everything here is keyed by content hash, which does not change when the way we
+        *decode* an image changes. So when the decoder changes - EXIF orientation being
+        the case that prompted this - a stale entry would be silently reused and the
+        whole folder would keep scoring as though the fix had never landed.
+
+        Labels, per-folder config overrides and the review session are the user's own
+        work and are never touched; only derived artefacts are discarded.
+        """
+        try:
+            recorded = 0
+            if self.cache_meta_path.is_file():
+                payload = json.loads(self.cache_meta_path.read_text(encoding="utf-8"))
+                if isinstance(payload, Mapping):
+                    recorded = int(payload.get("decode_version", 0) or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            recorded = 0
+        if recorded == DECODE_VERSION:
+            return
+
+        derived = (
+            self.embeddings_path,
+            self.index_path,
+            self.region_embeddings_path,
+            self.face_counts_path,
+            self.classifier_path,
+            self.vlm_verdicts_path,
+            self.metadata_path,
+        )
+        discarded = [path.name for path in derived if path.exists()]
+        for path in derived:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.warning("Could not discard stale cache %s: %s", path, exc)
+        if discarded:
+            LOGGER.info(
+                "Image decoding changed (v%d -> v%d); discarded %s in %s so they are rebuilt "
+                "from correctly oriented pixels. Your labels were kept.",
+                recorded,
+                DECODE_VERSION,
+                ", ".join(sorted(discarded)),
+                self.cache_dir,
+            )
+        self._embedding_cache = None
+        self._path_index_cache = None
+        self._face_count_cache = None
+        self._region_cache = None
+        self._vlm_cache = None
+        try:
+            atomic_write_json(self.cache_meta_path, {"decode_version": DECODE_VERSION})
+        except OSError as exc:
+            LOGGER.warning("Could not record the cache version in %s: %s", self.cache_meta_path, exc)
 
     def _load_vlm_cache(self) -> dict[str, dict[str, float]]:
         if self._vlm_cache is None:
@@ -326,6 +390,7 @@ class FolderStore:
             archive[key] = value
         if not dirty:
             return
+
         def write_npz(tmp: Path) -> None:
             with tmp.open("wb") as handle:
                 np.savez(handle, **archive)
@@ -372,6 +437,7 @@ class FolderStore:
                     dirty_faces = True
                 face_counts[key] = value
         if dirty_embeddings:
+
             def write_npz(tmp: Path) -> None:
                 with tmp.open("wb") as handle:
                     np.savez(handle, **embeddings)

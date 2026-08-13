@@ -79,10 +79,10 @@ DEFAULT_MAX_FACES = 3
 # config fields (with safe minimums) lets a user tighten the gate without code edits.
 # The minimums below are enforced in from_mapping and prevent weakening the gate
 # to the point of uselessness. Raising any of these makes the scanner LESS careful.
-DEFAULT_CHILD_ADULT_MARGIN = 0.10      # child must out-argue adult by this much
+DEFAULT_CHILD_ADULT_MARGIN = 0.10  # child must out-argue adult by this much
 DEFAULT_STRONGLY_MINOR_THRESHOLD = 0.75  # overwhelming child evidence, standalone
-DEFAULT_FACE_ANCHORED_MARGIN = 0.05    # smaller margin when a real face crop exists
-DEFAULT_WEAK_ADULT_DETAIL = 0.35       # detail score above which adult evidence is required
+DEFAULT_FACE_ANCHORED_MARGIN = 0.05  # smaller margin when a real face crop exists
+DEFAULT_WEAK_ADULT_DETAIL = 0.35  # detail score above which adult evidence is required
 # Opt-in second opinion from a larger model on borderline images only.
 DEFAULT_REFINE_MODEL = ""
 DEFAULT_REFINE_BAND = 0.18
@@ -222,7 +222,9 @@ class ScannerConfig:
         config.zero_shot_scale = _coerce_float(mapping.get("zero_shot_scale"), config.zero_shot_scale, 0.01, 1000.0)
         config.classifier_weight = _coerce_float(mapping.get("classifier_weight"), config.classifier_weight, 0.0, 100.0)
         config.zero_shot_weight = _coerce_float(mapping.get("zero_shot_weight"), config.zero_shot_weight, 0.0, 100.0)
-        config.nsfw_filter = _coerce_choice(mapping.get("nsfw_filter"), config.nsfw_filter, {"include", "exclude", "only"})
+        config.nsfw_filter = _coerce_choice(
+            mapping.get("nsfw_filter"), config.nsfw_filter, {"include", "exclude", "only"}
+        )
         config.nsfw_threshold = _coerce_float(mapping.get("nsfw_threshold"), config.nsfw_threshold, 0.0, 1.0)
         config.require_person = _coerce_bool(mapping.get("require_person"), config.require_person)
         config.person_threshold = _coerce_float(mapping.get("person_threshold"), config.person_threshold, 0.0, 1.0)
@@ -253,9 +255,7 @@ class ScannerConfig:
         config.face_anchored_margin = _coerce_float(
             mapping.get("face_anchored_margin"), config.face_anchored_margin, 0.02, 1.0
         )
-        config.weak_adult_detail = _coerce_float(
-            mapping.get("weak_adult_detail"), config.weak_adult_detail, 0.20, 1.0
-        )
+        config.weak_adult_detail = _coerce_float(mapping.get("weak_adult_detail"), config.weak_adult_detail, 0.20, 1.0)
         config.refine_model = _coerce_str(mapping.get("refine_model"), config.refine_model)
         config.refine_band = _coerce_float(mapping.get("refine_band"), config.refine_band, 0.0, 1.0)
         config.refine_max_images = _coerce_int(
