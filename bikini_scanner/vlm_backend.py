@@ -29,6 +29,9 @@ VLM_AXES = (
     "nsfw",
 )
 VLM_PROMPT_VERSION = "vlm-json-v1"
+# Local VLMs do not need full-resolution input; cap the longest side before sending to
+# keep memory and token usage bounded.
+VLM_MAX_IMAGE_SIDE = 512
 
 
 class VLMCancelled(Exception):
@@ -130,9 +133,17 @@ class VLMClient:
             return False
 
     @staticmethod
-    def _image_data_url(image: Image.Image) -> str:
+    def _image_data_url(image: Image.Image, max_side: int = VLM_MAX_IMAGE_SIDE) -> str:
+        image = image.convert("RGB")
+        longest = max(image.size)
+        if longest > max_side:
+            scale = max_side / longest
+            image = image.resize(
+                (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                resample=Image.Resampling.LANCZOS,
+            )
         buffer = BytesIO()
-        image.convert("RGB").save(buffer, format="JPEG", quality=85)
+        image.save(buffer, format="JPEG", quality=85)
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"data:image/jpeg;base64,{encoded}"
 

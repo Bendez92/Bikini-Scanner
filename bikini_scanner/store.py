@@ -62,31 +62,32 @@ IGNORE_MARKER_FILENAME = ".bikini_scanner_ignore"
 LOGGER = logging.getLogger(__name__)
 
 
-def _is_under_ignored_directory(path: Path, root: Path) -> bool:
-    for parent in path.parents:
-        if (parent / IGNORE_MARKER_FILENAME).is_file():
-            return True
-        if parent == root:
-            break
-    return False
+def _is_scanner_owned_directory(path: Path, cache_dir: Path, matches_dir: Path) -> bool:
+    return path in (cache_dir, matches_dir) or (path / IGNORE_MARKER_FILENAME).is_file()
 
 
 def collect_image_paths(folder: str | Path) -> list[Path]:
+    """Walk the folder once, pruning directories the scanner owns or has marked."""
     root = Path(folder).expanduser().resolve()
     cache_dir = root / ".bikini_scanner_cache"
     matches_dir = root / MATCHES_DIR_NAME
     paths: list[Path] = []
-    for path in root.rglob("*"):
-        if not path.is_file():
+    for parent, dirnames, filenames in os.walk(root):
+        parent_path = Path(parent)
+        if _is_scanner_owned_directory(parent_path, cache_dir, matches_dir):
+            dirnames.clear()
             continue
-        if cache_dir in path.parents:
-            continue
-        if matches_dir in path.parents:
-            continue
-        if _is_under_ignored_directory(path, root):
-            continue
-        if path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
-            paths.append(path.resolve())
+        # Prune ignored and app-owned child directories in place so they are never descended.
+        kept: list[str] = []
+        for name in dirnames:
+            child = parent_path / name
+            if _is_scanner_owned_directory(child, cache_dir, matches_dir):
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in filenames:
+            if Path(name).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
+                paths.append((parent_path / name).resolve())
     return sorted(paths)
 
 

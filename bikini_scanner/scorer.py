@@ -40,7 +40,6 @@ from .regions import (
     plan_regions,
     region_kind,
 )
-from .skin import skin_fraction
 from .store import FolderStore, collect_image_paths, safe_stat
 from .vision_analysis import detect_face_boxes, detect_face_count
 
@@ -929,6 +928,10 @@ def run_deep_pass(
     )
     # Row index of each image's candidate detail regions, resolved after scoring.
     detail_rows: dict[int, list[int]] = {}
+    # Crops that need embedding are gathered across images so the backend is invoked once
+    # per batch instead of once per candidate. Cached crops skip this list entirely.
+    pending_crops: list[tuple[int, str, Image.Image]] = []
+    pending_meta: list[tuple[int, str, str]] = []  # (index, content_hash, key)
     processed = 0
 
     for index in candidate_indices:
@@ -962,21 +965,14 @@ def run_deep_pass(
                     if region.key != FULL_REGION
                 ]
                 materialised = crop_regions(image, planned)
-                if materialised:
-                    vectors = backend.embed_pil_images([crop for _, crop in materialised])
-                    crops = [
-                        (key, np.asarray(vector, dtype=np.float32))
-                        for (key, _), vector in zip(materialised, vectors, strict=False)
-                    ]
+                pending_crops.extend((index, key, crop) for key, crop in materialised)
+                pending_meta.extend(
+                    (index, str(content_hash), key)
+                    for key, _ in materialised
+                    if content_hash
+                )
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Deep pass skipped %s: %s", path, exc)
-                crops = []
-            if store is not None and content_hash:
-                for key, vector in crops:
-                    pending_cache[store.region_cache_key(str(content_hash), namespace, key)] = vector
-                pending_cache[store.region_cache_key(str(content_hash), namespace, "__faces__")] = np.asarray(
-                    [max(int(updated_faces[index]), 0)], dtype=np.float32
-                )
 
         for key, vector in crops:
             if vector is None or np.asarray(vector).size == 0:
@@ -990,9 +986,22 @@ def run_deep_pass(
         processed += 1
         if on_progress is not None:
             on_progress(processed, len(candidate_indices))
-        if store is not None and len(pending_cache) >= 256:
-            store.save_region_embeddings(pending_cache)
-            pending_cache = {}
+
+    if pending_crops:
+        crop_images = [crop for _, _, crop in pending_crops]
+        vectors = backend.embed_pil_images(crop_images)
+        for (index, key, _), vector in zip(pending_crops, vectors, strict=False):
+            vector = np.asarray(vector, dtype=np.float32)
+            owner.append(index)
+            region_keys.append(key)
+            row_embeddings.append(vector)
+            if region_kind(key) != KIND_FACE:
+                detail_rows.setdefault(index, []).append(len(row_embeddings) - 1)
+        for (index, content_hash, key), vector in zip(pending_meta, vectors, strict=False):
+            pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(vector, dtype=np.float32)
+            pending_cache[store.region_cache_key(content_hash, namespace, "__faces__")] = np.asarray(
+                [max(int(updated_faces[index]), 0)], dtype=np.float32
+            )
 
     if store is not None and pending_cache:
         store.save_region_embeddings(pending_cache)
@@ -1083,9 +1092,14 @@ def compute_vlm_scores(
             candidates.append((distance, index))
     if not candidates:
         return None
+    # Rank candidates before decoding so only the images that will actually be sent to
+    # the VLM are loaded into memory. Distance from the decision threshold is the primary
+    # sort; skin fraction used to be a tiebreaker, but it required decoding every image.
+    candidates.sort(key=lambda item: (0 if item[0] <= band else 1, item[0]))
+    selected = candidates[:limit]
     detail_regions = state.detail_regions or [FULL_REGION] * len(state.paths)
     ranked: list[tuple[float, int, list[Image.Image]]] = []
-    for distance, index in candidates:
+    for distance, index in selected:
         try:
             image = open_oriented(state.paths[index])
             views = [image]
@@ -1099,15 +1113,11 @@ def compute_vlm_scores(
                 region = planned.get(wanted)
                 if region is not None and region.box is not None:
                     views.append(image.crop(region.box))
-            skin = skin_fraction(views[-1])
-            # Skin only breaks ties within the eligible band; it never filters.
-            priority = 0 if distance <= band else 1
-            normalized = distance / max(band, 1e-6)
-            ranked.append((priority * 10.0 + normalized - 0.5 * skin, index, views))
+            ranked.append((distance, index, views))
         except (OSError, ValueError) as exc:
             LOGGER.warning("VLM pass skipped %s: %s", state.paths[index], exc)
-    ranked.sort(key=lambda item: item[0])
-    ranked = ranked[:limit]
+    if not ranked:
+        return None
     if not ranked:
         return None
     cached: dict[int, dict[str, float]] = {}
