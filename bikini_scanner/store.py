@@ -33,6 +33,15 @@ IGNORE_MARKER_FILENAME = ".bikini_scanner_ignore"
 LOGGER = logging.getLogger(__name__)
 
 
+def _is_under_ignored_directory(path: Path, root: Path) -> bool:
+    for parent in path.parents:
+        if (parent / IGNORE_MARKER_FILENAME).is_file():
+            return True
+        if parent == root:
+            break
+    return False
+
+
 def collect_image_paths(folder: str | Path) -> list[Path]:
     root = Path(folder).expanduser().resolve()
     cache_dir = root / ".bikini_scanner_cache"
@@ -44,6 +53,8 @@ def collect_image_paths(folder: str | Path) -> list[Path]:
         if cache_dir in path.parents:
             continue
         if matches_dir in path.parents:
+            continue
+        if _is_under_ignored_directory(path, root):
             continue
         if path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
             paths.append(path.resolve())

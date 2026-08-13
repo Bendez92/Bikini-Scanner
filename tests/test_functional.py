@@ -16,6 +16,7 @@ to check that a change behaves the same way against real embeddings.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -71,6 +72,12 @@ from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, parse_axis_json
 
 IMAGE_COUNT = 8
 _SHARED: dict[str, object] = {}
+
+
+def _make_image_bytes(size: tuple[int, int] = (64, 64)) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color=(120, 90, 60)).save(buffer, format="JPEG")
+    return buffer.getvalue()
 
 
 def _make_images(folder: Path, count: int = IMAGE_COUNT) -> list[Path]:
@@ -1006,6 +1013,53 @@ class ImageDecoding(unittest.TestCase):
             self.assertEqual(payload["decode_version"], image_formats.DECODE_VERSION)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
+
+
+class IgnoreMarkers(unittest.TestCase):
+    """Output directories are not re-scanned as input on a later run."""
+
+    def test_ignored_subdirectory_is_skipped(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_ignore_"))
+        try:
+            (folder / "keep.jpg").write_bytes(_make_image_bytes())
+            ignored = folder / "already_output"
+            ignored.mkdir()
+            (ignored / ".bikini_scanner_ignore").touch()
+            (ignored / "copy.jpg").write_bytes(_make_image_bytes())
+            self.assertEqual({p.name for p in collect_image_paths(folder)}, {"keep.jpg"})
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+    def test_output_transfer_writes_ignore_marker(self) -> None:
+        destination = Path(tempfile.mkdtemp(prefix="bikini_out_marker_"))
+        source = destination.with_name(destination.name + "_src")
+        source.mkdir()
+        (source / "a.jpg").write_bytes(_make_image_bytes())
+        try:
+            plan = output_ops.build_transfer_plan(
+                [str(source / "a.jpg")], destination, {str(source / "a.jpg"): 0.5}, {}, output_ops.OutputOptions()
+            )
+            output_ops.execute_transfer_plan(plan, move=False)
+            self.assertTrue((destination / ".bikini_scanner_ignore").is_file())
+            self.assertEqual({p.name for p in collect_image_paths(destination)}, set())
+        finally:
+            shutil.rmtree(destination, ignore_errors=True)
+            shutil.rmtree(source, ignore_errors=True)
+
+    def test_html_assets_get_ignore_marker(self) -> None:
+        destination = Path(tempfile.mkdtemp(prefix="bikini_html_marker_"))
+        try:
+            output_ops.build_html_report(
+                destination / "report.html",
+                [{"path": str(destination / "dummy.jpg"), "score": 0.5, "bucket": "Bikini"}],
+                {},
+                {},
+                max_embedded_thumbnails=0,
+            )
+            assets = destination / "report_assets"
+            self.assertTrue((assets / ".bikini_scanner_ignore").is_file())
+        finally:
+            shutil.rmtree(destination, ignore_errors=True)
 
 
 def _cleanup() -> None:

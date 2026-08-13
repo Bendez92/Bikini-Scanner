@@ -16,8 +16,18 @@ from pathlib import Path
 from PIL import Image
 
 from .image_formats import apply_orientation, open_oriented
+from .store import IGNORE_MARKER_FILENAME
 
 LABEL_NAMES = {1: "good", 0: "bad", 2: "skip"}
+
+
+def _mark_ignored_directory(directory: Path) -> None:
+    """Drop a marker so a future scan does not ingest its own output copies."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / IGNORE_MARKER_FILENAME).touch(exist_ok=True)
+    except OSError:
+        pass
 OUTPUT_ORGANIZATIONS = {"flat", "score_band", "label", "score_band_label"}
 DUPLICATE_POLICIES = {"skip", "rename", "overwrite"}
 DEFAULT_HTML_EMBED_LIMIT = 512
@@ -203,12 +213,14 @@ def execute_transfer_plan(plan: Sequence[PlannedTransfer], move: bool = False) -
     skipped = 0
     retained_sources = 0
     failed = 0
+    destination_roots: set[Path] = set()
     for item in plan:
         if item.action == "skip":
             skipped += 1
             continue
         try:
             item.destination.parent.mkdir(parents=True, exist_ok=True)
+            destination_roots.add(item.destination.parent)
             if item.destination.exists() and item.action == "overwrite":
                 try:
                     item.destination.unlink()
@@ -250,6 +262,8 @@ def execute_transfer_plan(plan: Sequence[PlannedTransfer], move: bool = False) -
             LOGGER.warning("Transfer failed for %s -> %s: %s", item.source, item.destination, exc)
             continue
         processed += 1
+    for root in destination_roots:
+        _mark_ignored_directory(root)
     return processed, skipped, retained_sources, failed
 
 
@@ -271,6 +285,7 @@ def build_html_report(
     assets_root = Path(assets_dir) if assets_dir is not None else output.with_name(f"{output.stem}_assets")
     if use_assets:
         assets_root.mkdir(parents=True, exist_ok=True)
+        _mark_ignored_directory(assets_root)
     rows: list[str] = []
     for index, sample in enumerate(samples):
         path = Path(str(sample["path"]))
