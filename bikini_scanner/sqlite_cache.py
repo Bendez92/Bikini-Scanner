@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 from io import BytesIO
@@ -67,8 +68,12 @@ class SQLiteCache:
             self._connection = sqlite3.connect(
                 str(self.db_path), check_same_thread=False, isolation_level=None
             )
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA synchronous=NORMAL")
+            if os.environ.get("BIKINI_SCANNER_TEST_SQLITE_PRAGMAS") == "1":
+                self._connection.execute("PRAGMA journal_mode=MEMORY")
+                self._connection.execute("PRAGMA synchronous=OFF")
+            else:
+                self._connection.execute("PRAGMA journal_mode=WAL")
+                self._connection.execute("PRAGMA synchronous=NORMAL")
         return self._connection
 
     def _transaction(self) -> _SQLiteTransaction:

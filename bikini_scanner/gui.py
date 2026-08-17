@@ -45,7 +45,6 @@ from .backend_utils import ImageEmbeddingBackend
 from .config import HIGH_ACCURACY_MODEL, ScannerConfig
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
 from .global_store import GlobalLearningStore
-from .i18n import _
 from .image_formats import open_oriented, oriented_size
 from .logging_setup import configure_logging, log_path, read_log_tail
 from .output_ops import (
@@ -331,10 +330,10 @@ class BikiniScannerApp:
         ).pack(side=TOP, pady=(4, 0))
         preview_buttons = ttk.Frame(self.preview_frame)
         preview_buttons.pack(side=TOP, pady=(6, 0))
-        ttk.Button(preview_buttons, text=_("Accept (A)"), width=14, command=lambda: self.label_focused_card(1)).pack(
+        ttk.Button(preview_buttons, text="Accept (A)", width=14, command=lambda: self.label_focused_card(1)).pack(
             side=LEFT, padx=(0, 8)
         )
-        ttk.Button(preview_buttons, text=_("REJECT (D)"), width=14, command=lambda: self.label_focused_card(0)).pack(
+        ttk.Button(preview_buttons, text="REJECT (D)", width=14, command=lambda: self.label_focused_card(0)).pack(
             side=LEFT
         )
         self.preview_image_label.bind(
@@ -359,32 +358,32 @@ class BikiniScannerApp:
         self.theme_button = ttk.Button(bar, text=self._theme_button_text(), command=self.cycle_theme, width=11)
         self.theme_button.pack(side=RIGHT)
         self._tooltip(self.theme_button, "Switch between dark, light, and following Windows")
-        settings_button = ttk.Button(bar, text=_("Settings"), command=self.open_settings_dialog)
+        settings_button = ttk.Button(bar, text="Settings", command=self.open_settings_dialog)
         settings_button.pack(side=RIGHT, padx=(0, 6))
         help_button = ttk.Button(bar, text="?", command=self.show_shortcuts, width=3)
         help_button.pack(side=RIGHT, padx=(0, 6))
         self._tooltip(help_button, "Keyboard shortcuts and a quick tour")
 
-        self.queue_toggle = ttk.Button(bar, text=_("Queue"), command=lambda: self._toggle_panel("queue"))
+        self.queue_toggle = ttk.Button(bar, text="Queue", command=lambda: self._toggle_panel("queue"))
         self.queue_toggle.pack(side=RIGHT, padx=(0, 6))
         self._tooltip(self.queue_toggle, "Scan several folders in a row, or watch one for changes")
-        self.filter_toggle = ttk.Button(bar, text=_("Filters & view"), command=lambda: self._toggle_panel("filters"))
+        self.filter_toggle = ttk.Button(bar, text="Filters & view", command=lambda: self._toggle_panel("filters"))
         self.filter_toggle.pack(side=RIGHT, padx=(0, 6))
         self._tooltip(self.filter_toggle, "Search, sort, score range, thumbnail size")
 
-        ttk.Label(bar, text=_("Folder"), style="Muted.TLabel").pack(side=LEFT, padx=(0, 8))
+        ttk.Label(bar, text="Folder", style="Muted.TLabel").pack(side=LEFT, padx=(0, 8))
         folder_entry = ttk.Entry(bar, textvariable=self.folder_var)
         folder_entry.pack(side=LEFT, fill="x", expand=True, padx=(0, 6))
         self._tooltip(folder_entry, "The folder to scan. You can also drag a folder onto this window.")
-        choose_button = ttk.Button(bar, text=_("Choose…"), command=self.choose_folder)
+        choose_button = ttk.Button(bar, text="Choose…", command=self.choose_folder)
         choose_button.pack(side=LEFT, padx=(0, 12))
 
-        self.run_button = ttk.Button(bar, text=_("Run scan"), command=self.run_scan, style="Accent.TButton")
+        self.run_button = ttk.Button(bar, text="Run scan", command=self.run_scan, style="Accent.TButton")
         self.run_button.pack(side=LEFT)
         self._tooltip(self.run_button, "Scan this folder for bikini, cleavage and midriff photos")
-        self.stop_scan_button = ttk.Button(bar, text=_("Stop"), command=self.cancel_scan, state="disabled", width=7)
+        self.stop_scan_button = ttk.Button(bar, text="Stop", command=self.cancel_scan, state="disabled", width=7)
         self.stop_scan_button.pack(side=LEFT, padx=6)
-        self.update_button = ttk.Button(bar, text=_("Update rankings"), command=self.update_algorithm)
+        self.update_button = ttk.Button(bar, text="Update rankings", command=self.update_algorithm)
         self.update_button.pack(side=LEFT, padx=(0, 6))
         self._tooltip(self.update_button, "Re-rank using everything you have accepted and rejected so far")
         ttk.Label(bar, textvariable=self.override_var, style="Muted.TLabel").pack(side=LEFT, padx=(4, 0))
@@ -395,15 +394,15 @@ class BikiniScannerApp:
 
         row_one = ttk.Frame(panel, style="Toolbar.TFrame")
         row_one.pack(side=TOP, fill="x")
-        ttk.Label(row_one, text=_("Search"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_one, text="Search", style="Muted.TLabel").pack(side=LEFT)
         search_entry = ttk.Entry(row_one, textvariable=self.search_var, width=20)
         search_entry.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_one, text=_("Sort"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_one, text="Sort", style="Muted.TLabel").pack(side=LEFT)
         sort_combo = ttk.Combobox(
             row_one, textvariable=self.sort_var, values=("score", "filename", "date"), state="readonly", width=10
         )
         sort_combo.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_one, text=_("Show"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_one, text="Show", style="Muted.TLabel").pack(side=LEFT)
         match_combo = ttk.Combobox(
             row_one,
             textvariable=self.match_filter_var,
@@ -420,41 +419,41 @@ class BikiniScannerApp:
             width=10,
         )
         label_combo.pack(side=LEFT, padx=(0, 12))
-        ttk.Label(row_one, text=_("Score"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_one, text="Score", style="Muted.TLabel").pack(side=LEFT)
         ttk.Entry(row_one, textvariable=self.score_min_var, width=5).pack(side=LEFT, padx=(4, 2))
         # An en dash is the correct typography for a numeric range separator here.
         ttk.Label(row_one, text="–", style="Muted.TLabel").pack(side=LEFT)  # noqa: RUF001
         ttk.Entry(row_one, textvariable=self.score_max_var, width=5).pack(side=LEFT, padx=(2, 12))
-        ttk.Checkbutton(row_one, text=_("Only NSFW"), variable=self.nsfw_only_var, command=self._toggle_nsfw_only).pack(
+        ttk.Checkbutton(row_one, text="Only NSFW", variable=self.nsfw_only_var, command=self._toggle_nsfw_only).pack(
             side=LEFT
         )
-        clear_button = ttk.Button(row_one, text=_("Clear filters"), command=self.clear_filters)
+        clear_button = ttk.Button(row_one, text="Clear filters", command=self.clear_filters)
         clear_button.pack(side=RIGHT)
 
         row_two = ttk.Frame(panel, style="Toolbar.TFrame")
         row_two.pack(side=TOP, fill="x", pady=(8, 0))
-        ttk.Label(row_two, text=_("Columns"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_two, text="Columns", style="Muted.TLabel").pack(side=LEFT)
         columns_spin = ttk.Spinbox(row_two, from_=1, to=6, textvariable=self.columns_var, width=4)
         columns_spin.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_two, text=_("Text size"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_two, text="Text size", style="Muted.TLabel").pack(side=LEFT)
         font_spin = ttk.Spinbox(row_two, from_=8, to=16, textvariable=self.font_size_var, width=4)
         font_spin.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_two, text=_("Thumbnail size"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row_two, text="Thumbnail size", style="Muted.TLabel").pack(side=LEFT)
         thumb_scale = ttk.Scale(row_two, from_=120, to=520, variable=self.thumbnail_size_var, orient="horizontal")
         thumb_scale.pack(side=LEFT, fill="x", expand=True, padx=(4, 12))
-        ttk.Button(row_two, text=_("Prompt tester"), command=self.open_prompt_tester_dialog).pack(side=RIGHT)
+        ttk.Button(row_two, text="Prompt tester", command=self.open_prompt_tester_dialog).pack(side=RIGHT)
 
     def _build_queue_panel(self) -> None:
         panel = ttk.Frame(self.root, padding=(12, 4, 12, 10), style="Toolbar.TFrame")
         self._panels["queue"] = panel
         row = ttk.Frame(panel, style="Toolbar.TFrame")
         row.pack(side=TOP, fill="x")
-        ttk.Button(row, text=_("Add folder"), command=self.add_folder_to_queue).pack(side=LEFT)
-        ttk.Button(row, text=_("Run queue"), command=self.run_queue).pack(side=LEFT, padx=6)
-        ttk.Button(row, text=_("Stop queue"), command=self.stop_queue).pack(side=LEFT)
+        ttk.Button(row, text="Add folder", command=self.add_folder_to_queue).pack(side=LEFT)
+        ttk.Button(row, text="Run queue", command=self.run_queue).pack(side=LEFT, padx=6)
+        ttk.Button(row, text="Stop queue", command=self.stop_queue).pack(side=LEFT)
         ttk.Checkbutton(
             row,
-            text=_("Watch this folder for new photos"),
+            text="Watch this folder for new photos",
             variable=self.watch_enabled_var,
             command=self._toggle_watch_mode,
         ).pack(side=LEFT, padx=16)
@@ -467,11 +466,11 @@ class BikiniScannerApp:
         row.pack(side=TOP, fill="x")
         self.view_switch_row = row
         self.detected_button = ttk.Button(
-            row, text=_("Detected files"), command=self.show_detected_files, style="Accent.TButton"
+            row, text="Detected files", command=self.show_detected_files, style="Accent.TButton"
         )
         self.detected_button.pack(side=LEFT)
         self._tooltip(self.detected_button, "Every photo found, grouped by what was detected")
-        self.review_button = ttk.Button(row, text=_("Review queue"), command=self.restore_review_view)
+        self.review_button = ttk.Button(row, text="Review queue", command=self.restore_review_view)
         self.review_button.pack(side=LEFT, padx=6)
         self._tooltip(self.review_button, "A curated shortlist to Accept or REJECT so the scanner learns")
         self.view_hint = ttk.Label(row, text="", style="Muted.TLabel")
@@ -496,7 +495,7 @@ class BikiniScannerApp:
     def _build_threshold_row(self) -> None:
         row = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         row.pack(side=TOP, fill="x")
-        ttk.Label(row, text=_("Sensitivity"), style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(row, text="Sensitivity", style="Muted.TLabel").pack(side=LEFT)
         slider = ttk.Scale(
             row,
             from_=0.0,
@@ -687,7 +686,7 @@ class BikiniScannerApp:
         ):
             if button is None:
                 continue
-            label = _("Filters & view") if name == "filters" else _("Queue")
+            label = "Filters & view" if name == "filters" else "Queue"
             # Show a dot when filters are active so the user knows something is hidden.
             if name == "filters" and self._filters_active():
                 label = f"{label} ●"
@@ -757,7 +756,7 @@ class BikiniScannerApp:
 
     def show_shortcuts(self) -> None:
         messagebox.showinfo(
-            _("Shortcuts and tips"),
+            "Shortcuts and tips",
             "Reviewing\n"
             "  j / k or arrow keys   move between photos\n"
             "  a or g                Accept the active photo\n"
@@ -1324,54 +1323,54 @@ class BikiniScannerApp:
         help_menu = Menu(self.menu_bar_frame, tearoff=False)
         recent_menu = Menu(file_menu, tearoff=False)
 
-        file_menu.add_command(label=_("Open folder..."), command=self.choose_folder)
-        file_menu.add_command(label=_("Resume last scan"), command=self.resume_last_scan)
-        file_menu.add_cascade(label=_("Recent folders"), menu=recent_menu)
+        file_menu.add_command(label="Open folder...", command=self.choose_folder)
+        file_menu.add_command(label="Resume last scan", command=self.resume_last_scan)
+        file_menu.add_cascade(label="Recent folders", menu=recent_menu)
         file_menu.add_separator()
-        file_menu.add_command(label=_("Exit"), command=self._on_close)
+        file_menu.add_command(label="Exit", command=self._on_close)
 
-        view_menu.add_command(label=_("Detected files"), command=self.show_detected_files)
-        view_menu.add_command(label=_("Review queue"), command=self.restore_review_view)
+        view_menu.add_command(label="Detected files", command=self.show_detected_files)
+        view_menu.add_command(label="Review queue", command=self.restore_review_view)
         view_menu.add_separator()
-        view_menu.add_command(label=_("Light theme"), command=lambda: self.theme_var.set("light"))
-        view_menu.add_command(label=_("Dark theme"), command=lambda: self.theme_var.set("dark"))
-        view_menu.add_command(label=_("System theme"), command=lambda: self.theme_var.set("system"))
+        view_menu.add_command(label="Light theme", command=lambda: self.theme_var.set("light"))
+        view_menu.add_command(label="Dark theme", command=lambda: self.theme_var.set("dark"))
+        view_menu.add_command(label="System theme", command=lambda: self.theme_var.set("system"))
 
-        tools_menu.add_command(label=_("Settings"), command=self.open_settings_dialog)
-        tools_menu.add_command(label=_("Settings profiles"), command=self.open_profiles_dialog)
-        tools_menu.add_command(label=_("Import settings"), command=self.import_settings)
-        tools_menu.add_command(label=_("Export settings"), command=self.export_settings)
-        tools_menu.add_command(label=_("Output options"), command=self.open_output_options_dialog)
-        tools_menu.add_command(label=_("Prompt tester"), command=self.open_prompt_tester_dialog)
+        tools_menu.add_command(label="Settings", command=self.open_settings_dialog)
+        tools_menu.add_command(label="Settings profiles", command=self.open_profiles_dialog)
+        tools_menu.add_command(label="Import settings", command=self.import_settings)
+        tools_menu.add_command(label="Export settings", command=self.export_settings)
+        tools_menu.add_command(label="Output options", command=self.open_output_options_dialog)
+        tools_menu.add_command(label="Prompt tester", command=self.open_prompt_tester_dialog)
         tools_menu.add_separator()
-        tools_menu.add_command(label=_("Copy matches to subfolder"), command=self.copy_matches_to_subfolder)
-        tools_menu.add_command(label=_("Export matches (CSV)"), command=self.export_matches)
-        tools_menu.add_command(label=_("Export HTML report"), command=self.export_html_report)
-        tools_menu.add_command(label=_("Write metadata tags"), command=self.write_metadata_to_visible)
-        tools_menu.add_command(label=_("Accept everything shown"), command=lambda: self.mark_all_shown(1))
-        tools_menu.add_command(label=_("Reject everything shown"), command=lambda: self.mark_all_shown(0))
+        tools_menu.add_command(label="Copy matches to subfolder", command=self.copy_matches_to_subfolder)
+        tools_menu.add_command(label="Export matches (CSV)", command=self.export_matches)
+        tools_menu.add_command(label="Export HTML report", command=self.export_html_report)
+        tools_menu.add_command(label="Write metadata tags", command=self.write_metadata_to_visible)
+        tools_menu.add_command(label="Accept everything shown", command=lambda: self.mark_all_shown(1))
+        tools_menu.add_command(label="Reject everything shown", command=lambda: self.mark_all_shown(0))
         tools_menu.add_separator()
-        tools_menu.add_command(label=_("Clear cache"), command=self.clear_cache)
-        tools_menu.add_command(label=_("Reset cross-folder learning"), command=self.reset_global_learning)
+        tools_menu.add_command(label="Clear cache", command=self.clear_cache)
+        tools_menu.add_command(label="Reset cross-folder learning", command=self.reset_global_learning)
         tools_menu.add_separator()
-        tools_menu.add_command(label=_("Add folder to queue"), command=self.add_folder_to_queue)
-        tools_menu.add_command(label=_("Run queue"), command=self.run_queue)
-        tools_menu.add_command(label=_("Stop queue"), command=self.stop_queue)
+        tools_menu.add_command(label="Add folder to queue", command=self.add_folder_to_queue)
+        tools_menu.add_command(label="Run queue", command=self.run_queue)
+        tools_menu.add_command(label="Stop queue", command=self.stop_queue)
         tools_menu.add_separator()
-        tools_menu.add_command(label=_("Trash visible files"), command=self.trash_visible_files)
-        tools_menu.add_command(label=_("Duplicate groups"), command=self.show_duplicate_groups)
+        tools_menu.add_command(label="Trash visible files", command=self.trash_visible_files)
+        tools_menu.add_command(label="Duplicate groups", command=self.show_duplicate_groups)
 
-        help_menu.add_command(label=_("Guide"), command=self.show_guide)
-        help_menu.add_command(label=_("About"), command=self.show_about)
-        help_menu.add_command(label=_("Log viewer"), command=self.show_log_viewer)
-        help_menu.add_command(label=_("Check for updates"), command=self.check_for_updates)
+        help_menu.add_command(label="Guide", command=self.show_guide)
+        help_menu.add_command(label="About", command=self.show_about)
+        help_menu.add_command(label="Log viewer", command=self.show_log_viewer)
+        help_menu.add_command(label="Check for updates", command=self.check_for_updates)
 
         self.menus = [file_menu, view_menu, tools_menu, help_menu, recent_menu]
         for label, menu in (
-            (_("File"), file_menu),
-            (_("View"), view_menu),
-            (_("Tools"), tools_menu),
-            (_("Help"), help_menu),
+            ("File", file_menu),
+            ("View", view_menu),
+            ("Tools", tools_menu),
+            ("Help", help_menu),
         ):
             button = ttk.Menubutton(
                 self.menu_bar_frame, text=label, menu=menu, direction="below", style="MenuBar.TMenubutton"
@@ -1450,7 +1449,7 @@ class BikiniScannerApp:
             return
         self.recent_menu.delete(0, END)
         if not self.recent_folders:
-            self.recent_menu.add_command(label=_("No recent folders"), state="disabled")
+            self.recent_menu.add_command(label="No recent folders", state="disabled")
             return
         for folder in self.recent_folders[:10]:
             self.recent_menu.add_command(
@@ -1945,25 +1944,21 @@ class BikiniScannerApp:
 
     def show_guide(self) -> None:
         messagebox.showinfo(
-            _("Bikini Scanner guide"),
-            _(
-                "1. Choose a folder and run a scan.\n"
-                "2. Use the grid to review images with Accept, REJECT, or Skip.\n"
-                "3. Use filters, search, sorting, and the image viewer to narrow the set.\n"
-                "4. Open Tools > Settings to adjust scoring and hardware options.\n"
-                "5. Recently scanned folders appear in File > Recent folders."
-            ),
+            "Bikini Scanner guide",
+            "1. Choose a folder and run a scan.\n"
+            "2. Use the grid to review images with Accept, REJECT, or Skip.\n"
+            "3. Use filters, search, sorting, and the image viewer to narrow the set.\n"
+            "4. Open Tools > Settings to adjust scoring and hardware options.\n"
+            "5. Recently scanned folders appear in File > Recent folders.",
         )
 
     def show_about(self) -> None:
         messagebox.showinfo(
-            _("About Bikini Scanner"),
-            _(
-                f"Bikini Scanner {__version__}\n"
-                "Local CPU-first bikini-content scanner with optional active learning, review tools, and per-folder caches.\n"
-                f"User data: {prefs_path().parent}\n"
-                f"Log file: {log_path()}"
-            ),
+            "About Bikini Scanner",
+            f"Bikini Scanner {__version__}\n"
+            "Local CPU-first bikini-content scanner with optional active learning, review tools, and per-folder caches.\n"
+            f"User data: {prefs_path().parent}\n"
+            f"Log file: {log_path()}",
         )
 
     def check_for_updates(self) -> None:
@@ -2950,7 +2945,7 @@ class BikiniScannerApp:
         face_status.pack(side=LEFT)
         face_button = ttk.Button(
             face_row,
-            text=_("Install face model"),
+            text="Install face model",
             command=lambda: self.install_face_model(dialog, face_status),
         )
         face_button.pack(side=RIGHT)
@@ -4209,17 +4204,17 @@ class BikiniScannerApp:
             # horizontal line, whatever the card width.
             primary = ttk.Frame(buttons)
             primary.grid(row=0, column=0, sticky="w", pady=(0, 4))
-            ttk.Button(primary, text=_("Accept"), width=12, command=lambda: self.set_label(path, 1)).pack(
+            ttk.Button(primary, text="Accept", width=12, command=lambda: self.set_label(path, 1)).pack(
                 side=LEFT, padx=(0, 6)
             )
-            ttk.Button(primary, text=_("REJECT"), width=12, command=lambda: self.set_label(path, 0)).pack(side=LEFT)
+            ttk.Button(primary, text="REJECT", width=12, command=lambda: self.set_label(path, 0)).pack(side=LEFT)
             secondary = ttk.Frame(buttons)
             secondary.grid(row=1, column=0, sticky="w")
             actions = [
-                (_("View"), lambda: self.view_image(path)),
-                (_("Skip"), lambda: self.set_label(path, 2)),
-                (_("Find similar"), lambda: self.find_similar(path)),
-                (_("Reveal"), lambda: self.reveal_in_file_manager(path)),
+                ("View", lambda: self.view_image(path)),
+                ("Skip", lambda: self.set_label(path, 2)),
+                ("Find similar", lambda: self.find_similar(path)),
+                ("Reveal", lambda: self.reveal_in_file_manager(path)),
             ]
             for text, command in actions:
                 ttk.Button(secondary, text=text, command=command).pack(side=LEFT, padx=(0, 6))

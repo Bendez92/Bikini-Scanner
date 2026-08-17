@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Redirect every user-state path before importing anything that reads them.
 _STATE_DIR = Path(tempfile.mkdtemp(prefix="bikini_state_"))
+os.environ["BIKINI_SCANNER_TEST_SQLITE_PRAGMAS"] = "1"
 os.environ["APPDATA"] = str(_STATE_DIR)
 os.environ["LOCALAPPDATA"] = str(_STATE_DIR)  # the log lives here on Windows
 os.environ["XDG_CONFIG_HOME"] = str(_STATE_DIR)

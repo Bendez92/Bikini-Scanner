@@ -1598,11 +1598,11 @@ def _scan_and_score_folder_impl(
             for content_hash, embedding in zip(hash_to_image.keys(), batch_embeddings, strict=False):
                 content_embeddings[content_hash] = embedding
                 if scorer.config.enable_face_detection and content_hash not in content_face_counts:
-                    first_path = hash_to_records.get(content_hash, [None])[0]
+                    source_image = hash_to_image.get(content_hash)
                     face_count = None
-                    if first_path is not None:
+                    if source_image is not None:
                         try:
-                            face_count = detect_face_count(open_oriented(first_path))
+                            face_count = detect_face_count(source_image)
                         except Exception:  # noqa: BLE001
                             face_count = None
                     if face_count is not None:
