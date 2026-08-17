@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 from PIL import Image
@@ -269,7 +269,7 @@ class BikiniScorer:
     backend: ImageEmbeddingBackend
     config: ScannerConfig = field(default_factory=ScannerConfig)
     axis_embeddings: dict[str, AxisEmbeddings] = field(init=False, repr=False)
-    classifier: LogisticRegression | None = field(init=False, default=None, repr=False)
+    classifier: LogisticRegression | PlattCalibrator | None = field(init=False, default=None, repr=False)
     zero_shot_scale: float = field(init=False, default=DEFAULT_ZERO_SHOT_SCALE, repr=False)
     classifier_weight: float = field(init=False, default=DEFAULT_CLASSIFIER_WEIGHT, repr=False)
     zero_shot_weight: float = field(init=False, default=DEFAULT_ZERO_SHOT_WEIGHT, repr=False)
@@ -404,7 +404,7 @@ class BikiniScorer:
                     return label_count
 
         X = np.vstack([embeddings_by_path[path] for path, _ in labeled_pairs]).astype(np.float32)
-        y = np.asarray([label for _, label in labeled_pairs], dtype=np.int64)
+        y: np.ndarray = np.asarray([label for _, label in labeled_pairs], dtype=np.int64)
         classifier = self._fit_classifier(X, y)
         self.classifier = classifier
         if store is not None and classifier is not None:
@@ -441,7 +441,7 @@ class BikiniScorer:
         if len(labeled_pairs) < 6:
             return None
         X = np.vstack([embeddings_by_path[path] for path, _ in labeled_pairs]).astype(np.float32)
-        y = np.asarray([label for _, label in labeled_pairs], dtype=np.int64)
+        y: np.ndarray = np.asarray([label for _, label in labeled_pairs], dtype=np.int64)
         class_counts = np.bincount(y, minlength=2)
         if class_counts.min() < 3:
             return None
@@ -459,7 +459,7 @@ class BikiniScorer:
         except Exception:  # noqa: BLE001
             return None
 
-    def _fit_classifier(self, X: np.ndarray, y: np.ndarray):
+    def _fit_classifier(self, X: np.ndarray, y: np.ndarray) -> LogisticRegression | PlattCalibrator:
         base_classifier = LogisticRegression()
         try:
             class_counts = np.bincount(y, minlength=2)
@@ -520,14 +520,15 @@ class BikiniScorer:
         if axis_scores is None:
             axis_scores = self.axis_zero_shot_scores(embeddings)
         zero_shot = axis_scores.get("bikini", np.empty((0,), dtype=np.float32))
-        if (
-            self.classifier is None
-            or embeddings.size == 0
-            or getattr(self.classifier, "coef", None) is None
-            or int(embeddings.shape[1]) != int(self.classifier.coef.shape[0])
-        ):
+        classifier = self.classifier
+        if classifier is None or embeddings.size == 0:
             return zero_shot
-        classifier_scores = self.classifier.predict_proba(embeddings)[:, 1].astype(np.float32)
+        coef = getattr(classifier, "coef", None)
+        if coef is None and hasattr(classifier, "model"):
+            coef = getattr(classifier.model, "coef", None)
+        if coef is None or int(embeddings.shape[1]) != int(coef.shape[0]):
+            return zero_shot
+        classifier_scores: np.ndarray = classifier.predict_proba(embeddings)[:, 1].astype(np.float32)
         return (self.classifier_weight * classifier_scores + self.zero_shot_weight * zero_shot).astype(np.float32)
 
     # --- cascade plumbing ---------------------------------------------------
@@ -535,7 +536,7 @@ class BikiniScorer:
         """A region table with one full-frame row per image (no deep scan)."""
         embeddings = np.asarray(embeddings, dtype=np.float32)
         count = int(embeddings.shape[0]) if embeddings.ndim == 2 else 0
-        rows = np.arange(count, dtype=np.int64)
+        rows: np.ndarray = np.arange(count, dtype=np.int64)
         return RegionScoreTable(
             owner=rows,
             kinds=np.array([KIND_FULL] * count, dtype=object),
@@ -553,9 +554,9 @@ class BikiniScorer:
     ) -> RegionScoreTable:
         """Score every (image, region) row in one pass and index it by image."""
         row_embeddings = np.asarray(row_embeddings, dtype=np.float32)
-        owner_array = np.asarray(owner, dtype=np.int64)
+        owner_array: np.ndarray = np.asarray(owner, dtype=np.int64)
         kinds = np.array([region_kind(key) for key in region_keys], dtype=object)
-        full_row = np.zeros((image_count,), dtype=np.int64)
+        full_row: np.ndarray = np.zeros((image_count,), dtype=np.int64)
         for row, (image_index, key) in enumerate(zip(owner_array, region_keys, strict=False)):
             if key == FULL_REGION:
                 full_row[int(image_index)] = row
@@ -690,7 +691,7 @@ class BikiniScorer:
             # The cascade uses evidence-space values, but person_scores are sigmoid outputs.
             # Compare in evidence space so the same threshold maps to the same gate.
             mask &= logit(np.asarray(person_scores, dtype=np.float32)) >= logit(
-                float(self.config.person_threshold)
+                np.asarray([float(self.config.person_threshold)], dtype=np.float32)
             )
         if excluded is not None and len(excluded) == len(mask):
             mask &= ~np.asarray(excluded, dtype=bool)
@@ -766,7 +767,7 @@ class BikiniScorer:
         scores = learning.blend(zero_shot, learned, outcome.weight)
         # No amount of learned confidence may resurrect an age-gated image.
         if result.stage:
-            minor_rows = np.asarray([stage == cascade_module.STAGE_MINOR for stage in result.stage], dtype=bool)
+            minor_rows: np.ndarray = np.asarray([stage == cascade_module.STAGE_MINOR for stage in result.stage], dtype=bool)
             if minor_rows.any():
                 scores = np.asarray(scores, dtype=np.float32)
                 scores[minor_rows] = 0.0
@@ -854,6 +855,7 @@ class DeepPassResult:
     face_counts: np.ndarray | None
     deep_scanned: int
     detail_regions: list[str] = field(default_factory=list)
+    decoded_images: dict[int, Image.Image] = field(default_factory=dict)
 
 
 def _region_namespace(config: ScannerConfig) -> str:
@@ -932,6 +934,7 @@ def run_deep_pass(
     # per batch instead of once per candidate. Cached crops skip this list entirely.
     pending_crops: list[tuple[int, str, Image.Image]] = []
     pending_meta: list[tuple[int, str, str]] = []  # (index, content_hash, key)
+    decoded_images: dict[int, Image.Image] = {}
     processed = 0
 
     for index in candidate_indices:
@@ -957,6 +960,7 @@ def run_deep_pass(
                 # anything, so a scaled decode would throw away the very detail the
                 # crops exist to recover.
                 image = open_oriented(path)
+                decoded_images[index] = image
                 faces = detect_face_boxes(image)
                 updated_faces[index] = len(faces)
                 planned = [
@@ -997,14 +1001,14 @@ def run_deep_pass(
             row_embeddings.append(vector)
             if region_kind(key) != KIND_FACE:
                 detail_rows.setdefault(index, []).append(len(row_embeddings) - 1)
-        for (index, content_hash, key), vector in zip(pending_meta, vectors, strict=False):
-            pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(vector, dtype=np.float32)
-            pending_cache[store.region_cache_key(content_hash, namespace, "__faces__")] = np.asarray(
-                [max(int(updated_faces[index]), 0)], dtype=np.float32
-            )
-
-    if store is not None and pending_cache:
-        store.save_region_embeddings(pending_cache)
+        if store is not None:
+            for (index, content_hash, key), vector in zip(pending_meta, vectors, strict=False):
+                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(vector, dtype=np.float32)
+                pending_cache[store.region_cache_key(content_hash, namespace, "__faces__")] = np.asarray(
+                    [max(int(updated_faces[index]), 0)], dtype=np.float32
+                )
+            if pending_cache:
+                store.save_region_embeddings(pending_cache)
 
     matrix = np.vstack(row_embeddings).astype(np.float32)
     table = scorer.build_region_table(matrix, owner, region_keys, count)
@@ -1027,7 +1031,7 @@ def run_deep_pass(
         resolved_faces = updated_faces
     elif face_counts is not None:
         resolved_faces = np.asarray(face_counts, dtype=np.int32)
-    return DeepPassResult(table, detail_embeddings, resolved_faces, len(candidate_indices), detail_regions)
+    return DeepPassResult(table, detail_embeddings, resolved_faces, len(candidate_indices), detail_regions, decoded_images)
 
 
 @dataclass(slots=True)
@@ -1048,6 +1052,7 @@ def compute_vlm_scores(
     cancel_event: threading.Event | None = None,
     on_progress: Callable[[int, int], None] | None = None,
     store: FolderStore | None = None,
+    decoded_images: dict[int, Image.Image] | None = None,
 ) -> RefineResult | None:
     """Adjudicate borderline images with a local vision model.
 
@@ -1101,7 +1106,10 @@ def compute_vlm_scores(
     ranked: list[tuple[float, int, list[Image.Image]]] = []
     for distance, index in selected:
         try:
-            image = open_oriented(state.paths[index])
+            if decoded_images is not None and index in decoded_images:
+                image = decoded_images[index]
+            else:
+                image = open_oriented(state.paths[index])
             views = [image]
             wanted = detail_regions[index] if index < len(detail_regions) else FULL_REGION
             if wanted != FULL_REGION:
@@ -1157,14 +1165,14 @@ def compute_vlm_scores(
         store.save_vlm_verdicts(pending)
     if on_progress is not None and not uncached_images:
         on_progress(len(ranked), len(ranked))
-    scores = np.full((len(state.paths),), np.nan, dtype=np.float32)
-    minor = np.zeros((len(state.paths),), dtype=bool)
+    scores: np.ndarray = np.full((len(state.paths),), np.nan, dtype=np.float32)
+    minor: np.ndarray = np.zeros((len(state.paths),), dtype=bool)
     config = scorer.config
     for position, (_, index, _views) in enumerate(ranked):
         values = cached.get(position)
         if values is None:
             continue
-        matrix = np.asarray([[values.get(axis, 0.5) for axis in VLM_AXES]], dtype=np.float32)
+        matrix: np.ndarray = np.asarray([[values.get(axis, 0.5) for axis in VLM_AXES]], dtype=np.float32)
         axis_scores = {axis: matrix[:, offset] for offset, axis in enumerate(VLM_AXES)}
         table = RegionScoreTable(
             owner=np.array([0], dtype=np.int64),
@@ -1230,8 +1238,8 @@ def compute_refine_scores(
         return None
 
     detail_regions = state.detail_regions or [FULL_REGION] * len(state.paths)
-    refine_scores = np.full((len(state.paths),), np.nan, dtype=np.float32)
-    refine_minor = np.zeros((len(state.paths),), dtype=bool)
+    refine_scores: np.ndarray = np.full((len(state.paths),), np.nan, dtype=np.float32)
+    refine_minor: np.ndarray = np.zeros((len(state.paths),), dtype=bool)
     done = 0
     for index in targets:
         if cancel_event is not None and cancel_event.is_set():
@@ -1304,7 +1312,7 @@ def bucketed_sampling(
     ]
 
     used_paths: set[str] = set()
-    embedding_array = None if embeddings is None else np.asarray(embeddings, dtype=np.float32)
+    embedding_array: np.ndarray | None = None if embeddings is None else np.asarray(embeddings, dtype=np.float32)
     if embedding_array is not None and embedding_array.shape[0] != len(paths):
         embedding_array = None
 
@@ -1342,11 +1350,11 @@ def bucketed_sampling(
                     range(len(candidates)),
                     key=lambda idx: (
                         min(
-                            _cosine_distance(embedding_array[int(candidates[idx]["index"])], vector)
+                            _cosine_distance(embedding_array[cast(int, candidates[idx]["index"])], vector)
                             for vector in selected_vectors
                         ),
-                        -abs(float(candidates[idx]["score"]) - threshold),
-                        float(candidates[idx]["score"]),
+                        -abs(cast(float, candidates[idx]["score"]) - threshold),
+                        cast(float, candidates[idx]["score"]),
                     ),
                 )
             item = candidates.pop(best_index)
@@ -1355,30 +1363,30 @@ def bucketed_sampling(
                 continue
             used_paths.add(path)
             selected.append({k: v for k, v in item.items() if k != "index"} | {"bucket": bucket_name})
-            selected_vectors.append(embedding_array[int(item["index"])])
+            selected_vectors.append(embedding_array[cast(int, item["index"])])
         return selected
 
     contested = _take(
-        [item for item in scored if disagreement_by_index.get(int(item["index"]), 0.0) >= 0.08],
+        [item for item in scored if disagreement_by_index.get(cast(int, item["index"]), 0.0) >= 0.08],
         "Model disagrees",
-        sort_key=lambda item: disagreement_by_index.get(int(item["index"]), 0.0),
+        sort_key=lambda item: disagreement_by_index.get(cast(int, item["index"]), 0.0),
         reverse=True,
     )
     likely_good = _take(
-        [item for item in scored if item["score"] >= threshold + margin],
+        [item for item in scored if cast(float, item["score"]) >= threshold + margin],
         "Likely match",
-        sort_key=lambda item: item["score"],
+        sort_key=lambda item: cast(float, item["score"]),
         reverse=True,
     )
     likely_false_positives = _take(
-        [item for item in scored if threshold <= item["score"] <= threshold + margin],
+        [item for item in scored if threshold <= cast(float, item["score"]) <= threshold + margin],
         "Likely false positive",
-        sort_key=lambda item: item["score"],
+        sort_key=lambda item: cast(float, item["score"]),
     )
     likely_false_negatives = _take(
-        [item for item in scored if threshold - margin <= item["score"] < threshold],
+        [item for item in scored if threshold - margin <= cast(float, item["score"]) < threshold],
         "Likely false negative",
-        sort_key=lambda item: item["score"],
+        sort_key=lambda item: cast(float, item["score"]),
         reverse=True,
     )
 
@@ -1386,7 +1394,7 @@ def bucketed_sampling(
     uncertain = _take(
         uncertain_candidates,
         "Uncertain",
-        sort_key=lambda item: (abs(item["score"] - threshold), item["score"]),
+        sort_key=lambda item: (abs(cast(float, item["score"]) - threshold), cast(float, item["score"])),
     )
 
     if likely_good:
@@ -1399,7 +1407,7 @@ def scan_and_score_folder(
     store: FolderStore,
     scorer: BikiniScorer,
     threshold: float = 0.5,
-    progress_callback: Callable[[int, int, float, float | None], None] | None = None,
+    progress_callback: Callable[..., None] | None = None,
     batch_size: int = 16,
     cancel_event: threading.Event | None = None,
 ) -> tuple[ScoreState, list[dict[str, object]]]:
@@ -1421,7 +1429,7 @@ def _scan_and_score_folder_impl(
     store: FolderStore,
     scorer: BikiniScorer,
     threshold: float = 0.5,
-    progress_callback: Callable[[int, int, float, float | None], None] | None = None,
+    progress_callback: Callable[..., None] | None = None,
     batch_size: int = 16,
     cancel_event: threading.Event | None = None,
 ) -> tuple[ScoreState, list[dict[str, object]]]:
@@ -1550,11 +1558,12 @@ def _scan_and_score_folder_impl(
             cached_embedding = content_embeddings.get(record.content_hash)
             if cached_embedding is None:
                 cached_embedding = store.lookup_content_embedding(record.content_hash)
-            face_count: int | None = content_face_counts.get(record.content_hash)
-            if face_count is None and scorer.config.enable_face_detection:
-                face_count = detect_face_count(record.image)
-                if face_count is not None:
-                    content_face_counts[record.content_hash] = face_count
+            record_face_count: int | None = content_face_counts.get(record.content_hash)
+            if record_face_count is None and scorer.config.enable_face_detection:
+                assert record.image is not None
+                record_face_count = detect_face_count(record.image)
+                if record_face_count is not None:
+                    content_face_counts[record.content_hash] = record_face_count
             if cached_embedding is not None:
                 content_embeddings.setdefault(record.content_hash, cached_embedding)
                 path_records[record.path] = {
@@ -1564,7 +1573,7 @@ def _scan_and_score_folder_impl(
                 }
                 ordered_paths.append(str(record.path))
                 all_embeddings.append(np.asarray(cached_embedding, dtype=np.float32))
-                face_counts.append(face_count)
+                face_counts.append(record_face_count)
                 image_records.append(
                     {
                         "filename": record.path.name,
@@ -1572,13 +1581,14 @@ def _scan_and_score_folder_impl(
                         "score": None,
                         "zero_shot_score": None,
                         "axis_scores": {},
-                        "face_count": int(face_count) if face_count is not None else None,
+                        "face_count": int(record_face_count) if record_face_count is not None else None,
                         "matched": None,
                         "timestamp": scan_timestamp,
                     }
                 )
                 continue
             if record.content_hash not in hash_to_image:
+                assert record.image is not None
                 hash_to_image[record.content_hash] = record.image
                 hash_to_records[record.content_hash] = []
             hash_to_records[record.content_hash].append(record.path)
@@ -1643,8 +1653,8 @@ def _scan_and_score_folder_impl(
             pending_flush_images = 0
         _check_cancelled()
     if not all_embeddings:
-        empty = np.empty((0, backend.image_embedding_dim), dtype=np.float32)
-        empty_faces = np.empty((0,), dtype=np.int32)
+        empty: np.ndarray = np.empty((0, backend.image_embedding_dim), dtype=np.float32)
+        empty_faces: np.ndarray = np.empty((0,), dtype=np.int32)
         state = scorer.score_state(
             [],
             empty,
@@ -1659,8 +1669,8 @@ def _scan_and_score_folder_impl(
         return state, []
 
     reporter.complete_phase()
-    embeddings = np.vstack(all_embeddings).astype(np.float32)
-    face_array = (
+    embeddings: np.ndarray = np.vstack(all_embeddings).astype(np.float32)
+    face_array: np.ndarray | None = (
         np.asarray([int(face_count) if face_count is not None else -1 for face_count in face_counts], dtype=np.int32)
         if any(face_count is not None for face_count in face_counts)
         else None
@@ -1731,6 +1741,7 @@ def _scan_and_score_folder_impl(
             cancel_event=cancel_event,
             on_progress=_refine_progress,
             store=store,
+            decoded_images=deep.decoded_images,
         )
     if refine is None:
         refine = compute_refine_scores(
@@ -1764,7 +1775,7 @@ def _scan_and_score_folder_impl(
         threshold=threshold,
         disagreement=state_disagreement(state, visible_mask),
     )
-    for idx, (image_record, score, zero_shot_score, path) in enumerate(
+    for idx, (image_record, score, zero_shot_score, image_path) in enumerate(
         zip(image_records, state.scores, state.zero_shot_scores, state.paths, strict=False)
     ):
         image_record.update(
@@ -1777,7 +1788,7 @@ def _scan_and_score_folder_impl(
                 "face_count": int(state.face_counts[idx])
                 if state.face_counts is not None and state.face_counts[idx] >= 0
                 else None,
-                "label_state": int(labels.get(path)) if path in labels else None,
+                "label_state": int(labels[image_path]) if image_path in labels else None,
                 "matched": bool(score >= threshold and visible_mask[idx]),
                 "cascade_stage": state.cascade_stage[idx] if idx < len(state.cascade_stage) else "",
                 "cascade_reason": state.cascade_reason[idx] if idx < len(state.cascade_reason) else "",

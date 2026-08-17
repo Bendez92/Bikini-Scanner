@@ -1064,6 +1064,31 @@ class SQLiteCacheMigration(unittest.TestCase):
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 
+    def test_decode_version_bump_deletes_sqlite_and_legacy_caches(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_sqlite_inval_"))
+        try:
+            image_path = folder / "a.jpg"
+            image_path.write_bytes(_make_image_bytes())
+            cache_dir = folder / ".bikini_scanner_cache"
+            cache_dir.mkdir()
+            content_hash = content_hash_for_path(image_path)
+            (cache_dir / "cache_meta.json").write_text(
+                json.dumps({"decode_version": image_formats.DECODE_VERSION - 1}), encoding="utf-8"
+            )
+            np.savez(cache_dir / "embeddings.npz", **{content_hash: np.arange(4, dtype=np.float32)})
+            (cache_dir / "cache.db").write_bytes(b"sqlite")
+            (cache_dir / "cache.db-wal").write_bytes(b"wal")
+
+            store = FolderStore(folder)
+            self.assertFalse((cache_dir / "embeddings.npz").exists())
+            # The stale DB is replaced with a fresh empty one, so lookups return nothing.
+            self.assertTrue((cache_dir / "cache.db").exists())
+            self.assertIsNone(store.lookup_content_embedding(content_hash))
+            meta = json.loads((cache_dir / "cache_meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["decode_version"], image_formats.DECODE_VERSION)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
 
 class IgnoreMarkers(unittest.TestCase):
     """Output directories are not re-scanned as input on a later run."""

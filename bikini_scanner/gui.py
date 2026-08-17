@@ -34,12 +34,14 @@ from tkinter import (
     ttk,
 )
 from tkinter import font as tkfont
+from typing import cast
 
 import numpy as np
 from PIL import Image, ImageTk
 
 from . import cascade, vision_analysis
 from .__version__ import __version__
+from .backend_utils import ImageEmbeddingBackend
 from .config import HIGH_ACCURACY_MODEL, ScannerConfig
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
 from .global_store import GlobalLearningStore
@@ -186,7 +188,7 @@ class BikiniScannerApp:
         self._watch_after_id: str | None = None
         self._hardware_after_id: str | None = None
         self.store: FolderStore | None = None
-        self.backend = None
+        self.backend: ImageEmbeddingBackend | None = None
         self.scorer: BikiniScorer | None = None
         self._refresh_generation = 0
         self._scan_start_monotonic: float | None = None
@@ -737,14 +739,14 @@ class BikiniScannerApp:
         def leave(_event=None) -> None:
             if state["after"] is not None:
                 try:
-                    self.root.after_cancel(state["after"])
+                    self.root.after_cancel(state["after"])  # type: ignore[arg-type]
                 except Exception:  # noqa: BLE001
                     pass
                 state["after"] = None
             window = state["window"]
             if window is not None:
                 try:
-                    window.destroy()
+                    window.destroy()  # type: ignore[attr-defined]
                 except Exception:  # noqa: BLE001
                     pass
                 state["window"] = None
@@ -1385,7 +1387,7 @@ class BikiniScannerApp:
                 with Image.open(icon_path) as image:
                     icon = ImageTk.PhotoImage(image.copy())
                 self._window_icon = icon
-                self.root.iconphoto(True, icon)
+                self.root.iconphoto(True, icon)  # type: ignore[arg-type]
         except Exception:  # noqa: BLE001
             return
 
@@ -1393,8 +1395,8 @@ class BikiniScannerApp:
         if TkinterDnD is None or DND_FILES is None:
             return
         try:
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind("<<Drop>>", self._on_drop_files)
+            self.root.drop_target_register(DND_FILES)  # type: ignore[attr-defined]
+            self.root.dnd_bind("<<Drop>>", self._on_drop_files)  # type: ignore[attr-defined]
         except Exception:  # noqa: BLE001
             return
 
@@ -1451,7 +1453,9 @@ class BikiniScannerApp:
             self.recent_menu.add_command(label=_("No recent folders"), state="disabled")
             return
         for folder in self.recent_folders[:10]:
-            self.recent_menu.add_command(label=folder, command=lambda value=folder: self._open_recent_folder(value))
+            self.recent_menu.add_command(
+                label=folder, command=lambda value=folder: self._open_recent_folder(value)  # type: ignore[misc]
+            )
 
     def _open_recent_folder(self, folder: str) -> None:
         self.open_folder(folder, scan=True)
@@ -1480,10 +1484,7 @@ class BikiniScannerApp:
         if self.backend is not None and self.scorer is not None:
             return True
         try:
-            if self.config.backend == "clip-onnx":
-                from .onnx_backend import get_backend
-            else:
-                from .clip_backend import get_backend
+            from .clip_backend import get_backend
             self.backend = get_backend(self.config)
             return True
         except Exception as exc:
@@ -2054,7 +2055,7 @@ class BikiniScannerApp:
 
     def _sample_sort_key(self, sample: dict[str, object]) -> tuple[object, ...]:
         path = str(sample["path"])
-        score = float(sample.get("score", 0.0))
+        score = float(cast(float, sample.get("score", 0.0)))
         stat = None
         try:
             stat = Path(path).stat()
@@ -2108,12 +2109,12 @@ class BikiniScannerApp:
         match_mode = self.match_filter_var.get().strip()
         if match_mode != "all":
             threshold = float(self.threshold_var.get())
-            matches = float(sample.get("score", 0.0)) >= threshold
+            matches = float(cast(float, sample.get("score", 0.0))) >= threshold
             if match_mode == "matched" and not matches:
                 return False
             if match_mode == "unmatched" and matches:
                 return False
-        score = float(sample.get("score", 0.0))
+        score = float(cast(float, sample.get("score", 0.0)))
         score_min, score_max = self._score_range()
         if score_min is not None and score < score_min:
             return False
@@ -2434,6 +2435,8 @@ class BikiniScannerApp:
             except Exception:  # noqa: BLE001
                 messagebox.showerror("Invalid prompt", "Top N must be a positive integer.", parent=dialog)
                 return
+            if self.scorer is None or self.current_state is None:
+                return
             scores = self.scorer.score_prompt_similarity(
                 self.current_state.embeddings,
                 raw_positive,
@@ -2465,7 +2468,9 @@ class BikiniScannerApp:
 
         button_row = ttk.Frame(outer)
         button_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
-        ttk.Button(button_row, text="Close", command=dialog._safe_close).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(
+            button_row, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+        ).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(button_row, text="Test", command=run_test).pack(side=RIGHT)
         run_test()
 
@@ -3450,7 +3455,9 @@ class BikiniScannerApp:
         ttk.Button(buttons, text="Apply", command=apply).pack(side=LEFT)
         ttk.Button(buttons, text="Save as...", command=save_as).pack(side=LEFT, padx=6)
         ttk.Button(buttons, text="Delete", command=delete).pack(side=LEFT)
-        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
+        ttk.Button(
+            buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+        ).pack(side=RIGHT)
 
     def run_scan(self) -> None:
         if self._scan_active:
@@ -3566,29 +3573,33 @@ class BikiniScannerApp:
         # the main loop is not currently running.
         threshold = float(self.threshold_var.get())
         batch_size = int(self.config.batch_size)
+        store = self.store
+        backend = self.backend
+        scorer = self.scorer
+        assert store is not None and backend is not None and scorer is not None
 
         def worker() -> None:
+            def report_progress(progress: ScanProgress) -> None:
+                self._after(0, self._scan_progress_update, progress)
+
             try:
                 if full_rescan or source_state is None:
                     state, samples = scan_and_score_folder(
-                        self.backend,
-                        self.store,
-                        self.scorer,
+                        backend,
+                        store,
+                        scorer,
                         threshold=threshold,
                         batch_size=batch_size,
                         cancel_event=cancel_event,
-                        progress_callback=lambda progress: self._after(
-                            0,
-                            lambda snapshot=progress: self._scan_progress_update(snapshot),
-                        ),
+                        progress_callback=report_progress,
                     )
                 else:
-                    labels = self.store.load_labels()
-                    state, samples = self.scorer.rescore_state(
+                    labels = store.load_labels()
+                    state, samples = scorer.rescore_state(
                         source_state,
                         labels,
                         threshold=threshold,
-                        store=self.store,
+                        store=store,
                         cancel_event=cancel_event,
                     )
             except ScanCancelled:
@@ -4000,7 +4011,7 @@ class BikiniScannerApp:
         else:
             self.preview_cache.move_to_end(cache_key)
         self.preview_image_label.configure(image=photo)
-        self.preview_image_label.image = photo
+        self.preview_image_label.image = photo  # type: ignore[attr-defined]
         self.preview_caption_var.set(self._preview_caption_text(path))
         if not self.preview_frame.winfo_ismapped():
             self.preview_frame.pack(side=TOP, fill="x", before=self.canvas)
@@ -4114,7 +4125,7 @@ class BikiniScannerApp:
             row += 1
             for index, sample in enumerate(items):
                 path = str(sample["path"])
-                score = float(sample["score"])
+                score = float(cast(float, sample["score"]))
                 self._render_card(
                     self.grid_inner,
                     path,
@@ -4224,9 +4235,15 @@ class BikiniScannerApp:
                 score=score,
             )
             self.photo_refs.append(photo)
+        def _on_click(_event: object, candidate: str = path) -> None:
+            self.focus_path(candidate)
+
+        def _on_double_click(_event: object, candidate: str = path) -> None:
+            self.view_image(candidate)
+
         for widget in (frame, image_label, right, info, name_label, score_label, label_label, details_label):
-            widget.bind("<Button-1>", lambda _event, candidate=path: self.focus_path(candidate))
-            widget.bind("<Double-Button-1>", lambda _event, candidate=path: self.view_image(candidate))
+            widget.bind("<Button-1>", _on_click)
+            widget.bind("<Double-Button-1>", _on_double_click)
         return photo
 
     @staticmethod
@@ -4535,7 +4552,9 @@ class BikiniScannerApp:
         ttk.Button(buttons, text="Open log folder", command=lambda: self.reveal_in_file_manager(str(path))).pack(
             side=LEFT, padx=8
         )
-        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
+        ttk.Button(
+            buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+        ).pack(side=RIGHT)
 
     @staticmethod
     def _refresh_log_text(text: Text) -> None:
@@ -4567,7 +4586,9 @@ class BikiniScannerApp:
         ttk.Button(
             buttons, text="Keep first, trash rest", command=lambda: self._trash_duplicate_remainders(groups, dialog)
         ).pack(side=LEFT)
-        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)
+        ttk.Button(
+            buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+        ).pack(side=RIGHT)
 
     def _trash_duplicate_remainders(self, groups: dict[str, list[str]], dialog: Toplevel) -> None:
         duplicates = [path for paths in groups.values() for path in paths[1:]]
@@ -4687,10 +4708,12 @@ class BikiniScannerApp:
         text.configure(state="disabled")
         button_row = ttk.Frame(outer)
         button_row.pack(side=TOP, fill=BOTH, pady=(10, 0))
-        ttk.Button(button_row, text="Cancel", command=dialog._safe_close).pack(side=RIGHT, padx=(8, 0))
+        ttk.Button(
+            button_row, text="Cancel", command=dialog._safe_close  # type: ignore[attr-defined]
+        ).pack(side=RIGHT, padx=(8, 0))
 
         def proceed() -> None:
-            dialog._safe_close()
+            dialog._safe_close()  # type: ignore[attr-defined]
             on_confirm()
 
         ttk.Button(button_row, text=confirm_text, command=proceed).pack(side=RIGHT)

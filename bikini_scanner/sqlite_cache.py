@@ -65,7 +65,7 @@ class SQLiteCache:
         # lock. This is simpler than a connection-per-thread pool for a single local DB.
         if self._connection is None:
             self._connection = sqlite3.connect(
-                str(self.db_path), check_same_thread=False, isolation_level=""
+                str(self.db_path), check_same_thread=False, isolation_level=None
             )
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
@@ -74,11 +74,25 @@ class SQLiteCache:
     def _transaction(self) -> _SQLiteTransaction:
         return _SQLiteTransaction(self._lock, self._connect)
 
-    def _execute(self, sql: str, parameters: tuple[Any, ...] | list[Any] = ()) -> sqlite3.Cursor:
+    def _execute(
+        self,
+        sql: str,
+        parameters: tuple[Any, ...] | list[Any] = (),
+        conn: sqlite3.Connection | None = None,
+    ) -> sqlite3.Cursor:
+        if conn is not None:
+            return conn.execute(sql, parameters)
         with self._lock:
             return self._connect().execute(sql, parameters)
 
-    def _executemany(self, sql: str, parameters: list[tuple[Any, ...]]) -> sqlite3.Cursor:
+    def _executemany(
+        self,
+        sql: str,
+        parameters: list[tuple[Any, ...]],
+        conn: sqlite3.Connection | None = None,
+    ) -> sqlite3.Cursor:
+        if conn is not None:
+            return conn.executemany(sql, parameters)
         with self._lock:
             return self._connect().executemany(sql, parameters)
 
@@ -173,14 +187,15 @@ class SQLiteCache:
             with self._transaction() as conn:
                 if embeddings_path.is_file():
                     with np.load(embeddings_path, allow_pickle=False) as archive:
-                        rows = [
+                        rows: list[tuple[Any, ...]] = [
                             (str(key), self._array_to_blob(archive[key].astype(np.float32)))
                             for key in archive.files
                         ]
                     if rows:
-                        conn.executemany(
+                        self._executemany(
                             "INSERT OR REPLACE INTO embeddings(content_hash, embedding) VALUES (?, ?)",
                             rows,
+                            conn,
                         )
 
                 if index_path.is_file():
@@ -195,14 +210,15 @@ class SQLiteCache:
                             )
                             for path, record in payload.items()
                             if isinstance(record, dict)
-                        ]
+                        ]  # type: ignore[misc]
                         if rows:
-                            conn.executemany(
+                            self._executemany(
                                 """
                                 INSERT OR REPLACE INTO image_records(path, content_hash, mtime_ns, size)
                                 VALUES (?, ?, ?, ?)
                                 """,
                                 rows,
+                                conn,
                             )
 
                 if face_counts_path.is_file():
@@ -213,9 +229,10 @@ class SQLiteCache:
                             for content_hash, value in payload.items()
                         ]
                         if rows:
-                            conn.executemany(
+                            self._executemany(
                                 "INSERT OR REPLACE INTO face_counts(content_hash, face_count) VALUES (?, ?)",
                                 rows,
+                                conn,
                             )
 
                 if region_path.is_file():
@@ -235,12 +252,13 @@ class SQLiteCache:
                                 )
                             )
                         if rows:
-                            conn.executemany(
+                            self._executemany(
                                 """
                                 INSERT OR REPLACE INTO region_embeddings(content_hash, namespace, region_key, embedding)
                                 VALUES (?, ?, ?, ?)
                                 """,
                                 rows,
+                                conn,
                             )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Legacy cache migration failed, starting fresh: %s", exc)
@@ -263,13 +281,14 @@ class SQLiteCache:
             return
         with self._transaction() as conn:
             if content_embeddings:
-                rows = [
+                rows: list[tuple[Any, ...]] = [
                     (str(content_hash), self._array_to_blob(np.asarray(embedding, dtype=np.float32)))
                     for content_hash, embedding in content_embeddings.items()
                 ]
-                conn.executemany(
+                self._executemany(
                     "INSERT OR REPLACE INTO embeddings(content_hash, embedding) VALUES (?, ?)",
                     rows,
+                    conn,
                 )
             if path_records:
                 rows = [
@@ -281,21 +300,23 @@ class SQLiteCache:
                     )
                     for path, record in path_records.items()
                 ]
-                conn.executemany(
+                self._executemany(
                     """
                     INSERT OR REPLACE INTO image_records(path, content_hash, mtime_ns, size)
                     VALUES (?, ?, ?, ?)
                     """,
                     rows,
+                    conn,
                 )
             if face_counts_by_content_hash:
                 rows = [
                     (str(content_hash), int(face_count))
                     for content_hash, face_count in face_counts_by_content_hash.items()
                 ]
-                conn.executemany(
+                self._executemany(
                     "INSERT OR REPLACE INTO face_counts(content_hash, face_count) VALUES (?, ?)",
                     rows,
+                    conn,
                 )
 
     def get_cached_image_records(
@@ -396,12 +417,13 @@ class SQLiteCache:
         if not rows:
             return
         with self._transaction() as conn:
-            conn.executemany(
+            self._executemany(
                 """
                 INSERT OR REPLACE INTO region_embeddings(content_hash, namespace, region_key, embedding)
                 VALUES (?, ?, ?, ?)
                 """,
                 rows,
+                conn,
             )
 
     def lookup_region_embeddings(self, content_hash: str, namespace: str) -> dict[str, np.ndarray]:

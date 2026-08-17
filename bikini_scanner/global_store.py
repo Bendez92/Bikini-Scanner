@@ -142,7 +142,7 @@ class GlobalLearningStore:
 
                 def write_npz(tmp: Path) -> None:
                     with tmp.open("wb") as handle:
-                        np.savez(handle, **features)
+                        np.savez(handle, **features, allow_pickle=False)
 
                 atomic_replace(self.features_path, write_npz)
             except Exception:
@@ -167,7 +167,7 @@ class GlobalLearningStore:
 
                 def write_npz(tmp: Path) -> None:
                     with tmp.open("wb") as handle:
-                        np.savez(handle, **features)
+                        np.savez(handle, **features, allow_pickle=False)
 
                 atomic_replace(self.features_path, write_npz)
             except Exception:
@@ -232,8 +232,12 @@ class GlobalLearningStore:
     def save_classifier(self, payload: Mapping[str, Any]) -> None:
         data = dict(payload)
         data["feature_version"] = FEATURE_VERSION
+
+        def write_classifier(tmp: Path) -> None:
+            tmp.write_bytes(pickle.dumps(data))
+
         try:
-            atomic_replace(self.classifier_path, lambda tmp: tmp.write_bytes(pickle.dumps(data)))
+            atomic_replace(self.classifier_path, write_classifier)
         except Exception:
             LOGGER.exception("Could not persist the global classifier")
 

@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
@@ -37,8 +37,8 @@ def onnx_model_dir() -> Path:
 @dataclass(slots=True)
 class ClipOnnxBackend:
     processor: CLIPProcessor
-    vision_session: object
-    text_session: object
+    vision_session: Any
+    text_session: Any
     image_embedding_dim_value: int
     active_device_value: str = "cpu"
     active_precision_value: str = "fp32"

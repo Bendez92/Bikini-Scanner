@@ -150,7 +150,7 @@ class RegionScoreTable:
             return np.zeros((self.image_count,), dtype=np.float32)
         # Always seed with the full-frame score so every image has a value even when no
         # eligible crop exists.
-        full = np.zeros((self.image_count,), dtype=np.float32)
+        full: np.ndarray = np.zeros((self.image_count,), dtype=np.float32)
         if self.full_row.size:
             full[:] = scores[self.full_row]
         if AXIS_REGION_KINDS.get(axis) is None:
@@ -277,7 +277,7 @@ def evaluate(
     adult = evidence(aggregated.get("adult", np.full((count,), 0.5, dtype=np.float32)))
 
     # A detected face is direct evidence of a person that does not depend on the prompt.
-    has_face = np.zeros((count,), dtype=bool)
+    has_face: np.ndarray = np.zeros((count,), dtype=bool)
     if face_counts is not None and len(face_counts) == count:
         has_face = np.asarray(face_counts, dtype=np.int32) > 0
 

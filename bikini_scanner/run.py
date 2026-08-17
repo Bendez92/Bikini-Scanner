@@ -8,6 +8,7 @@ import signal
 import sys
 import threading
 from pathlib import Path
+from typing import cast
 
 from .config import ScannerConfig
 from .config_profiles import profile_config
@@ -117,10 +118,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         emit(f"Folder does not exist: {folder}")
         return 2
     store = FolderStore(folder)
-    if config.backend == "clip-onnx":
-        from .onnx_backend import get_backend
-    else:
-        from .clip_backend import get_backend
+    from .clip_backend import get_backend
     backend = get_backend(config)
     scorer = BikiniScorer(backend, config)
     cancel_event = threading.Event()
@@ -170,7 +168,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
             {
                 "path": path,
                 "filename": Path(path).name,
-                "score": float(sample.get("score", state.scores[state_index] if state_index >= 0 else 0.0)),
+                "score": float(cast(float, sample.get("score", state.scores[state_index] if state_index >= 0 else 0.0))),
                 "zero_shot_score": float(state.zero_shot_scores[state_index] if state_index >= 0 else 0.0),
                 "axis_scores": axes,
                 "label": labels.get(path),

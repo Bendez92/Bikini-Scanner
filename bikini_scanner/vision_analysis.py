@@ -18,7 +18,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -27,7 +27,7 @@ from .user_prefs import prefs_path
 try:
     import cv2
 except Exception:  # noqa: BLE001
-    cv2 = None
+    cv2: Any | None = None  # type: ignore[no-redef]
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -47,7 +47,7 @@ _SCORE_THRESHOLD = 0.7
 _MIN_FACE_PX = 16
 
 _LOCK = threading.Lock()
-_DETECTOR: object | None = None
+_DETECTOR: Any | None = None
 _DETECTOR_PATH: Path | None = None
 
 
@@ -94,7 +94,7 @@ def face_detection_available() -> bool:
     return cv2 is not None and hasattr(cv2, "FaceDetectorYN") and resolve_model() is not None
 
 
-def _detector() -> object | None:
+def _detector() -> Any | None:
     global _DETECTOR, _DETECTOR_PATH
     if cv2 is None or not hasattr(cv2, "FaceDetectorYN"):
         return None

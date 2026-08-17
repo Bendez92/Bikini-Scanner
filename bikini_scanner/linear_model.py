@@ -50,7 +50,7 @@ def roc_auc(labels: np.ndarray, scores: np.ndarray) -> float:
         raise ValueError("ROC AUC needs at least four samples from both classes")
     order = np.argsort(scores, kind="mergesort")
     ranked = scores[order]
-    ranks = np.empty(len(scores), dtype=np.float64)
+    ranks: np.ndarray = np.empty(len(scores), dtype=np.float64)
     index = 0
     # Average the ranks inside each tie group, exactly as the standard definition does.
     while index < len(ranked):
@@ -72,7 +72,7 @@ def average_precision(labels: np.ndarray, scores: np.ndarray) -> float:
         return 0.0
     order = np.argsort(-scores, kind="mergesort")
     hits = labels[order] == 1
-    cumulative_hits = np.cumsum(hits)
+    cumulative_hits: np.ndarray = np.cumsum(hits)
     precision = cumulative_hits / np.arange(1, len(hits) + 1)
     return float((precision * hits).sum() / positives)
 
@@ -123,7 +123,7 @@ class LogisticRegression:
         if features.ndim != 2 or features.shape[0] != labels.shape[0]:
             raise ValueError("feature/label shape mismatch")
         self.scaler = StandardScaler().fit(features)
-        x = self.scaler.transform(features).astype(np.float64)
+        x: np.ndarray = self.scaler.transform(features).astype(np.float64)
         n, d = x.shape
 
         # class_weight="balanced": each class contributes equally regardless of size.
@@ -148,7 +148,7 @@ class LogisticRegression:
         converged = False
         for iteration in range(1, int(self.max_iter) + 1):
             logits = x @ coef + intercept
-            probabilities = sigmoid(logits).astype(np.float64)
+            probabilities: np.ndarray = sigmoid(logits).astype(np.float64)
             residual = (probabilities - labels) * weights
             grad_coef = x.T @ residual / n + penalty * coef / n
             grad_int = float(residual.sum() / n)
@@ -209,7 +209,7 @@ class PlattCalibrator:
         labels = np.asarray(labels).astype(np.int64).ravel()
         if labels.size < min_samples or len(set(labels.tolist())) < 2:
             raise ValueError("Platt calibration needs at least min_samples from both classes")
-        scores = self.model.decision_function(features).astype(np.float64).reshape(-1, 1)
+        scores: np.ndarray = self.model.decision_function(features).astype(np.float64).reshape(-1, 1)
         calibrator = LogisticRegression(C=1e6, max_iter=400)
         calibrator.fit(scores.astype(np.float32), labels)
         # The 1-D calibrator standardises its input, so fold that back into slope/bias.
@@ -220,7 +220,7 @@ class PlattCalibrator:
         return self
 
     def predict_proba(self, features: np.ndarray) -> np.ndarray:
-        raw = self.model.decision_function(features).astype(np.float64)
+        raw: np.ndarray = self.model.decision_function(features).astype(np.float64)
         positive = sigmoid(self.slope * raw + self.bias)
         return np.column_stack([1.0 - positive, positive]).astype(np.float32)
 
@@ -252,8 +252,8 @@ def stratified_split(labels: np.ndarray, test_size: int, seed: int = 42) -> tupl
         # so a tiny class does not disappear from the training fold entirely.
         share = min(share, max(0, len(members) - 1))
         test.extend(int(index) for index in members[:share])
-    test_index = np.asarray(sorted(set(test)), dtype=np.int64)
-    mask = np.ones(total, dtype=bool)
+    test_index: np.ndarray = np.asarray(sorted(set(test)), dtype=np.int64)
+    mask: np.ndarray = np.ones(total, dtype=bool)
     mask[test_index] = False
     return np.nonzero(mask)[0], test_index
 
@@ -267,9 +267,9 @@ def cross_val_scores(features: np.ndarray, labels: np.ndarray, c_value: float, f
     """
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels).astype(np.int64).ravel()
-    out = np.full(len(labels), np.nan, dtype=np.float32)
+    out: np.ndarray = np.full(len(labels), np.nan, dtype=np.float32)
     for held_out in stratified_folds(labels, folds):
-        mask = np.ones(len(labels), dtype=bool)
+        mask: np.ndarray = np.ones(len(labels), dtype=bool)
         mask[held_out] = False
         if len(set(labels[mask].tolist())) < 2 or held_out.size == 0:
             continue

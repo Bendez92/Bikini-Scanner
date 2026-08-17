@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from threading import Event
+from typing import Any
 from urllib.parse import urlparse
 
 import numpy as np
@@ -78,6 +79,8 @@ def parse_axis_json(text: str, axes: tuple[str, ...] = VLM_AXES) -> dict[str, fl
     result: dict[str, float] = {}
     for axis in axes:
         value = payload.get(axis)
+        if value is None:
+            continue
         if isinstance(value, bool):
             value = float(value)
         try:
@@ -163,7 +166,7 @@ class VLMClient:
             + ", ".join(VLM_AXES)
             + ". Use 0.5 when uncertain. Return exactly those keys when possible."
         )
-        content = [{"type": "text", "text": user}]
+        content: list[dict[str, Any]] = [{"type": "text", "text": user}]
         content.extend({"type": "image_url", "image_url": {"url": self._image_data_url(image)}} for image in images)
         payload = {
             "model": self.model,

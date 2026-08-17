@@ -11,6 +11,7 @@ import os
 import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
 import numpy as np
 import torch
@@ -22,6 +23,7 @@ from transformers.utils import logging as hf_logging
 from .backend_utils import ClipBackendBase, DecodedImage, ImageEmbeddingBackend
 from .config import ScannerConfig
 from .image_formats import register_heif_support
+from .onnx_backend import ClipOnnxBackend
 
 __all__ = [
     "BACKENDS",
@@ -38,7 +40,7 @@ LOGGER = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 _BACKEND_LOAD_LOCK = threading.Lock()
 _TORCH_BACKEND_CACHE: dict[tuple[str, str, str, bool], ClipTorchBackend] = {}
-_ONNX_BACKEND_CACHE: dict[str, ClipBackendBase] = {}
+_ONNX_BACKEND_CACHE: dict[str, ClipOnnxBackend] = {}
 
 
 @dataclass(slots=True)
@@ -53,7 +55,7 @@ class ClipTorchBackend(ClipBackendBase):
 
     @property
     def image_embedding_dim(self) -> int:
-        return int(self.model.config.projection_dim)
+        return int(self.model.config.projection_dim or 0)
 
     def _embed_image_batch(self, images: Sequence[Image.Image]) -> list[np.ndarray]:
         inputs = self.processor(images=list(images), return_tensors="pt")
@@ -115,7 +117,7 @@ def _load_clip_torch_backend(
                 pass
         processor = CLIPProcessor.from_pretrained(model_name)
         model = CLIPModel.from_pretrained(model_name)
-        model.to(device)
+        model.to(device)  # type: ignore[arg-type]
         if device.type == "cuda" and precision == "fp16":
             model = model.half()
         if device.type == "cpu" and quantize_cpu:
@@ -137,7 +139,7 @@ def _load_clip_torch_backend(
         return backend
 
 
-def _load_clip_onnx_backend(model_name: str) -> ClipBackendBase:
+def _load_clip_onnx_backend(model_name: str) -> ClipOnnxBackend:
     with _BACKEND_LOAD_LOCK:
         cached = _ONNX_BACKEND_CACHE.get(model_name)
         if cached is not None:
@@ -161,5 +163,8 @@ def get_backend(config: ScannerConfig | None = None) -> ImageEmbeddingBackend:
     if backend_id not in BACKENDS:
         raise ValueError(f"Unsupported backend: {backend_id}")
     if backend_id == "clip-torch":
-        return BACKENDS[backend_id](resolved.model_name, resolved.device, resolved.precision, resolved.quantize_cpu)
-    return BACKENDS[backend_id](resolved.model_name)
+        return cast(
+            ImageEmbeddingBackend,
+            _load_clip_torch_backend(resolved.model_name, resolved.device, resolved.precision, resolved.quantize_cpu),
+        )
+    return cast(ImageEmbeddingBackend, _load_clip_onnx_backend(resolved.model_name))

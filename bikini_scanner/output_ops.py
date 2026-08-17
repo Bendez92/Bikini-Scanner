@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from typing import Any, cast
 
 from PIL import Image
 
@@ -291,7 +292,7 @@ def build_html_report(
         path = Path(str(sample["path"]))
         if not path.exists():
             continue
-        score = float(scores.get(str(path), float(sample.get("score", 0.0))))
+        score = float(scores.get(str(path), cast(float, sample.get("score", 0.0))))
         label = label_name(labels.get(str(path)))
         if use_assets:
             asset_path = assets_root / f"thumb_{index:06d}.jpg"
@@ -384,7 +385,7 @@ def write_image_metadata(path: str | Path, keyword: str, score: float | None = N
             fd, tmp_name = tempfile.mkstemp(suffix=source.suffix, dir=str(source.parent))
             os.close(fd)
             tmp = Path(tmp_name)
-            save_kwargs: dict[str, object] = {"exif": exif.tobytes()}
+            save_kwargs: dict[str, Any] = {"exif": exif.tobytes()}
             if suffix == ".png":
                 save_kwargs.pop("exif", None)
                 pnginfo = _pnginfo(keyword, score)

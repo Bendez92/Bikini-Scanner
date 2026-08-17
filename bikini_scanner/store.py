@@ -11,7 +11,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -135,7 +135,7 @@ class FolderStore:
     cache_meta_path: Path = field(init=False)
     cache_db_path: Path = field(init=False)
     lock_path: Path = field(init=False)
-    sqlite_cache: Any = field(init=False, default=None, repr=False)
+    sqlite_cache: SQLiteCache | None = field(init=False, default=None, repr=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
@@ -217,12 +217,13 @@ class FolderStore:
                 LOGGER.warning("Could not discard stale cache %s: %s", path, exc)
         if self.sqlite_cache is not None:
             self.sqlite_cache.clear()
-            discarded.append(self.cache_db_path.name)
-        for suffix in ("-wal", "-shm"):
+        for path in (self.cache_db_path, self.cache_dir / "cache.db-wal", self.cache_dir / "cache.db-shm"):
             try:
-                (self.cache_dir / f"cache.db{suffix}").unlink(missing_ok=True)
+                if path.exists():
+                    path.unlink(missing_ok=True)
+                    discarded.append(path.name)
             except OSError as exc:
-                LOGGER.warning("Could not discard stale cache WAL file: %s", exc)
+                LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
         if discarded:
             LOGGER.info(
                 "Image decoding changed (v%d -> v%d); discarded %s in %s so they are rebuilt "
@@ -330,7 +331,9 @@ class FolderStore:
 
     def _load_path_index(self) -> dict[str, dict[str, int | str]]:
         if self._path_index_cache is None:
-            records = self.sqlite_cache._load_all_image_records()
+            sqlite = self.sqlite_cache
+            assert sqlite is not None
+            records = sqlite._load_all_image_records()
             self._path_index_cache = {
                 str(path): {
                     "path": str(path),
@@ -344,31 +347,41 @@ class FolderStore:
 
     def _load_embedding_cache(self) -> dict[str, np.ndarray]:
         if self._embedding_cache is None:
-            self._embedding_cache = self.sqlite_cache._load_all_embeddings()
+            sqlite = self.sqlite_cache
+            assert sqlite is not None
+            self._embedding_cache = sqlite._load_all_embeddings()
         return self._embedding_cache
 
     def _load_face_count_cache(self) -> dict[str, int]:
         if self._face_count_cache is None:
-            self._face_count_cache = self.sqlite_cache.load_face_counts()
+            sqlite = self.sqlite_cache
+            assert sqlite is not None
+            self._face_count_cache = sqlite.load_face_counts()
         return self._face_count_cache
 
     def get_cached_image_records(self, paths: Iterable[Path]) -> dict[Path, dict[str, object]]:
-        return self.sqlite_cache.get_cached_image_records(list(paths))
+        sqlite = self.sqlite_cache
+        assert sqlite is not None
+        return sqlite.get_cached_image_records(list(paths))
 
     def get_cached_embeddings(self, paths: Iterable[Path]) -> dict[Path, np.ndarray]:
-        return {path: record["embedding"] for path, record in self.get_cached_image_records(paths).items()}
+        return {path: cast(np.ndarray, record["embedding"]) for path, record in self.get_cached_image_records(paths).items()}
 
     def lookup_content_embedding(self, content_hash: str) -> np.ndarray | None:
-        return self.sqlite_cache.lookup_content_embedding(content_hash)
+        sqlite = self.sqlite_cache
+        assert sqlite is not None
+        return sqlite.lookup_content_embedding(content_hash)
 
     def content_hash_for_path(self, path: str | Path) -> str | None:
         return content_hash_for_path(path)
 
     def lookup_face_count(self, content_hash: str) -> int | None:
-        return self.sqlite_cache.lookup_face_count(content_hash)
+        sqlite = self.sqlite_cache
+        assert sqlite is not None
+        return sqlite.lookup_face_count(content_hash)
 
     def save_embeddings(self, embeddings_by_path: dict[Path, np.ndarray]) -> None:
-        if not embeddings_by_path:
+        if not embeddings_by_path or self.sqlite_cache is None:
             return
         content_embeddings: dict[str, np.ndarray] = {}
         path_records: dict[Path, dict[str, int | str]] = {}
@@ -406,10 +419,12 @@ class FolderStore:
         path_records: dict[Path, dict[str, int | str]],
         face_counts_by_content_hash: dict[str, int] | None = None,
     ) -> None:
+        if self.sqlite_cache is None:
+            return
         if not content_embeddings and not path_records and not face_counts_by_content_hash:
             return
         normalized_embeddings = {str(k): np.asarray(v, dtype=np.float32) for k, v in content_embeddings.items()}
-        normalized_records = {
+        normalized_records: dict[Path, dict[str, int | str]] = {
             path: {
                 "content_hash": str(record["content_hash"]),
                 "mtime_ns": int(record["mtime_ns"]),
@@ -452,11 +467,13 @@ class FolderStore:
         return f"{content_hash}|{namespace}|{region_key}"
 
     def lookup_region_embeddings(self, content_hash: str, namespace: str) -> dict[str, np.ndarray]:
-        return self.sqlite_cache.lookup_region_embeddings(str(content_hash), str(namespace))
+        sqlite = self.sqlite_cache
+        assert sqlite is not None
+        return sqlite.lookup_region_embeddings(str(content_hash), str(namespace))
 
     def save_region_embeddings(self, entries: Mapping[str, np.ndarray]) -> None:
         """Persist region embeddings keyed by region_cache_key()."""
-        if not entries:
+        if not entries or self.sqlite_cache is None:
             return
         normalized = {str(k): np.asarray(v, dtype=np.float32) for k, v in entries.items()}
         self.sqlite_cache.save_region_embeddings(normalized)
@@ -487,7 +504,11 @@ class FolderStore:
     def save_classifier_cache(self, payload: Mapping[str, Any]) -> None:
         data = dict(payload)
         data["version"] = CLASSIFIER_CACHE_VERSION
-        atomic_replace(self.classifier_path, lambda tmp: tmp.write_bytes(pickle.dumps(data)))
+
+        def write_classifier(tmp: Path) -> None:
+            tmp.write_bytes(pickle.dumps(data))
+
+        atomic_replace(self.classifier_path, write_classifier)
 
     def load_review_session(self) -> dict[str, Any] | None:
         if not self.review_session_path.exists():
