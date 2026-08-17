@@ -66,7 +66,7 @@ from bikini_scanner.scorer import (
     scan_and_score_folder,
 )
 from bikini_scanner.skin import skin_fraction
-from bikini_scanner.store import FolderStore, collect_image_paths
+from bikini_scanner.store import FolderStore, collect_image_paths, content_hash_for_path
 from bikini_scanner.vision_analysis import FaceBox, detect_face_count
 from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, parse_axis_json
 
@@ -1011,6 +1011,56 @@ class ImageDecoding(unittest.TestCase):
             self.assertFalse(store2.region_embeddings_path.exists())
             payload = json.loads(store2.cache_meta_path.read_text(encoding="utf-8"))
             self.assertEqual(payload["decode_version"], image_formats.DECODE_VERSION)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
+class SQLiteCacheMigration(unittest.TestCase):
+    """Legacy NPZ/JSON caches are migrated into SQLite once, then removed."""
+
+    def test_legacy_npz_json_cache_migrated_to_sqlite(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_sqlite_"))
+        try:
+            image_path = folder / "a.jpg"
+            image_path.write_bytes(_make_image_bytes())
+            cache_dir = folder / ".bikini_scanner_cache"
+            cache_dir.mkdir()
+            (cache_dir / "cache_meta.json").write_text(
+                json.dumps({"decode_version": image_formats.DECODE_VERSION}), encoding="utf-8"
+            )
+            content_hash = content_hash_for_path(image_path)
+            embedding = np.arange(4, dtype=np.float32)
+            np.savez(cache_dir / "embeddings.npz", **{content_hash: embedding})
+            (cache_dir / "embeddings_index.json").write_text(
+                json.dumps(
+                    {
+                        str(image_path): {
+                            "path": str(image_path),
+                            "mtime_ns": image_path.stat().st_mtime_ns,
+                            "size": image_path.stat().st_size,
+                            "content_hash": content_hash,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (cache_dir / "face_counts.json").write_text(json.dumps({content_hash: 2}), encoding="utf-8")
+            np.savez(
+                cache_dir / "region_embeddings.npz",
+                **{f"{content_hash}|v1|upper": np.arange(4, dtype=np.float32)},
+            )
+
+            store = FolderStore(folder)
+            self.assertTrue((cache_dir / "cache.db").exists())
+            self.assertFalse((cache_dir / "embeddings.npz").exists())
+            self.assertFalse((cache_dir / "embeddings_index.json").exists())
+            self.assertFalse((cache_dir / "face_counts.json").exists())
+            self.assertFalse((cache_dir / "region_embeddings.npz").exists())
+            np.testing.assert_allclose(store.lookup_content_embedding(content_hash), embedding)
+            self.assertEqual(store.lookup_face_count(content_hash), 2)
+            regions = store.lookup_region_embeddings(content_hash, "v1")
+            self.assertIn("upper", regions)
+            np.testing.assert_allclose(regions["upper"], embedding)
         finally:
             shutil.rmtree(folder, ignore_errors=True)
 

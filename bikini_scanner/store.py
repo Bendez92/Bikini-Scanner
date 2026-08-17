@@ -24,6 +24,7 @@ except Exception:  # noqa: BLE001
 
 from .image_formats import DECODE_VERSION
 from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
+from .sqlite_cache import SQLiteCache
 
 # Pickle is used only for the classifier cache. Rather than deleting legacy caches, a
 # restricted unpickler limits what can be loaded to the few scanner-owned classes and
@@ -117,15 +118,6 @@ def content_hash_for_path(path: str | Path, chunk_size: int = 1024 * 1024) -> st
     return digest.hexdigest()
 
 
-def _legacy_cache_key(path: Path) -> str | None:
-    stat = safe_stat(path)
-    if stat is None:
-        return None
-    # path.resolve() is part of the key: changing it would invalidate every legacy cache.
-    token = f"{path.resolve()}|{stat.st_mtime_ns}|{stat.st_size}".encode()
-    return hashlib.sha1(token).hexdigest()
-
-
 @dataclass(slots=True)
 class FolderStore:
     folder: Path
@@ -141,7 +133,9 @@ class FolderStore:
     region_embeddings_path: Path = field(init=False)
     vlm_verdicts_path: Path = field(init=False)
     cache_meta_path: Path = field(init=False)
+    cache_db_path: Path = field(init=False)
     lock_path: Path = field(init=False)
+    sqlite_cache: Any = field(init=False, default=None, repr=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
@@ -165,10 +159,18 @@ class FolderStore:
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
         self.vlm_verdicts_path = self.cache_dir / VLM_VERDICTS_FILENAME
         self.cache_meta_path = self.cache_dir / CACHE_META_FILENAME
+        self.cache_db_path = self.cache_dir / "cache.db"
         self.lock_path = self.cache_dir / ".bikini_scanner.lock"
         if _FILELOCK_AVAILABLE:
             self._lock = FileLock(str(self.lock_path))
         self._discard_stale_derived_caches()
+        self.sqlite_cache = SQLiteCache(self.cache_db_path)
+        self.sqlite_cache.migrate_from_legacy(
+            self.embeddings_path,
+            self.index_path,
+            self.region_embeddings_path,
+            self.face_counts_path,
+        )
 
     def lock(self, timeout: float = -1) -> Any:
         """Advisory lock for this folder. Use in a `with` statement."""
@@ -213,6 +215,14 @@ class FolderStore:
                 path.unlink(missing_ok=True)
             except OSError as exc:
                 LOGGER.warning("Could not discard stale cache %s: %s", path, exc)
+        if self.sqlite_cache is not None:
+            self.sqlite_cache.clear()
+            discarded.append(self.cache_db_path.name)
+        for suffix in ("-wal", "-shm"):
+            try:
+                (self.cache_dir / f"cache.db{suffix}").unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.warning("Could not discard stale cache WAL file: %s", exc)
         if discarded:
             LOGGER.info(
                 "Image decoding changed (v%d -> v%d); discarded %s in %s so they are rebuilt "
@@ -320,135 +330,75 @@ class FolderStore:
 
     def _load_path_index(self) -> dict[str, dict[str, int | str]]:
         if self._path_index_cache is None:
-            if not self.index_path.exists():
-                self._path_index_cache = {}
-            else:
-                try:
-                    with self.index_path.open("r", encoding="utf-8") as handle:
-                        raw = json.load(handle)
-                    if isinstance(raw, dict) and raw and all(isinstance(value, dict) for value in raw.values()):
-                        self._path_index_cache = {}
-                        for key, value in raw.items():
-                            path = str(value.get("path", key))
-                            self._path_index_cache[path] = {
-                                "path": path,
-                                "mtime_ns": int(value.get("mtime_ns", 0)),
-                                "size": int(value.get("size", 0)),
-                                **({"content_hash": str(value["content_hash"])} if "content_hash" in value else {}),
-                            }
-                    else:
-                        quarantine_broken_file(self.index_path, LOGGER, "invalid payload type")
-                        self._path_index_cache = {}
-                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    LOGGER.warning("Ignoring unreadable embedding index %s: %s", self.index_path, exc)
-                    quarantine_broken_file(self.index_path, LOGGER, "invalid JSON")
-                    self._path_index_cache = {}
+            records = self.sqlite_cache._load_all_image_records()
+            self._path_index_cache = {
+                str(path): {
+                    "path": str(path),
+                    "mtime_ns": int(record["mtime_ns"]),
+                    "size": int(record["size"]),
+                    "content_hash": str(record["content_hash"]),
+                }
+                for path, record in records.items()
+            }
         return self._path_index_cache
 
     def _load_embedding_cache(self) -> dict[str, np.ndarray]:
         if self._embedding_cache is None:
-            if not self.embeddings_path.exists():
-                self._embedding_cache = {}
-            else:
-                try:
-                    with np.load(self.embeddings_path, allow_pickle=False) as archive:
-                        self._embedding_cache = {str(key): archive[key].astype(np.float32) for key in archive.files}
-                except (OSError, ValueError, TypeError) as exc:
-                    LOGGER.warning("Ignoring unreadable embedding cache %s: %s", self.embeddings_path, exc)
-                    quarantine_broken_file(self.embeddings_path, LOGGER, "invalid NPZ")
-                    self._embedding_cache = {}
+            self._embedding_cache = self.sqlite_cache._load_all_embeddings()
         return self._embedding_cache
 
     def _load_face_count_cache(self) -> dict[str, int]:
         if self._face_count_cache is None:
-            if not self.face_counts_path.exists():
-                self._face_count_cache = {}
-            else:
-                try:
-                    with self.face_counts_path.open("r", encoding="utf-8") as handle:
-                        data = json.load(handle)
-                    if isinstance(data, dict):
-                        self._face_count_cache = {str(key): int(value) for key, value in data.items()}
-                    else:
-                        raise TypeError("invalid payload type")
-                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
-                    LOGGER.warning("Ignoring unreadable face-count cache %s: %s", self.face_counts_path, exc)
-                    quarantine_broken_file(self.face_counts_path, LOGGER, "invalid JSON")
-                    self._face_count_cache = {}
+            self._face_count_cache = self.sqlite_cache.load_face_counts()
         return self._face_count_cache
 
     def get_cached_image_records(self, paths: Iterable[Path]) -> dict[Path, dict[str, object]]:
-        index = self._load_path_index()
-        embeddings = self._load_embedding_cache()
-        cached: dict[Path, dict[str, object]] = {}
-        for path in paths:
-            entry = index.get(str(path))
-            if not entry:
-                continue
-            stat = safe_stat(path)
-            if stat is None:
-                # Listed a moment ago, gone now. Treat it as uncached rather than fatal.
-                continue
-            if int(entry.get("mtime_ns", -1)) != stat.st_mtime_ns or int(entry.get("size", -1)) != stat.st_size:
-                continue
-            content_hash = entry.get("content_hash")
-            embedding: np.ndarray | None = None
-            if content_hash and str(content_hash) in embeddings:
-                embedding = embeddings[str(content_hash)]
-            else:
-                legacy_key = _legacy_cache_key(path)
-                if legacy_key is not None and legacy_key in embeddings:
-                    embedding = embeddings[legacy_key]
-            if embedding is not None:
-                cached[path] = {
-                    "path": path,
-                    "content_hash": str(content_hash) if content_hash else None,
-                    "embedding": embedding,
-                    "mtime_ns": stat.st_mtime_ns,
-                    "size": stat.st_size,
-                }
-        return cached
+        return self.sqlite_cache.get_cached_image_records(list(paths))
 
     def get_cached_embeddings(self, paths: Iterable[Path]) -> dict[Path, np.ndarray]:
         return {path: record["embedding"] for path, record in self.get_cached_image_records(paths).items()}
 
     def lookup_content_embedding(self, content_hash: str) -> np.ndarray | None:
-        embeddings = self._load_embedding_cache()
-        embedding = embeddings.get(str(content_hash))
-        if embedding is None:
-            return None
-        return embedding.astype(np.float32)
+        return self.sqlite_cache.lookup_content_embedding(content_hash)
 
     def content_hash_for_path(self, path: str | Path) -> str | None:
         return content_hash_for_path(path)
 
     def lookup_face_count(self, content_hash: str) -> int | None:
-        return self._load_face_count_cache().get(str(content_hash))
+        return self.sqlite_cache.lookup_face_count(content_hash)
 
     def save_embeddings(self, embeddings_by_path: dict[Path, np.ndarray]) -> None:
         if not embeddings_by_path:
             return
-        archive: dict[str, np.ndarray] = {}
-        if self.embeddings_path.exists():
-            with np.load(self.embeddings_path, allow_pickle=False) as existing_archive:
-                for key in existing_archive.files:
-                    archive[key] = existing_archive[key].astype(np.float32)
-        dirty = False
+        content_embeddings: dict[str, np.ndarray] = {}
+        path_records: dict[Path, dict[str, int | str]] = {}
         for path, embedding in embeddings_by_path.items():
-            key = _legacy_cache_key(path)
-            value = np.asarray(embedding, dtype=np.float32)
-            if key not in archive or not np.array_equal(archive[key], value):
-                dirty = True
-            archive[key] = value
-        if not dirty:
-            return
-
-        def write_npz(tmp: Path) -> None:
-            with tmp.open("wb") as handle:
-                np.savez(handle, **archive)
-
-        atomic_replace(self.embeddings_path, write_npz)
-        self._embedding_cache = archive
+            content_hash = content_hash_for_path(path)
+            if content_hash is None:
+                continue
+            content_embeddings[content_hash] = np.asarray(embedding, dtype=np.float32)
+            stat = safe_stat(path)
+            if stat is None:
+                continue
+            path_records[path] = {
+                "content_hash": content_hash,
+                "mtime_ns": stat.st_mtime_ns,
+                "size": stat.st_size,
+            }
+        self.sqlite_cache.save_scan_cache(content_embeddings, path_records)
+        if self._embedding_cache is None:
+            self._embedding_cache = {}
+        self._embedding_cache.update(content_embeddings)
+        if self._path_index_cache is None:
+            self._path_index_cache = {}
+        for path, record in path_records.items():
+            key = str(path.resolve())
+            self._path_index_cache[key] = {
+                "path": key,
+                "content_hash": str(record["content_hash"]),
+                "mtime_ns": int(record["mtime_ns"]),
+                "size": int(record["size"]),
+            }
 
     def save_scan_cache(
         self,
@@ -458,64 +408,41 @@ class FolderStore:
     ) -> None:
         if not content_embeddings and not path_records and not face_counts_by_content_hash:
             return
-        embeddings = self._load_embedding_cache()
-        index = self._load_path_index()
-        face_counts = self._load_face_count_cache()
-        dirty_embeddings = False
-        dirty_index = False
-        dirty_faces = False
-        for content_hash, embedding in content_embeddings.items():
-            key = str(content_hash)
-            value = np.asarray(embedding, dtype=np.float32)
-            if key not in embeddings or not np.array_equal(embeddings[key], value):
-                dirty_embeddings = True
-            embeddings[key] = value
-        for path, record in path_records.items():
-            key = str(path.resolve())
-            current = {
-                "path": key,
+        normalized_embeddings = {str(k): np.asarray(v, dtype=np.float32) for k, v in content_embeddings.items()}
+        normalized_records = {
+            path: {
+                "content_hash": str(record["content_hash"]),
                 "mtime_ns": int(record["mtime_ns"]),
                 "size": int(record["size"]),
-                "content_hash": str(record["content_hash"]),
             }
-            if index.get(key) != current:
-                dirty_index = True
-            index[key] = current
-        if face_counts_by_content_hash:
-            for content_hash, face_count in face_counts_by_content_hash.items():
-                key = str(content_hash)
-                value = int(face_count)
-                if face_counts.get(key) != value:
-                    dirty_faces = True
-                face_counts[key] = value
-        if dirty_embeddings:
-
-            def write_npz(tmp: Path) -> None:
-                with tmp.open("wb") as handle:
-                    np.savez(handle, **embeddings)
-
-            atomic_replace(self.embeddings_path, write_npz)
-            self._embedding_cache = embeddings
-        if dirty_index:
-            atomic_write_json(self.index_path, index)
-            self._path_index_cache = index
-        if dirty_faces:
-            atomic_write_json(self.face_counts_path, face_counts)
-            self._face_count_cache = face_counts
+            for path, record in path_records.items()
+        }
+        normalized_faces = {str(k): int(v) for k, v in (face_counts_by_content_hash or {}).items()}
+        self.sqlite_cache.save_scan_cache(
+            normalized_embeddings,
+            normalized_records,
+            normalized_faces,
+        )
+        if self._embedding_cache is None:
+            self._embedding_cache = {}
+        self._embedding_cache.update(normalized_embeddings)
+        if self._path_index_cache is None:
+            self._path_index_cache = {}
+        for path, record in normalized_records.items():
+            self._path_index_cache[str(path.resolve())] = {
+                "path": str(path.resolve()),
+                "content_hash": record["content_hash"],
+                "mtime_ns": record["mtime_ns"],
+                "size": record["size"],
+            }
+        if self._face_count_cache is None:
+            self._face_count_cache = {}
+        self._face_count_cache.update(normalized_faces)
 
     # --- region (deep scan) embeddings --------------------------------------
     def _load_region_cache(self) -> dict[str, np.ndarray]:
         if self._region_cache is None:
-            if not self.region_embeddings_path.exists():
-                self._region_cache = {}
-            else:
-                try:
-                    with np.load(self.region_embeddings_path, allow_pickle=False) as archive:
-                        self._region_cache = {str(key): archive[key].astype(np.float32) for key in archive.files}
-                except (OSError, ValueError, TypeError) as exc:
-                    LOGGER.warning("Ignoring unreadable region cache %s: %s", self.region_embeddings_path, exc)
-                    quarantine_broken_file(self.region_embeddings_path, LOGGER, "invalid NPZ")
-                    self._region_cache = {}
+            self._region_cache = {}
         return self._region_cache
 
     @staticmethod
@@ -525,30 +452,17 @@ class FolderStore:
         return f"{content_hash}|{namespace}|{region_key}"
 
     def lookup_region_embeddings(self, content_hash: str, namespace: str) -> dict[str, np.ndarray]:
-        prefix = f"{content_hash}|{namespace}|"
-        cache = self._load_region_cache()
-        return {key[len(prefix) :]: value for key, value in cache.items() if key.startswith(prefix)}
+        return self.sqlite_cache.lookup_region_embeddings(str(content_hash), str(namespace))
 
     def save_region_embeddings(self, entries: Mapping[str, np.ndarray]) -> None:
         """Persist region embeddings keyed by region_cache_key()."""
         if not entries:
             return
-        cache = self._load_region_cache()
-        dirty = False
-        for key, value in entries.items():
-            array = np.asarray(value, dtype=np.float32)
-            if key not in cache or not np.array_equal(cache[key], array):
-                dirty = True
-            cache[key] = array
-        if not dirty:
-            return
-
-        def write_npz(tmp: Path) -> None:
-            with tmp.open("wb") as handle:
-                np.savez(handle, **cache)
-
-        atomic_replace(self.region_embeddings_path, write_npz)
-        self._region_cache = cache
+        normalized = {str(k): np.asarray(v, dtype=np.float32) for k, v in entries.items()}
+        self.sqlite_cache.save_region_embeddings(normalized)
+        if self._region_cache is None:
+            self._region_cache = {}
+        self._region_cache.update(normalized)
 
     def save_scan_metadata(self, payload: Mapping[str, object]) -> None:
         atomic_write_json(self.metadata_path, payload)
@@ -618,6 +532,11 @@ class FolderStore:
         return total
 
     def clear_cache(self) -> None:
+        if self.sqlite_cache is not None:
+            try:
+                self.sqlite_cache.close()
+            except Exception:  # noqa: BLE001
+                pass
         if self.cache_dir.exists():
             shutil.rmtree(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -630,6 +549,8 @@ class FolderStore:
         self.config_override_path = self.cache_dir / CONFIG_OVERRIDE_FILENAME
         self.review_session_path = self.cache_dir / "review_session.json"
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
+        self.cache_db_path = self.cache_dir / "cache.db"
+        self.sqlite_cache = SQLiteCache(self.cache_db_path)
         self._labels_cache = None
         self._path_index_cache = None
         self._embedding_cache = None
