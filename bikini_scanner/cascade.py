@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import cast
 
 import numpy as np
 
@@ -113,6 +114,29 @@ class RegionScoreTable:
     axis_scores: dict[str, np.ndarray]
     image_count: int
     full_row: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.int64))
+    _axis_masks: dict[str, tuple[np.ndarray, np.ndarray]] | None = field(
+        init=False, default=None, repr=False
+    )
+
+    def _ensure_masks(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        if self._axis_masks is None:
+            self._axis_masks = {}
+            kinds = np.asarray(self.kinds)
+            for axis in self.axis_scores:
+                eligible = AXIS_REGION_KINDS.get(axis)
+                if eligible is None:
+                    self._axis_masks[axis] = (
+                        np.zeros(len(kinds), dtype=bool),
+                        np.zeros(len(kinds), dtype=bool),
+                    )
+                    continue
+                allowed = np.isin(kinds, list(eligible))
+                unanchored = np.isin(kinds, list(UNANCHORED_KINDS))
+                self._axis_masks[axis] = (
+                    allowed & ~unanchored,
+                    allowed & unanchored,
+                )
+        return self._axis_masks
 
     def aggregate(self, axis: str) -> np.ndarray:
         """Best evidence for one axis per image, over that axis's eligible regions.
@@ -129,14 +153,12 @@ class RegionScoreTable:
         full = np.zeros((self.image_count,), dtype=np.float32)
         if self.full_row.size:
             full[:] = scores[self.full_row]
-        eligible = AXIS_REGION_KINDS.get(axis)
-        if eligible is None:
+        if AXIS_REGION_KINDS.get(axis) is None:
             return full.astype(np.float32)
 
+        anchored_mask, unanchored_mask = self._ensure_masks()[axis]
         anchored = full.copy()
         unanchored = full.copy()
-        anchored_mask = np.array([kind in eligible and kind not in UNANCHORED_KINDS for kind in self.kinds], dtype=bool)
-        unanchored_mask = np.array([kind in eligible and kind in UNANCHORED_KINDS for kind in self.kinds], dtype=bool)
         if anchored_mask.any():
             np.maximum.at(anchored, self.owner[anchored_mask], scores[anchored_mask])
         if unanchored_mask.any():
@@ -215,13 +237,14 @@ def combine_detail_rows(
     position allows — otherwise the crop chosen to represent an image (and to train the
     learned model) can be a bottom-of-frame band that scored highly on cleavage.
     """
+    kinds_array = np.asarray(kinds)
     masked: dict[str, np.ndarray] = {}
     for axis, scores in axis_scores.items():
         eligible = AXIS_REGION_KINDS.get(axis)
         if eligible is None:
             masked[axis] = np.asarray(scores, dtype=np.float32)
             continue
-        allowed = np.array([kind in eligible for kind in kinds], dtype=bool)
+        allowed = np.isin(kinds_array, list(eligible))
         # 0.5 is the neutral point of the sigmoid axes, i.e. "no evidence either way".
         masked[axis] = np.where(allowed, np.asarray(scores, dtype=np.float32), 0.5).astype(np.float32)
     return combine_detail(masked, weights)
@@ -321,21 +344,14 @@ def evaluate(
     gate_factor = (person_conf * female_conf * age_conf).astype(np.float32)
     score = (detail * gate_factor).astype(np.float32)
 
-    stage: list[str] = []
-    reason: list[str] = []
-    excluded = np.zeros((count,), dtype=bool)
-    for index in range(count):
-        if age_fail[index]:
-            current = STAGE_MINOR
-        elif not person_pass[index]:
-            current = STAGE_NO_PERSON
-        elif not female_pass[index]:
-            current = STAGE_NOT_FEMALE
-        else:
-            current = STAGE_SCORED
-        stage.append(current)
-        reason.append(STAGE_REASONS[current])
-        excluded[index] = current != STAGE_SCORED
+    stage_arr = np.select(
+        [age_fail, ~person_pass, ~female_pass],
+        [STAGE_MINOR, STAGE_NO_PERSON, STAGE_NOT_FEMALE],
+        default=STAGE_SCORED,
+    )
+    stage = stage_arr.tolist()
+    reason = [STAGE_REASONS[cast(str, value)] for value in stage_arr]
+    excluded = stage_arr != STAGE_SCORED
 
     # Anything the age gate flags is forced to zero, not merely ranked down, so no
     # threshold or filter setting can surface it later.

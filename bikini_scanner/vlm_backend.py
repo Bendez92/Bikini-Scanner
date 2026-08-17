@@ -32,6 +32,9 @@ VLM_PROMPT_VERSION = "vlm-json-v1"
 # Local VLMs do not need full-resolution input; cap the longest side before sending to
 # keep memory and token usage bounded.
 VLM_MAX_IMAGE_SIDE = 512
+# Hard ceiling on VLM workers. Config/GUI already validates user input, but this
+# protects against runaway concurrency if the setting is set programmatically.
+VLM_MAX_CONCURRENCY = 16
 
 
 class VLMCancelled(Exception):
@@ -104,7 +107,7 @@ class VLMClient:
         self.model = model
         self.api_key = api_key.strip()
         self.timeout = max(1.0, float(timeout))
-        self.concurrency = max(1, int(concurrency))
+        self.concurrency = max(1, min(int(concurrency), VLM_MAX_CONCURRENCY))
         self._cancel_event: Event | None = None
         if not self._is_loopback(parsed.netloc):
             LOGGER.warning(
