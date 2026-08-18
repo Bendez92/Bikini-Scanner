@@ -274,6 +274,17 @@ class VLMAdjudication(unittest.TestCase):
         self.assertFalse(client.probe())
 
 
+class CacheNamespace(unittest.TestCase):
+    def test_full_frame_cache_is_namespaced_by_model(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="bikini_cache_namespace_"))
+        store = FolderStore(root)
+        embedding = np.ones((3,), dtype=np.float32)
+        store.save_scan_cache({"content": embedding}, {}, namespace="model-a")
+        np.testing.assert_allclose(store.lookup_content_embedding("content", "model-a", 3), embedding)
+        self.assertIsNone(store.lookup_content_embedding("content", "model-b", 3))
+        self.assertIsNone(store.lookup_content_embedding("content", "model-a", 2))
+
+
 class AgeGate(unittest.TestCase):
     """The age gate must exclude, force the score to zero, and never be overridable."""
 
@@ -378,6 +389,64 @@ class AgeGate(unittest.TestCase):
             app._closing = True
         finally:
             root.destroy()
+
+
+class RefineWeighting(unittest.TestCase):
+    class Backend:
+        image_embedding_dim = 2
+
+        def embed_texts(self, prompts):
+            return np.ones((len(prompts), 2), dtype=np.float32)
+
+    def test_vlm_and_clip_use_separate_weights(self) -> None:
+        config = ScannerConfig()
+        config.vlm_weight = 0.8
+        config.refine_weight = 0.2
+        scorer = BikiniScorer(backend=self.Backend(), config=config)
+        table = cascade.RegionScoreTable(
+            owner=np.array([0], dtype=np.int64),
+            kinds=np.array(["full"], dtype=object),
+            axis_scores={
+                "bikini": np.array([0.2], dtype=np.float32),
+                "bikini_top": np.array([0.2], dtype=np.float32),
+                "bikini_bottom": np.array([0.2], dtype=np.float32),
+                "cleavage": np.array([0.2], dtype=np.float32),
+                "midriff": np.array([0.2], dtype=np.float32),
+                "nsfw": np.array([0.2], dtype=np.float32),
+                "person": np.array([0.9], dtype=np.float32),
+                "female": np.array([0.9], dtype=np.float32),
+                "child": np.array([0.1], dtype=np.float32),
+                "adult": np.array([0.9], dtype=np.float32),
+            },
+            image_count=1,
+            full_row=np.array([0], dtype=np.int64),
+        )
+        paths = ["image.jpg"]
+        embeddings = np.ones((1, 2), dtype=np.float32)
+        base = scorer.score_state(paths, embeddings, {}, region_table=table).zero_shot_scores[0]
+        vlm = scorer.score_state(
+            paths,
+            embeddings,
+            {},
+            region_table=table,
+            refine=RefineResult(
+                scores=np.array([0.9], dtype=np.float32),
+                minor=np.array([False]),
+                source="vlm",
+            ),
+        ).zero_shot_scores[0]
+        clip = scorer.score_state(
+            paths,
+            embeddings,
+            {},
+            region_table=table,
+            refine=RefineResult(
+                scores=np.array([0.9], dtype=np.float32),
+                minor=np.array([False]),
+            ),
+        ).zero_shot_scores[0]
+        self.assertAlmostEqual(float(vlm), 0.2 * float(base) + 0.8 * 0.9, places=5)
+        self.assertAlmostEqual(float(clip), 0.8 * float(base) + 0.2 * 0.9, places=5)
 
 
 class RegionAggregation(unittest.TestCase):
@@ -780,9 +849,15 @@ class OutputOperations(unittest.TestCase):
     def test_metadata_written_to_jpeg(self) -> None:
         working = Path(tempfile.mkdtemp(prefix="bikini_meta_")) / "tagged.jpg"
         shutil.copyfile(self.sources[0], working)
+        with Image.open(working) as image:
+            before_pixels = np.asarray(image).copy()
         self.assertTrue(output_ops.write_image_metadata(working, "bikini", 0.87))
         self.assertGreater(working.stat().st_size, 0)
         with Image.open(working) as image:
+            np.testing.assert_array_equal(np.asarray(image), before_pixels)
+            value = image.getexif().get(40094)
+            self.assertIsNotNone(value)
+            self.assertEqual(value.decode("utf-16le").rstrip("\x00"), "bikini")
             image.verify()
 
 

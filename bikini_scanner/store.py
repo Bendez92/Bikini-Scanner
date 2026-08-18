@@ -242,6 +242,10 @@ class FolderStore:
                     self._embedding_cache = {}
         return self._embedding_cache
 
+    @staticmethod
+    def embedding_cache_key(identity: str, namespace: str) -> str:
+        return f"{identity}|{namespace}"
+
     def _load_face_count_cache(self) -> dict[str, int]:
         if self._face_count_cache is None:
             if not self.face_counts_path.exists():
@@ -260,7 +264,12 @@ class FolderStore:
                     self._face_count_cache = {}
         return self._face_count_cache
 
-    def get_cached_image_records(self, paths: Iterable[Path]) -> dict[Path, dict[str, object]]:
+    def get_cached_image_records(
+        self,
+        paths: Iterable[Path],
+        namespace: str,
+        embedding_dim: int | None = None,
+    ) -> dict[Path, dict[str, object]]:
         index = self._load_path_index()
         embeddings = self._load_embedding_cache()
         cached: dict[Path, dict[str, object]] = {}
@@ -276,13 +285,21 @@ class FolderStore:
                 continue
             content_hash = entry.get("content_hash")
             embedding: np.ndarray | None = None
-            if content_hash and str(content_hash) in embeddings:
-                embedding = embeddings[str(content_hash)]
+            if content_hash:
+                key = self.embedding_cache_key(str(content_hash), namespace)
+                if key in embeddings:
+                    embedding = embeddings[key]
             else:
                 legacy_key = _legacy_cache_key(path)
-                if legacy_key is not None and legacy_key in embeddings:
-                    embedding = embeddings[legacy_key]
-            if embedding is not None:
+                if legacy_key is not None:
+                    key = self.embedding_cache_key(legacy_key, namespace)
+                    if key in embeddings:
+                        embedding = embeddings[key]
+            if (
+                embedding is not None
+                and embedding.ndim == 1
+                and (embedding_dim is None or embedding.shape[0] == int(embedding_dim))
+            ):
                 cached[path] = {
                     "path": path,
                     "content_hash": str(content_hash) if content_hash else None,
@@ -292,13 +309,30 @@ class FolderStore:
                 }
         return cached
 
-    def get_cached_embeddings(self, paths: Iterable[Path]) -> dict[Path, np.ndarray]:
-        return {path: record["embedding"] for path, record in self.get_cached_image_records(paths).items()}
+    def get_cached_embeddings(
+        self,
+        paths: Iterable[Path],
+        namespace: str,
+        embedding_dim: int | None = None,
+    ) -> dict[Path, np.ndarray]:
+        return {
+            path: record["embedding"]
+            for path, record in self.get_cached_image_records(paths, namespace, embedding_dim).items()
+        }
 
-    def lookup_content_embedding(self, content_hash: str) -> np.ndarray | None:
+    def lookup_content_embedding(
+        self,
+        content_hash: str,
+        namespace: str,
+        embedding_dim: int | None = None,
+    ) -> np.ndarray | None:
         embeddings = self._load_embedding_cache()
-        embedding = embeddings.get(str(content_hash))
-        if embedding is None:
+        embedding = embeddings.get(self.embedding_cache_key(str(content_hash), namespace))
+        if (
+            embedding is None
+            or embedding.ndim != 1
+            or (embedding_dim is not None and embedding.shape[0] != int(embedding_dim))
+        ):
             return None
         return embedding.astype(np.float32)
 
@@ -308,7 +342,7 @@ class FolderStore:
     def lookup_face_count(self, content_hash: str) -> int | None:
         return self._load_face_count_cache().get(str(content_hash))
 
-    def save_embeddings(self, embeddings_by_path: dict[Path, np.ndarray]) -> None:
+    def save_embeddings(self, embeddings_by_path: dict[Path, np.ndarray], namespace: str) -> None:
         if not embeddings_by_path:
             return
         archive: dict[str, np.ndarray] = {}
@@ -318,7 +352,10 @@ class FolderStore:
                     archive[key] = existing_archive[key].astype(np.float32)
         dirty = False
         for path, embedding in embeddings_by_path.items():
-            key = _legacy_cache_key(path)
+            legacy_key = _legacy_cache_key(path)
+            if legacy_key is None:
+                continue
+            key = self.embedding_cache_key(legacy_key, namespace)
             value = np.asarray(embedding, dtype=np.float32)
             if key not in archive or not np.array_equal(archive[key], value):
                 dirty = True
@@ -337,6 +374,8 @@ class FolderStore:
         content_embeddings: dict[str, np.ndarray],
         path_records: dict[Path, dict[str, int | str]],
         face_counts_by_content_hash: dict[str, int] | None = None,
+        *,
+        namespace: str,
     ) -> None:
         if not content_embeddings and not path_records and not face_counts_by_content_hash:
             return
@@ -347,7 +386,7 @@ class FolderStore:
         dirty_index = False
         dirty_faces = False
         for content_hash, embedding in content_embeddings.items():
-            key = str(content_hash)
+            key = self.embedding_cache_key(str(content_hash), namespace)
             value = np.asarray(embedding, dtype=np.float32)
             if key not in embeddings or not np.array_equal(embeddings[key], value):
                 dirty_embeddings = True

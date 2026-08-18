@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import shutil
-import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
@@ -14,6 +13,8 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from PIL import Image, ImageOps
+
+from .safe_io import atomic_replace
 
 LABEL_NAMES = {1: "good", 0: "bad", 2: "skip"}
 OUTPUT_ORGANIZATIONS = {"flat", "score_band", "label", "score_band_label"}
@@ -358,35 +359,32 @@ def write_image_metadata(path: str | Path, keyword: str, score: float | None = N
     suffix = source.suffix.lower()
     if suffix not in {".jpg", ".jpeg", ".tif", ".tiff", ".png", ".webp"}:
         return False
-    if suffix in {".tif", ".tiff"} and _write_pyexiv2_metadata(source, keyword, score):
-        return True
-    tmp = None
+    if suffix in {".tif", ".tiff"}:
+        return _write_pyexiv2_metadata(source, keyword, score)
+    if suffix == ".webp":
+        return False
     try:
-        with Image.open(source) as image:
-            image = ImageOps.exif_transpose(image)
-            exif = image.getexif()
-            exif[40094] = keyword.encode("utf-16le")
-            if score is not None:
-                exif[270] = f"score={score:.3f}"
-            fd, tmp_name = tempfile.mkstemp(suffix=source.suffix, dir=str(source.parent))
-            os.close(fd)
-            tmp = Path(tmp_name)
-            save_kwargs: dict[str, object] = {"exif": exif.tobytes()}
-            if suffix == ".png":
-                save_kwargs.pop("exif", None)
-                pnginfo = _pnginfo(keyword, score)
-                save_kwargs["pnginfo"] = pnginfo
-            image.save(tmp, **save_kwargs)
         if suffix in {".jpg", ".jpeg"}:
-            _inject_jpeg_xmp(tmp, keyword, score)
-        os.replace(tmp, source)
+            with Image.open(source) as image:
+                exif = image.getexif()
+                exif[40094] = keyword.encode("utf-16le")
+                if score is not None:
+                    exif[270] = f"score={score:.3f}"
+            data = _jpeg_with_metadata(source.read_bytes(), exif.tobytes(), keyword, score)
+            atomic_replace(source, lambda tmp: tmp.write_bytes(data))
+            return True
+
+        with Image.open(source) as image:
+            icc_profile = image.info.get("icc_profile")
+            save_kwargs: dict[str, object] = {
+                "format": "PNG",
+                "pnginfo": _pnginfo(keyword, score),
+            }
+            if icc_profile is not None:
+                save_kwargs["icc_profile"] = icc_profile
+            atomic_replace(source, lambda tmp: image.save(tmp, **save_kwargs))
         return True
     except Exception:  # noqa: BLE001
-        if tmp is not None and tmp.exists():
-            try:
-                tmp.unlink()
-            except Exception:  # noqa: BLE001
-                pass
         return False
 
 
@@ -408,16 +406,67 @@ def _xmp_packet(keyword: str, score: float | None) -> bytes:
     return b"http://ns.adobe.com/xap/1.0/\x00" + xml.encode("utf-8")
 
 
-def _inject_jpeg_xmp(path: Path, keyword: str, score: float | None) -> None:
-    data = path.read_bytes()
-    if not data.startswith(b"\xff\xd8"):
-        return
-    payload = _xmp_packet(keyword, score)
+def _jpeg_app1(payload: bytes) -> bytes:
     segment_length = len(payload) + 2
     if segment_length > 0xFFFF:
-        return
-    segment = b"\xff\xe1" + segment_length.to_bytes(2, "big") + payload
-    path.write_bytes(data[:2] + segment + data[2:])
+        raise ValueError("JPEG metadata segment is too large")
+    return b"\xff\xe1" + segment_length.to_bytes(2, "big") + payload
+
+
+def _jpeg_with_metadata(data: bytes, exif_bytes: bytes, keyword: str, score: float | None) -> bytes:
+    if not data.startswith(b"\xff\xd8"):
+        raise ValueError("not a JPEG")
+    segments: list[tuple[int, bytes, bytes]] = []
+    position = 2
+    tail_start = len(data)
+    while position + 1 < len(data):
+        marker_start = position
+        if data[position] != 0xFF:
+            raise ValueError("invalid JPEG marker")
+        while position < len(data) and data[position] == 0xFF:
+            position += 1
+        if position >= len(data):
+            raise ValueError("truncated JPEG marker")
+        marker = data[position]
+        position += 1
+        if marker == 0xDA:
+            tail_start = marker_start
+            break
+        if marker == 0xD9:
+            tail_start = position
+            break
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            segments.append((marker, data[marker_start:position], b""))
+            continue
+        if position + 2 > len(data):
+            raise ValueError("truncated JPEG segment")
+        length = int.from_bytes(data[position : position + 2], "big")
+        end = position + length
+        if length < 2 or end > len(data):
+            raise ValueError("invalid JPEG segment length")
+        segments.append((marker, data[marker_start:end], data[position + 2 : end]))
+        position = end
+
+    exif_payload = b"Exif\x00\x00" + exif_bytes
+    xmp_payload = _xmp_packet(keyword, score)
+    filtered = [
+        (marker, raw, payload)
+        for marker, raw, payload in segments
+        if not (
+            marker == 0xE1
+            and (payload.startswith(b"Exif\x00\x00") or payload.startswith(b"http://ns.adobe.com/xap/1.0/\x00"))
+        )
+    ]
+    insertion_index = 0
+    for index, (marker, _raw, payload) in enumerate(filtered):
+        if marker == 0xE0 and payload.startswith(b"JFIF\x00"):
+            insertion_index = index + 1
+            break
+    new_segments = [(_jpeg_app1(exif_payload), b""), (_jpeg_app1(xmp_payload), b"")]
+    filtered[insertion_index:insertion_index] = [
+        (0xE1, raw, payload) for raw, payload in new_segments
+    ]
+    return data[:2] + b"".join(raw for _marker, raw, _payload in filtered) + data[tail_start:]
 
 
 def _write_pyexiv2_metadata(source: Path, keyword: str, score: float | None) -> bool:
@@ -425,28 +474,21 @@ def _write_pyexiv2_metadata(source: Path, keyword: str, score: float | None) -> 
         import pyexiv2
     except Exception:
         return False
-    tmp = None
     try:
-        fd, tmp_name = tempfile.mkstemp(suffix=source.suffix, dir=str(source.parent))
-        os.close(fd)
-        tmp = Path(tmp_name)
-        shutil.copyfile(source, tmp)
-        metadata = pyexiv2.ImageMetadata(str(tmp))
-        metadata.read()
-        metadata["Xmp.dc.subject"] = [keyword]
-        metadata["Xmp.lr.hierarchicalSubject"] = [keyword]
-        if score is not None:
-            metadata["Xmp.Rating"] = float(score)
-        metadata.write()
-        os.replace(tmp, source)
+        def write_metadata(tmp: Path) -> None:
+            shutil.copyfile(source, tmp)
+            metadata = pyexiv2.ImageMetadata(str(tmp))
+            metadata.read()
+            metadata["Xmp.dc.subject"] = [keyword]
+            metadata["Xmp.lr.hierarchicalSubject"] = [keyword]
+            if score is not None:
+                metadata["Xmp.Rating"] = float(score)
+            metadata.write()
+
+        atomic_replace(source, write_metadata)
         return True
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Optional pyexiv2 metadata write failed for %s: %s", source, exc)
-        if tmp is not None and tmp.exists():
-            try:
-                tmp.unlink()
-            except Exception:  # noqa: BLE001
-                pass
         return False
 
 

@@ -2961,6 +2961,13 @@ class BikiniScannerApp:
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
         def save_settings() -> None:
+            if self._scan_active:
+                messagebox.showinfo(
+                    "Scan in progress",
+                    "A scan is already running. Press Stop to end it, or wait for it to finish.",
+                    parent=dialog,
+                )
+                return
             raw_positive = [line.strip() for line in positive_text.get("1.0", "end").splitlines()]
             raw_negative = [line.strip() for line in negative_text.get("1.0", "end").splitlines()]
             positive_prompts = [line for line in raw_positive if line]
@@ -3511,6 +3518,9 @@ class BikiniScannerApp:
         assert self.store is not None
         assert self.backend is not None
         assert self.scorer is not None
+        backend = self.backend
+        store = self.store
+        scorer = self.scorer
         generation = self._refresh_generation = self._refresh_generation + 1
         source_state = self.current_state
         self._scan_start_monotonic = time.monotonic()
@@ -3537,9 +3547,9 @@ class BikiniScannerApp:
             try:
                 if full_rescan or source_state is None:
                     state, samples = scan_and_score_folder(
-                        self.backend,
-                        self.store,
-                        self.scorer,
+                        backend,
+                        store,
+                        scorer,
                         threshold=threshold,
                         batch_size=batch_size,
                         cancel_event=cancel_event,
@@ -3549,12 +3559,12 @@ class BikiniScannerApp:
                         ),
                     )
                 else:
-                    labels = self.store.load_labels()
-                    state, samples = self.scorer.rescore_state(
+                    labels = store.load_labels()
+                    state, samples = scorer.rescore_state(
                         source_state,
                         labels,
                         threshold=threshold,
-                        store=self.store,
+                        store=store,
                         cancel_event=cancel_event,
                     )
             except ScanCancelled:
