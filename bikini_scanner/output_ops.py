@@ -382,7 +382,10 @@ def write_image_metadata(path: str | Path, keyword: str, score: float | None = N
             }
             if icc_profile is not None:
                 save_kwargs["icc_profile"] = icc_profile
-            atomic_replace(source, lambda tmp: image.save(tmp, **save_kwargs))
+            buffer = BytesIO()
+            image.save(buffer, **save_kwargs)
+        data = buffer.getvalue()
+        atomic_replace(source, lambda tmp: tmp.write_bytes(data))
         return True
     except Exception:  # noqa: BLE001
         return False

@@ -736,8 +736,9 @@ class BikiniScorer:
                 # legacy CLIP refine path uses refine_weight (default 0.65); the VLM
                 # adjudication path uses vlm_weight. They are separate knobs now.
                 zero_shot = zero_shot.copy()
-                weight_name = "vlm_weight" if getattr(refine, "source", "clip") == "vlm" else "refine_weight"
-                refine_weight = float(getattr(self.config, weight_name, self.config.refine_weight))
+                refine_weight = float(
+                    self.config.vlm_weight if refine.source == "vlm" else self.config.refine_weight
+                )
                 refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
                     (1.0 - refine_weight) * zero_shot[refined_rows]

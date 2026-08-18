@@ -860,6 +860,19 @@ class OutputOperations(unittest.TestCase):
             self.assertEqual(value.decode("utf-16le").rstrip("\x00"), "bikini")
             image.verify()
 
+    def test_metadata_written_to_png(self) -> None:
+        working = Path(tempfile.mkdtemp(prefix="bikini_meta_")) / "tagged.png"
+        with Image.open(self.sources[0]) as image:
+            image.save(working, format="PNG")
+            before_pixels = np.asarray(image).copy()
+        self.assertTrue(output_ops.write_image_metadata(working, "bikini", 0.87))
+        self.assertGreater(working.stat().st_size, 0)
+        with Image.open(working) as image:
+            np.testing.assert_array_equal(np.asarray(image), before_pixels)
+            self.assertEqual(image.info.get("Keywords"), "bikini")
+        with Image.open(working) as image:
+            image.verify()
+
 
 class Configuration(unittest.TestCase):
     def test_round_trip_preserves_every_field(self) -> None:
