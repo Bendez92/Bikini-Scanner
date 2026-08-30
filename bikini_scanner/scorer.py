@@ -736,7 +736,9 @@ class BikiniScorer:
                 # legacy CLIP refine path uses refine_weight (default 0.65); the VLM
                 # adjudication path uses vlm_weight. They are separate knobs now.
                 zero_shot = zero_shot.copy()
-                refine_weight = float(self.config.refine_weight)
+                refine_weight = float(
+                    self.config.vlm_weight if refine.source == "vlm" else self.config.refine_weight
+                )
                 refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
                     (1.0 - refine_weight) * zero_shot[refined_rows]
@@ -841,8 +843,13 @@ class DeepPassResult:
     detail_regions: list[str] = field(default_factory=list)
 
 
-def _region_namespace(config: ScannerConfig) -> str:
+def _model_namespace(config: ScannerConfig) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", str(config.model_name or "default")).strip("_").lower()
+    return slug or "default"
+
+
+def _region_namespace(config: ScannerConfig) -> str:
+    slug = _model_namespace(config)
     return f"{slug}__g{REGION_GEOMETRY_VERSION}"
 
 
@@ -1015,6 +1022,7 @@ class RefineResult:
 
     scores: np.ndarray
     minor: np.ndarray
+    source: str = "clip"
 
     def any(self) -> bool:
         return bool(np.isfinite(self.scores).any())
@@ -1155,7 +1163,7 @@ def compute_vlm_scores(
         if result.score.size:
             scores[index] = float(result.score[0])
             minor[index] = bool(result.stage and result.stage[0] == cascade_module.STAGE_MINOR)
-    return RefineResult(scores=scores, minor=minor)
+    return RefineResult(scores=scores, minor=minor, source="vlm")
 
 
 def compute_refine_scores(
@@ -1250,7 +1258,7 @@ def compute_refine_scores(
         if on_progress is not None:
             on_progress(done, len(targets))
 
-    return RefineResult(scores=refine_scores, minor=refine_minor)
+    return RefineResult(scores=refine_scores, minor=refine_minor, source="clip")
 
 
 def bucketed_sampling(
@@ -1383,7 +1391,9 @@ def scan_and_score_folder(
         LOGGER.warning("Large folder detected: %d images in %s", len(paths), store.folder)
     else:
         LOGGER.info("Starting scan of %d images in %s", len(paths), store.folder)
-    cached_records = store.get_cached_image_records(paths)
+    embedding_namespace = _model_namespace(scorer.config)
+    embedding_dim = int(backend.image_embedding_dim)
+    cached_records = store.get_cached_image_records(paths, embedding_namespace, embedding_dim)
     content_embeddings: dict[str, np.ndarray] = {}
     content_face_counts: dict[str, int] = {}
     path_records: dict[Path, dict[str, int | str]] = {}
@@ -1407,7 +1417,12 @@ def scan_and_score_folder(
 
     def _check_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
-            store.save_scan_cache(content_embeddings, path_records, content_face_counts)
+            store.save_scan_cache(
+                content_embeddings,
+                path_records,
+                content_face_counts,
+                namespace=embedding_namespace,
+            )
             LOGGER.info("Scan cancellation requested after %d processed images", processed)
             raise ScanCancelled
 
@@ -1502,7 +1517,11 @@ def scan_and_score_folder(
                 continue
             cached_embedding = content_embeddings.get(record.content_hash)
             if cached_embedding is None:
-                cached_embedding = store.lookup_content_embedding(record.content_hash)
+                cached_embedding = store.lookup_content_embedding(
+                    record.content_hash,
+                    embedding_namespace,
+                    embedding_dim,
+                )
             face_count: int | None = content_face_counts.get(record.content_hash)
             if face_count is None and scorer.config.enable_face_detection:
                 face_count = detect_face_count(record.image)
@@ -1592,7 +1611,12 @@ def scan_and_score_folder(
             _notify()
         pending_flush_images += len(valid_records)
         if pending_flush_images >= max(batch_size * 4, 32):
-            store.save_scan_cache(content_embeddings, path_records, content_face_counts)
+            store.save_scan_cache(
+                content_embeddings,
+                path_records,
+                content_face_counts,
+                namespace=embedding_namespace,
+            )
             LOGGER.info("Flushed scan cache after %d processed images", processed)
             pending_flush_images = 0
         _check_cancelled()
@@ -1619,7 +1643,12 @@ def scan_and_score_folder(
         if any(face_count is not None for face_count in face_counts)
         else None
     )
-    store.save_scan_cache(content_embeddings, path_records, content_face_counts)
+    store.save_scan_cache(
+        content_embeddings,
+        path_records,
+        content_face_counts,
+        namespace=embedding_namespace,
+    )
     labels = store.load_labels()
 
     # --- deep pass: face and body-region crops for the candidates -------------

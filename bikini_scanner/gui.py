@@ -2529,7 +2529,11 @@ class BikiniScannerApp:
         threading.Thread(target=worker, name="face-model-download", daemon=True).start()
 
     def open_settings_dialog(self) -> None:
-        dialog, form = self._create_modal("Settings", resizable=(False, False))
+        dialog, outer = self._create_modal("Settings", resizable=(False, True))
+        footer = ttk.Frame(outer)
+        footer.pack(side=BOTTOM, fill="x")
+        canvas, scroll_frame, scroll_window = self._modal_scroll_frame(outer)
+        form = scroll_frame
         palette = self._palette()
 
         backend_var = StringVar(value=self.config.backend)
@@ -2951,8 +2955,8 @@ class BikiniScannerApp:
         self._tooltip(url_caption, url_tip)
         self._tooltip(update_url_entry, url_tip)
 
-        button_row = ttk.Frame(form)
-        button_row.grid(row=43, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        button_row = ttk.Frame(footer)
+        button_row.pack(fill="x", pady=(10, 0))
 
         def close_dialog() -> None:
             dialog.grab_release()
@@ -2961,6 +2965,13 @@ class BikiniScannerApp:
         dialog.protocol("WM_DELETE_WINDOW", close_dialog)
 
         def save_settings() -> None:
+            if self._scan_active:
+                messagebox.showinfo(
+                    "Scan in progress",
+                    "A scan is already running. Press Stop to end it, or wait for it to finish.",
+                    parent=dialog,
+                )
+                return
             raw_positive = [line.strip() for line in positive_text.get("1.0", "end").splitlines()]
             raw_negative = [line.strip() for line in negative_text.get("1.0", "end").splitlines()]
             positive_prompts = [line for line in raw_positive if line]
@@ -3216,6 +3227,39 @@ class BikiniScannerApp:
         )
         dialog.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=1)
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(scroll_window, width=event.width))
+
+        def scroll_settings(event) -> str:
+            if event.delta:
+                canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+        canvas.bind("<MouseWheel>", scroll_settings)
+        canvas.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"))
+
+        def bind_mousewheel(widget) -> None:
+            if isinstance(widget, Text):
+                return
+            widget.bind("<MouseWheel>", scroll_settings, add="+")
+            widget.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"), add="+")
+            widget.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"), add="+")
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        bind_mousewheel(form)
+        dialog.update_idletasks()
+        form_width = form.winfo_reqwidth()
+        canvas.configure(width=form_width)
+        dialog.update_idletasks()
+        outer_width = outer.winfo_reqwidth()
+        footer_height = footer.winfo_reqheight()
+        form_height = form.winfo_reqheight()
+        screen_height = dialog.winfo_screenheight()
+        max_height = min(screen_height, int(screen_height * 0.85))
+        min_height = footer_height + 24
+        dialog.minsize(outer_width, min_height)
+        dialog.geometry(f"{outer_width}x{max(min_height, min(form_height + footer_height + 24, max_height))}")
         positive_text.configure(
             bg=palette["entry_bg"],
             fg=palette["fg"],
@@ -3511,6 +3555,9 @@ class BikiniScannerApp:
         assert self.store is not None
         assert self.backend is not None
         assert self.scorer is not None
+        backend = self.backend
+        store = self.store
+        scorer = self.scorer
         generation = self._refresh_generation = self._refresh_generation + 1
         source_state = self.current_state
         self._scan_start_monotonic = time.monotonic()
@@ -3537,9 +3584,9 @@ class BikiniScannerApp:
             try:
                 if full_rescan or source_state is None:
                     state, samples = scan_and_score_folder(
-                        self.backend,
-                        self.store,
-                        self.scorer,
+                        backend,
+                        store,
+                        scorer,
                         threshold=threshold,
                         batch_size=batch_size,
                         cancel_event=cancel_event,
@@ -3549,12 +3596,12 @@ class BikiniScannerApp:
                         ),
                     )
                 else:
-                    labels = self.store.load_labels()
-                    state, samples = self.scorer.rescore_state(
+                    labels = store.load_labels()
+                    state, samples = scorer.rescore_state(
                         source_state,
                         labels,
                         threshold=threshold,
-                        store=self.store,
+                        store=store,
                         cancel_event=cancel_event,
                     )
             except ScanCancelled:
