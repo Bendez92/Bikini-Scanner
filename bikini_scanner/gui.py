@@ -2529,7 +2529,11 @@ class BikiniScannerApp:
         threading.Thread(target=worker, name="face-model-download", daemon=True).start()
 
     def open_settings_dialog(self) -> None:
-        dialog, form = self._create_modal("Settings", resizable=(False, False))
+        dialog, outer = self._create_modal("Settings", resizable=(False, True))
+        footer = ttk.Frame(outer)
+        footer.pack(side=BOTTOM, fill="x")
+        canvas, scroll_frame, scroll_window = self._modal_scroll_frame(outer)
+        form = scroll_frame
         palette = self._palette()
 
         backend_var = StringVar(value=self.config.backend)
@@ -2951,8 +2955,8 @@ class BikiniScannerApp:
         self._tooltip(url_caption, url_tip)
         self._tooltip(update_url_entry, url_tip)
 
-        button_row = ttk.Frame(form)
-        button_row.grid(row=43, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        button_row = ttk.Frame(footer)
+        button_row.pack(fill="x", pady=(10, 0))
 
         def close_dialog() -> None:
             dialog.grab_release()
@@ -3223,6 +3227,37 @@ class BikiniScannerApp:
         )
         dialog.columnconfigure(0, weight=1)
         form.columnconfigure(1, weight=1)
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(scroll_window, width=event.width))
+
+        def scroll_settings(event) -> str:
+            if event.delta:
+                canvas.yview_scroll(-int(event.delta / 120), "units")
+            return "break"
+
+        canvas.bind("<MouseWheel>", scroll_settings)
+        canvas.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"))
+
+        def bind_mousewheel(widget) -> None:
+            widget.bind("<MouseWheel>", scroll_settings, add="+")
+            widget.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"), add="+")
+            widget.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"), add="+")
+            for child in widget.winfo_children():
+                bind_mousewheel(child)
+
+        bind_mousewheel(form)
+        dialog.update_idletasks()
+        form_width = form.winfo_reqwidth()
+        canvas.configure(width=form_width)
+        dialog.update_idletasks()
+        outer_width = outer.winfo_reqwidth()
+        footer_height = footer.winfo_reqheight()
+        form_height = form.winfo_reqheight()
+        screen_height = dialog.winfo_screenheight()
+        max_height = min(screen_height, int(screen_height * 0.85))
+        min_height = footer_height + 24
+        dialog.minsize(outer_width, min_height)
+        dialog.geometry(f"{outer_width}x{max(min_height, min(form_height + footer_height + 24, max_height))}")
         positive_text.configure(
             bg=palette["entry_bg"],
             fg=palette["fg"],
