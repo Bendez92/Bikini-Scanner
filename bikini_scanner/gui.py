@@ -3239,6 +3239,8 @@ class BikiniScannerApp:
         canvas.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"))
 
         def bind_mousewheel(widget) -> None:
+            if isinstance(widget, Text):
+                return
             widget.bind("<MouseWheel>", scroll_settings, add="+")
             widget.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"), add="+")
             widget.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"), add="+")
