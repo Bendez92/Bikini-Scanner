@@ -668,6 +668,11 @@ class BikiniScorer:
             np.asarray(train_labels, dtype=np.int64),
             max_weight=float(self.config.max_learning_weight),
         )
+        # Split this folder's labels out of the pooled total so the status bar can be
+        # reconciled against the reviewer's own Accepted/Rejected tally.
+        outcome.local_count = len(local_labels)
+        outcome.local_positive = sum(1 for value in local_labels if value == 1)
+        outcome.local_negative = sum(1 for value in local_labels if value == 0)
         self.learning_outcome = outcome
         self.classifier = outcome.classifier
         LOGGER.info("Learning: %s", outcome.summary())

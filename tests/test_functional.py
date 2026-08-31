@@ -675,6 +675,208 @@ class GuiConcurrency(unittest.TestCase):
         self.assertIs(self.app._scan_cancel_event, first, "Stop would no longer reach the running pass")
 
 
+class GuiReviewQueue(unittest.TestCase):
+    """The review loop must count down and never re-serve a decided photo."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_queue_"))
+        _make_images(self.folder, count=6)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app._set_folder(str(self.folder))
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+        self.app.current_state = scorer_module.ScoreState(
+            paths=self.paths,
+            embeddings=np.zeros((len(self.paths), 4), dtype=np.float32),
+            zero_shot_scores=np.full(len(self.paths), 0.5, dtype=np.float32),
+            scores=np.full(len(self.paths), 0.9, dtype=np.float32),
+            axis_scores={"bikini": np.full(len(self.paths), 0.6, dtype=np.float32)},
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(len(self.paths), dtype=bool),
+        )
+
+        class _Passthrough:
+            config = ScannerConfig()
+
+            def state_visibility(self, state):
+                return np.ones((len(state.paths),), dtype=bool)
+
+            def label_counts(self, labels):
+                values = list(labels.values())
+                return {
+                    "good": values.count(1),
+                    "bad": values.count(0),
+                    "skip": values.count(2),
+                    "unlabeled": 0,
+                }
+
+            def estimate_quality(self, embeddings_by_path, labels):
+                return None
+
+        self.app.scorer = _Passthrough()
+        self.app.page_samples = [
+            {"path": path, "score": 0.9, "bucket": "Bikini"} for path in self.paths
+        ]
+        self.app.displayed_samples = list(self.app.page_samples)
+        self.app.current_samples = list(self.app.page_samples)
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_focus_skips_photos_that_were_already_decided(self) -> None:
+        assert self.app.store is not None
+        # Everything but the last photo has been judged already.
+        self.app.store.save_labels(dict.fromkeys(self.paths[:-1], 1))
+        self.app.focused_path = self.paths[0]
+        self.app._advance_focus_after(self.paths[0])
+        self.assertEqual(
+            self.app.focused_path,
+            self.paths[-1],
+            "the focus landed on a photo that had already been accepted or rejected",
+        )
+
+    def test_focus_stops_instead_of_looping_when_everything_is_decided(self) -> None:
+        assert self.app.store is not None
+        self.app.store.save_labels(dict.fromkeys(self.paths, 0))
+        self.app.focused_path = self.paths[0]
+        self.app._advance_focus_after(self.paths[0])
+        self.assertEqual(
+            self.app.focused_path,
+            self.paths[0],
+            "the queue wrapped back onto decided photos instead of stopping",
+        )
+        self.assertIn("decided", self.app.status_var.get().lower())
+
+    def test_progress_note_counts_what_is_left(self) -> None:
+        assert self.app.store is not None
+        self.app.store.save_labels(dict.fromkeys(self.paths[:2], 1))
+        note = self.app._progress_note()
+        self.assertIn("2 decided", note)
+        self.assertIn(f"{len(self.paths) - 2} left in folder", note)
+
+    def test_undecided_remaining_ignores_labelled_photos(self) -> None:
+        assert self.app.store is not None
+        self.app.store.save_labels({self.paths[0]: 1, self.paths[1]: 0, self.paths[2]: 2})
+        self.assertEqual(self.app._undecided_remaining(), len(self.paths) - 3)
+
+    def test_the_grid_renders_one_page_at_a_time(self) -> None:
+        # Synthetic paths: this exercises slicing, not thumbnail decoding.
+        synthetic = [str(self.folder / f"page{index:03d}.jpg") for index in range(50)]
+        self.app.page_size_var.set(20)
+        self.app.sort_var.set("filename")
+        self.app.current_samples = [
+            {"path": path, "score": 0.9, "bucket": "Bikini"} for path in synthetic
+        ]
+        self.app._refresh_displayed_results()
+        self.assertEqual(len(self.app.displayed_samples), 50, "paging must not drop results")
+        self.assertEqual(len(self.app.page_samples), 20, "the grid rendered more than one page of cards")
+        self.assertEqual(self.app._page_count(), 3)
+        self.app.next_page()
+        self.assertEqual(self.app.page_index, 1)
+        self.assertEqual(
+            [str(sample["path"]) for sample in self.app.page_samples],
+            synthetic[20:40],
+        )
+        self.app.next_page()
+        self.assertEqual(len(self.app.page_samples), 10, "the last page should hold the remainder")
+
+    def test_a_retrain_reports_what_the_labels_changed(self) -> None:
+        state = self.app.current_state
+        assert state is not None
+        previous = dict.fromkeys(self.paths, 0.1)
+        state.classifier_label_count = 8
+        state.learning_summary = "8 labels, influence 12%"
+        report = self.app._retrain_report(state, previous, threshold=0.5)
+        self.assertIn("8 labels", report)
+        self.assertIn(f"{len(self.paths)} photos changed side of the threshold", report)
+
+    def test_a_retrain_with_no_labels_says_so(self) -> None:
+        state = self.app.current_state
+        assert state is not None
+        state.classifier_label_count = 0
+        report = self.app._retrain_report(state, {}, threshold=0.5)
+        self.assertIn("zero-shot", report)
+
+
+class LearningReadout(unittest.TestCase):
+    """The label counts on screen have to reconcile with the reviewer's own tally."""
+
+    def test_pooled_labels_are_named_as_pooled(self) -> None:
+        outcome = learning.LearningOutcome(
+            prototype=object(),
+            label_count=128,
+            positive_count=14,
+            negative_count=114,
+            local_count=14,
+            local_positive=7,
+            local_negative=7,
+            weight=0.82,
+        )
+        summary = outcome.summary()
+        # Without the split this read "128 labels (14 accepted / 114 rejected)" beside a
+        # stats panel saying "Accepted 7 | Rejected 7" - two answers to one question.
+        self.assertIn("14 labels here", summary)
+        self.assertIn("7 accepted / 7 rejected", summary)
+        self.assertIn("114 pooled from other folders", summary)
+
+    def test_folder_only_labels_are_not_described_as_pooled(self) -> None:
+        outcome = learning.LearningOutcome(
+            prototype=object(),
+            label_count=14,
+            positive_count=7,
+            negative_count=7,
+            local_count=14,
+            local_positive=7,
+            local_negative=7,
+            weight=0.12,
+        )
+        summary = outcome.summary()
+        self.assertIn("14 labels (7 accepted / 7 rejected)", summary)
+        self.assertNotIn("pooled", summary)
+
+    def test_fit_defaults_to_treating_every_label_as_local(self) -> None:
+        # A caller that does not pool must not read as "0 labels here + N pooled".
+        rng = np.random.default_rng(2)
+        features = np.vstack(
+            [rng.normal(1.0, 0.2, (8, 6)), rng.normal(-1.0, 0.2, (8, 6))]
+        ).astype(np.float32)
+        labels = np.array([1] * 8 + [0] * 8, dtype=np.int64)
+        outcome = learning.fit(features, labels)
+        self.assertEqual(outcome.local_count, outcome.label_count)
+        self.assertNotIn("pooled", outcome.summary())
+
+    def test_an_untrusted_model_says_it_is_not_steering(self) -> None:
+        outcome = learning.LearningOutcome(prototype=object(), label_count=4, weight=0.0)
+        self.assertIn("not yet steering", outcome.summary())
+
+    def test_the_scorer_reports_the_local_share_of_a_pooled_fit(self) -> None:
+        shared = _shared()
+        folder = Path(tempfile.mkdtemp(prefix="bikini_pooled_"))
+        try:
+            paths = [str(path) for path in _make_images(folder, count=4)]
+            scorer = scorer_module.BikiniScorer(shared["backend"], ScannerConfig())
+            features = np.random.default_rng(5).random((len(paths), 8)).astype(np.float32)
+            labels = {paths[0]: 1, paths[1]: 1, paths[2]: 0, paths[3]: 0}
+            outcome = scorer.learn(paths, features, labels)
+            self.assertEqual(outcome.local_count, 4)
+            self.assertEqual(outcome.local_positive, 2)
+            self.assertEqual(outcome.local_negative, 2)
+        finally:
+            shutil.rmtree(folder, ignore_errors=True)
+
+
 class NumericPrimitives(unittest.TestCase):
     """The numpy replacements for scikit-learn have to behave like the originals."""
 

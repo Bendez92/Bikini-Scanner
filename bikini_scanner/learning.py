@@ -70,6 +70,14 @@ class LearningOutcome:
     label_count: int = 0
     positive_count: int = 0
     negative_count: int = 0
+    # Of `label_count`, how many came from the folder on screen. The rest were pooled
+    # from other folders by global learning. Reported separately because a reviewer
+    # comparing the status bar against their own tally needs the two to reconcile.
+    # `fit` sets these to the whole training set, so a caller that never pools reads
+    # correctly by default; only a pooling caller narrows them.
+    local_count: int = 0
+    local_positive: int = 0
+    local_negative: int = 0
     cv_auc: float | None = None
     weight: float = 0.0
     chosen_c: float | None = None
@@ -79,14 +87,32 @@ class LearningOutcome:
         return self.classifier is not None or self.prototype is not None
 
     def summary(self) -> str:
+        """One line the reviewer can read to see their labels landing.
+
+        Spelling out the accepted/rejected split matters: the most common reason a
+        run of Accepts changes nothing is that no REJECTs exist yet, and a count of
+        labels alone hides that.
+        """
         if not self.trained:
             return "not trained"
-        parts = [f"{self.label_count} labels"]
+        pooled = max(0, self.label_count - self.local_count)
+        if pooled:
+            parts = [
+                f"{self.local_count} labels here "
+                f"({self.local_positive} accepted / {self.local_negative} rejected) "
+                f"+ {pooled} pooled from other folders"
+            ]
+        else:
+            parts = [f"{self.label_count} labels ({self.positive_count} accepted / {self.negative_count} rejected)"]
         if self.cv_auc is not None:
             parts.append(f"AUC {self.cv_auc:.2f}")
         if self.classifier is None:
             parts.append("prototype only")
         parts.append(f"influence {self.weight * 100:.0f}%")
+        if self.weight <= 0.0:
+            parts.append("not yet steering the ranking")
+        elif self.label_count < FULL_TRUST_LABELS:
+            parts.append(f"grows to full strength at {FULL_TRUST_LABELS}")
         return ", ".join(parts)
 
     def score(self, features: np.ndarray) -> np.ndarray | None:
@@ -202,6 +228,9 @@ def fit(features: np.ndarray, labels: np.ndarray, max_weight: float = 0.85) -> L
         label_count=int(labels.size),
         positive_count=int(counts[1]),
         negative_count=int(counts[0]),
+        local_count=int(labels.size),
+        local_positive=int(counts[1]),
+        local_negative=int(counts[0]),
     )
     outcome.prototype = _fit_prototype(features, labels)
 

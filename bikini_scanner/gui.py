@@ -94,6 +94,11 @@ CARD_INFO_WIDTH = 340
 # Buckets used by the detected-files view, in the order they are listed.
 DETECTED_BUCKETS = ("Cleavage", "Bikini", "Midriff", "Explicit (NSFW)", "Other detections")
 
+# How many cards one page of the results grid holds. Chosen so a page renders in well
+# under a second on a slow disk; the pager below the grid walks the rest.
+DEFAULT_PAGE_SIZE = 120
+PAGE_SIZE_CHOICES = (60, 120, 240, 500, 1000)
+
 
 @dataclass(slots=True)
 class ResultCard:
@@ -131,6 +136,7 @@ class BikiniScannerApp:
         self.font_size_var = IntVar(value=int(self.user_prefs.get("font_size", 10)))
         self.columns_var = IntVar(value=int(self.user_prefs.get("columns", 2)))
         self.thumbnail_size_var = IntVar(value=int(self.user_prefs.get("thumbnail_size", 320)))
+        self.page_size_var = IntVar(value=int(self.user_prefs.get("page_size", DEFAULT_PAGE_SIZE)))
         try:
             thumbnail_cache_size = int(self.user_prefs.get("thumbnail_cache_size", 512))
         except (TypeError, ValueError):
@@ -161,6 +167,12 @@ class BikiniScannerApp:
         self.notice_var = StringVar(value="")
         self.cards: dict[str, ResultCard] = {}
         self.displayed_samples: list[dict[str, object]] = []
+        # One page of `displayed_samples`. The grid builds a Tk frame plus a decoded
+        # thumbnail per card, so rendering a few thousand detected files at once wedges
+        # the main loop for minutes. Everything that acts on a selection still uses
+        # `displayed_samples`; only rendering and keyboard focus use the page.
+        self.page_samples: list[dict[str, object]] = []
+        self.page_index = 0
         self.review_samples: list[dict[str, object]] = []
         self.photo_refs: list[ImageTk.PhotoImage] = []
         self.thumbnail_cache: OrderedDict[tuple[str, int], ImageTk.PhotoImage] = OrderedDict()
@@ -476,6 +488,85 @@ class BikiniScannerApp:
         self._tooltip(self.review_button, "A curated shortlist to Accept or REJECT so the scanner learns")
         self.view_hint = ttk.Label(row, text="", style="Muted.TLabel")
         self.view_hint.pack(side=LEFT, padx=(12, 0))
+        self._build_pager(row)
+
+    def _build_pager(self, row: ttk.Frame) -> None:
+        """Page controls for the results grid, right-aligned on the view-switch row."""
+        pager = ttk.Frame(row)
+        pager.pack(side=RIGHT)
+        self.pager_frame = pager
+        self.next_page_button = ttk.Button(pager, text="Next >", width=9, command=self.next_page)
+        self.next_page_button.pack(side=RIGHT)
+        self.prev_page_button = ttk.Button(pager, text="< Prev", width=9, command=self.previous_page)
+        self.prev_page_button.pack(side=RIGHT, padx=(0, 4))
+        self.page_status_var = StringVar(value="")
+        ttk.Label(pager, textvariable=self.page_status_var, style="Muted.TLabel").pack(side=RIGHT, padx=(0, 8))
+        size_box = ttk.Combobox(
+            pager,
+            width=6,
+            state="readonly",
+            values=[str(value) for value in PAGE_SIZE_CHOICES],
+        )
+        size_box.set(str(self._page_size()))
+        size_box.pack(side=RIGHT, padx=(0, 8))
+        size_box.bind("<<ComboboxSelected>>", self._on_page_size_selected)
+        self.page_size_box = size_box
+        ttk.Label(pager, text="Per page", style="Muted.TLabel").pack(side=RIGHT, padx=(0, 4))
+
+    def _page_size(self) -> int:
+        try:
+            return max(20, min(2000, int(self.page_size_var.get())))
+        except Exception:  # noqa: BLE001
+            return DEFAULT_PAGE_SIZE
+
+    def _on_page_size_selected(self, _event: object = None) -> None:
+        try:
+            self.page_size_var.set(int(self.page_size_box.get()))
+        except Exception:  # noqa: BLE001
+            return
+        self.page_index = 0
+        self._save_user_prefs()
+        if self.current_state is not None:
+            self._refresh_displayed_results(reset_page=True)
+
+    def _page_count(self) -> int:
+        size = self._page_size()
+        return max(1, (len(self.displayed_samples) + size - 1) // size)
+
+    def next_page(self) -> None:
+        if self.page_index + 1 >= self._page_count():
+            return
+        self.page_index += 1
+        self._refresh_displayed_results(reset_page=False, keep_focus=False)
+
+    def previous_page(self) -> None:
+        if self.page_index <= 0:
+            return
+        self.page_index -= 1
+        self._refresh_displayed_results(reset_page=False, keep_focus=False)
+
+    def _sync_pager(self) -> None:
+        if not hasattr(self, "page_status_var"):
+            return
+        total = len(self.displayed_samples)
+        pages = self._page_count()
+        size = self._page_size()
+        if total <= size:
+            # One page holds everything; the controls would only be noise.
+            self.page_status_var.set(f"{total} shown" if total else "")
+            state = "disabled"
+        else:
+            first = self.page_index * size + 1
+            last = min(total, first + size - 1)
+            self.page_status_var.set(f"{first}-{last} of {total}  (page {self.page_index + 1}/{pages})")
+            state = "normal"
+        try:
+            self.prev_page_button.configure(state="normal" if (state == "normal" and self.page_index > 0) else "disabled")
+            self.next_page_button.configure(
+                state="normal" if (state == "normal" and self.page_index + 1 < pages) else "disabled"
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _sync_view_switch(self) -> None:
         if not hasattr(self, "detected_button"):
@@ -588,7 +679,7 @@ class BikiniScannerApp:
             title = "Ready to scan"
             body = f"{folder}\n\nPress Run scan to look through this folder."
             action = ("Run scan", self.run_scan)
-        elif not self.displayed_samples:
+        elif not self.page_samples:
             if self._filters_active():
                 title = "Nothing matches these filters"
                 body = "Your search, score range, or label filter is hiding every result."
@@ -767,8 +858,14 @@ class BikiniScannerApp:
             "  double-click          open the full-size viewer\n\n"
             "Tips\n"
             "  • The big picture at the top is the active one; Accept and REJECT apply to it.\n"
+            "  • Accept and REJECT skip past photos you already decided, so the queue counts down.\n"
+            "  • The status bar shows how many are decided and how many are left in the folder.\n"
             "  • Every Accept and REJECT trains the scanner, and now carries over to other folders.\n"
+            "  • Watch 'learning:' in the status bar: it names the labels counted and how much\n"
+            "    influence they currently have over the ranking.\n"
             "  • 'Detected files' lists everything found, grouped by what was detected.\n"
+            "  • Long lists are paged: use Prev/Next at the right of the view buttons, or\n"
+            "    raise 'Per page' to show more at once.\n"
             "  • Drag the sensitivity slider left to see near misses.",
         )
 
@@ -1273,6 +1370,7 @@ class BikiniScannerApp:
             "columns": int(self.columns_var.get()),
             "thumbnail_size": int(self.thumbnail_size_var.get()),
             "thumbnail_cache_size": self._thumbnail_cache_limit(),
+            "page_size": self._page_size(),
             "search": self.search_var.get(),
             "sort": self.sort_var.get(),
             "match_filter": self.match_filter_var.get(),
@@ -1680,12 +1778,17 @@ class BikiniScannerApp:
                 except Exception:  # noqa: BLE001
                     continue
 
-    def _update_stats_panel(self, record_history: bool = False) -> None:
+    def _update_stats_panel(
+        self, record_history: bool = False, labels: dict[str, int] | None = None
+    ) -> None:
         if self.current_state is None:
             self.stats_var.set("")
             self.notice_var.set("")
             return
-        labels = self.store.load_labels() if self.store is not None else {}
+        # The caller usually has the label map already; dragging the sensitivity slider
+        # calls through here on every tick, and a fresh copy per tick is wasted work.
+        if labels is None:
+            labels = self.store.load_labels() if self.store is not None else {}
         counts = (
             self.scorer.label_counts(labels)
             if self.scorer is not None
@@ -1720,8 +1823,8 @@ class BikiniScannerApp:
 
     def _session_focus(self) -> None:
         # Always keep one card active so the enlarged preview has something to show.
-        if self.displayed_samples and (not self.focused_path or self.focused_path not in self.cards):
-            self.focused_path = str(self.displayed_samples[0]["path"])
+        if self.page_samples and (not self.focused_path or self.focused_path not in self.cards):
+            self.focused_path = str(self.page_samples[0]["path"])
         self._apply_focus_visuals()
 
     def _append_queue_item(self, folder: str) -> None:
@@ -1928,6 +2031,7 @@ class BikiniScannerApp:
         self.current_state = None
         self.current_samples = []
         self.displayed_samples = []
+        self.page_samples = []
         self.review_samples = []
         self.undo_stack.clear()
         self.redo_stack.clear()
@@ -2152,10 +2256,23 @@ class BikiniScannerApp:
         self.similar_anchor_path = None
         self._refresh_displayed_results()
 
-    def _refresh_displayed_results(self) -> None:
+    def _refresh_displayed_results(self, reset_page: bool = True, keep_focus: bool = True) -> None:
         self.displayed_samples = self._apply_display_filters(self.current_samples)
+        if reset_page:
+            # A new result set starts at the top; paging through one does not.
+            self.page_index = 0
+        pages = self._page_count()
+        self.page_index = max(0, min(self.page_index, pages - 1))
+        size = self._page_size()
+        start = self.page_index * size
+        self.page_samples = self.displayed_samples[start : start + size]
+        if not keep_focus:
+            # Turning a page moves the active picture onto that page, otherwise the
+            # preview keeps showing a photo that is no longer in the grid.
+            self.focused_path = str(self.page_samples[0]["path"]) if self.page_samples else None
         self._refresh_summary()
         self._render_samples()
+        self._sync_pager()
         self._save_review_session()
 
     def _axis_details_text(self, path: str) -> str:
@@ -2241,23 +2358,36 @@ class BikiniScannerApp:
             for path in self._visible_matches()
         ]
 
-    def show_detected_files(self) -> None:
+    def show_detected_files(self, reset_page: bool = True) -> None:
         if self.current_state is None:
             messagebox.showinfo("No results", "Run a scan first.")
             return
         samples = self._detected_samples()
         if not samples:
-            messagebox.showinfo("No detected files", "No files scored above the current threshold.")
+            messagebox.showinfo(
+                "No detected files",
+                "No files scored above the current threshold.\n\n"
+                "Drag the Sensitivity slider left to include the near misses.",
+            )
             return
+        self._apply_detected_view(samples, reset_page=reset_page)
+
+    def _apply_detected_view(self, samples: list[dict[str, object]], reset_page: bool) -> None:
         self.view_mode = "detected"
         self.similar_anchor_path = None
         self.current_samples = samples
         threshold = float(self.threshold_var.get())
+        counts: dict[str, int] = {}
+        for sample in samples:
+            bucket = str(sample.get("bucket", ""))
+            counts[bucket] = counts.get(bucket, 0) + 1
+        breakdown = ", ".join(f"{name} {count}" for name, count in counts.items() if count)
         self.status_var.set(
-            f"{len(samples)} detected files at threshold {threshold:.3f}, grouped by what was detected. "
-            "Switch to 'Review queue' to teach the scanner."
+            f"{len(samples)} detected files at threshold {threshold:.3f}"
+            + (f" — {breakdown}" if breakdown else "")
+            + ". Switch to 'Review queue' to teach the scanner."
         )
-        self._refresh_displayed_results()
+        self._refresh_displayed_results(reset_page=reset_page)
 
     def restore_review_view(self) -> None:
         if self.review_samples:
@@ -3758,6 +3888,15 @@ class BikiniScannerApp:
         self.progress_text_var.set("100%")
         self._show_progress(False)
         previous_view = self.view_mode
+        previous_page = self.page_index
+        # Kept so a retrain can report what the new labels actually changed. "It moved
+        # 14 photos across the threshold" is the only honest proof that Accept/REJECT
+        # reached the model; a bare "Scan complete" is not.
+        previous_scores = (
+            dict(zip(self.current_state.paths, self.current_state.scores, strict=False))
+            if self.current_state is not None
+            else {}
+        )
         self.current_state = state
         processed_samples = self._post_process_review_samples(list(samples))
         self.review_samples = list(processed_samples)
@@ -3811,12 +3950,17 @@ class BikiniScannerApp:
                 f"{detail}",
             )
         else:
-            self.status_var.set("Scan complete.")
+            self.status_var.set(self._retrain_report(state, previous_scores, threshold))
+        # Labelling from page 7 of a long list should not throw the reviewer back to
+        # page 1 every time the re-rank lands, so a retrain keeps the page it was on.
+        keep_page = not full_rescan
+        if keep_page:
+            self.page_index = previous_page
         # A fresh scan lands on the full detected-files list; retrains keep whichever view was active.
         if matches and (full_rescan or previous_view == "detected"):
-            self.show_detected_files()
+            self.show_detected_files(reset_page=not keep_page)
         else:
-            self._refresh_displayed_results()
+            self._refresh_displayed_results(reset_page=not keep_page)
         self._update_stats_panel(record_history=True)
         self._save_review_session()
         self._save_last_folder(self.folder_var.get().strip())
@@ -3849,12 +3993,16 @@ class BikiniScannerApp:
             for score, include in zip(self.current_state.scores, visible_mask, strict=False)
             if include and score >= threshold
         )
+        # This folder's own labels, not the pooled cross-folder total: the count beside
+        # "images" has to match the Accepted/Rejected tally underneath it, or a reviewer
+        # checking whether their decisions registered sees two different answers.
+        labels = self.store.load_labels() if self.store is not None else {}
         self.summary_var.set(
             f"{len(self.current_state.paths)} images, {matches} above threshold, "
-            f"{self.current_state.classifier_label_count} labeled, "
+            f"{len(labels)} labeled, "
             f"{'classifier on' if self.current_state.classifier_trained else 'zero-shot only'}"
         )
-        self._update_stats_panel(record_history=False)
+        self._update_stats_panel(record_history=False, labels=labels)
 
     def _on_threshold_change(self, _value: str) -> None:
         self._refresh_summary()
@@ -3873,14 +4021,9 @@ class BikiniScannerApp:
         self._threshold_refresh_after_id = None
         if self.view_mode != "detected" or self.current_state is None:
             return
-        samples = self._detected_samples()
-        self.current_samples = samples
-        threshold = float(self.threshold_var.get())
-        self.status_var.set(
-            f"{len(samples)} detected files at threshold {threshold:.3f}, grouped by what was detected. "
-            "Switch to 'Review queue' to teach the scanner."
-        )
-        self._refresh_displayed_results()
+        # Dragging the slider past every match must not raise a modal; just empty the
+        # grid and let the empty-state panel explain itself.
+        self._apply_detected_view(self._detected_samples(), reset_page=True)
 
     def _bind_shortcuts(self) -> None:
         self.root.bind_all("<KeyPress-j>", self._handle_next_card)
@@ -3959,7 +4102,7 @@ class BikiniScannerApp:
         return "break"
 
     def move_focus(self, delta: int) -> None:
-        paths = [str(sample["path"]) for sample in self.displayed_samples or self.current_samples]
+        paths = [str(sample["path"]) for sample in self.page_samples or self.current_samples]
         if not paths:
             return
         if self.focused_path not in paths:
@@ -3970,7 +4113,7 @@ class BikiniScannerApp:
         self._apply_focus_visuals()
 
     def move_focus_grid(self, row_delta: int, column_delta: int) -> None:
-        paths = [str(sample["path"]) for sample in self.displayed_samples or self.current_samples]
+        paths = [str(sample["path"]) for sample in self.page_samples or self.current_samples]
         if not paths:
             return
         columns = max(1, int(self.columns_var.get()))
@@ -4147,7 +4290,7 @@ class BikiniScannerApp:
 
     def _render_samples(self) -> None:
         self._clear_grid()
-        samples = self.displayed_samples if self.current_samples else []
+        samples = self.page_samples if self.current_samples else []
         if not samples:
             self._update_preview()
             self._refresh_empty_state()
@@ -4172,10 +4315,19 @@ class BikiniScannerApp:
                 buckets.append(bucket)
                 grouped[bucket] = []
             grouped[bucket].append(sample)
+        # A bucket can straddle a page boundary, so the header has to say how many of
+        # the bucket's total are on this page. A bare count would read as the whole
+        # bucket and repeat itself unchanged on the next page.
+        totals: dict[str, int] = {}
+        for sample in self.displayed_samples:
+            name = str(sample.get("bucket", ""))
+            totals[name] = totals.get(name, 0) + 1
         row = 0
         for bucket in buckets:
             items = grouped[bucket]
-            ttk.Label(self.grid_inner, text=f"{bucket} ({len(items)})", font=("TkDefaultFont", 11, "bold")).grid(
+            total = totals.get(bucket, len(items))
+            heading = f"{bucket} ({len(items)})" if total == len(items) else f"{bucket} ({len(items)} of {total})"
+            ttk.Label(self.grid_inner, text=heading, font=("TkDefaultFont", 11, "bold")).grid(
                 row=row,
                 column=0,
                 columnspan=columns,
@@ -4371,27 +4523,70 @@ class BikiniScannerApp:
         # preview sits on the image you just judged and the click looks like it did
         # nothing. Captured before labelling, because the retrain re-renders the grid.
         advance_from = path if path == self.focused_path else None
+        verb = {1: "Accepted", 0: "REJECTED", 2: "Skipped"}.get(int(label), "Labelled")
         self._apply_label_batch(
-            {path: int(label)}, status=f"Saved label for {Path(path).name}. Retraining...", retrain=True
+            {path: int(label)},
+            status=f"{verb} {Path(path).name} — teaching the scanner...",
+            retrain=True,
         )
         if advance_from is not None:
             self._advance_focus_after(advance_from)
 
     def _advance_focus_after(self, path: str) -> None:
-        """Point the active picture at the next image in the list currently shown."""
-        order = [str(sample["path"]) for sample in (self.displayed_samples or self.current_samples)]
+        """Point the active picture at the next photo on this page you have not decided.
+
+        The wrap-around here used to ignore labels, so once you reached the bottom of a
+        batch the focus looped straight back onto photos you had already accepted or
+        rejected — which is what made the queue feel like it never ended. Decided photos
+        are skipped now, and when none are left the focus stays put and says so.
+        """
+        order = [str(sample["path"]) for sample in (self.page_samples or self.current_samples)]
         if len(order) < 2:
             return
         try:
             index = order.index(path)
         except ValueError:
             index = -1
+        labels = self.store.load_labels() if self.store is not None else {}
         # Everything after the current position, then wrap around to what came before.
         for candidate in order[index + 1 :] + order[: max(index, 0)]:
-            if candidate != path:
+            if candidate != path and labels.get(candidate) is None:
                 self.focused_path = candidate
                 self._apply_focus_visuals()
                 return
+        # Nothing undecided left in front of the reviewer. Say so rather than silently
+        # handing back a photo that was already judged.
+        if self.page_index + 1 < self._page_count():
+            self.next_page()
+            self.status_var.set(
+                f"Page finished — showing page {self.page_index + 1} of {self._page_count()}."
+            )
+            return
+        remaining = self._undecided_remaining()
+        if remaining:
+            self.status_var.set(
+                f"Every photo on screen is decided. {remaining} undecided left in this folder — "
+                "the next batch arrives when the re-rank finishes."
+            )
+        else:
+            self.status_var.set("Every photo in this folder has been decided. Nothing left to review.")
+
+    def _undecided_remaining(self, labels: dict[str, int] | None = None) -> int:
+        """How many scanned, visible photos still carry no Accept/REJECT/Skip.
+
+        `labels` is accepted so a caller that already loaded them does not pay for a
+        second copy of the whole label map on every keystroke.
+        """
+        if self.current_state is None or self.store is None:
+            return 0
+        if labels is None:
+            labels = self.store.load_labels()
+        mask = self._result_visibility_mask()
+        return sum(
+            1
+            for path, include in zip(self.current_state.paths, mask, strict=False)
+            if include and labels.get(str(path)) is None
+        )
 
     def _apply_label_batch(
         self,
@@ -4426,10 +4621,49 @@ class BikiniScannerApp:
             self.redo_stack.clear()
         for path in changes:
             self._refresh_label_state(path)
-        self.status_var.set(status)
+        # Always say how much is actually left. Without this the queue refilling after
+        # every retrain looks infinite, because nothing on screen ever counts down.
+        self.status_var.set(f"{status} {self._progress_note()}".strip())
         self._save_review_session()
         if retrain:
             self.update_algorithm()
+
+    def _progress_note(self) -> str:
+        """Short 'how much is left' line for the status bar."""
+        if self.current_state is None or self.store is None:
+            return ""
+        labels = self.store.load_labels()
+        decided = sum(1 for value in labels.values() if value in (0, 1, 2))
+        remaining = self._undecided_remaining(labels)
+        on_screen = sum(
+            1 for sample in self.page_samples if labels.get(str(sample["path"])) is None
+        )
+        return f"[{decided} decided | {on_screen} left on this page | {remaining} left in folder]"
+
+    def _retrain_report(
+        self,
+        state: ScoreState,
+        previous_scores: dict[str, float],
+        threshold: float,
+    ) -> str:
+        """Say what the labels just did, in terms the reviewer can check."""
+        learning_text = state.learning_summary or "no model yet"
+        moved = 0
+        if previous_scores:
+            for path, score in zip(state.paths, state.scores, strict=False):
+                before = previous_scores.get(str(path))
+                if before is None:
+                    continue
+                if (float(before) >= threshold) != (float(score) >= threshold):
+                    moved += 1
+        if state.classifier_label_count <= 0:
+            return "Re-ranked. No Accept/REJECT decisions recorded yet, so the model is still zero-shot."
+        effect = (
+            f"{moved} photo{'s' if moved != 1 else ''} changed side of the threshold"
+            if moved
+            else "the ranking did not change"
+        )
+        return f"Re-ranked with your labels — {learning_text}; {effect}. {self._progress_note()}".strip()
 
     def label_focused_card(self, label: int) -> None:
         if self.focused_path is None:
@@ -4447,9 +4681,13 @@ class BikiniScannerApp:
             messagebox.showinfo("Nothing shown", "There are no images on screen to label.")
             return
         verb = {1: "Accept", 0: "REJECT", 2: "Skip"}.get(int(label), "label")
+        # "Shown" is every image the current filters let through, not just the page
+        # on screen. The count below is the whole set, so name the scope explicitly.
+        pages = self._page_count()
+        scope = "in this view" if pages == 1 else f"in this view (all {pages} pages)"
         if not messagebox.askyesno(
             f"{verb} everything shown",
-            f"{verb} all {len(paths)} images currently on screen?\n\nUse Ctrl+Z afterwards if that was not what you wanted.",
+            f"{verb} all {len(paths)} images {scope}?\n\nUse Ctrl+Z afterwards if that was not what you wanted.",
         ):
             return
         self._apply_label_batch(
@@ -4718,6 +4956,7 @@ class BikiniScannerApp:
         self.current_samples = []
         self.review_samples = []
         self.displayed_samples = []
+        self.page_samples = []
         self.focused_path = None
         self.undo_stack.clear()
         self.redo_stack.clear()
