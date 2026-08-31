@@ -415,8 +415,11 @@ class BikiniScorer:
                         "classifier": classifier,
                     }
                 )
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception:
+                # Not fatal - the model is already trained and usable this session -
+                # but silence here meant a read-only or full cache directory threw the
+                # training away on every restart with nothing to show for it.
+                LOGGER.exception("Could not persist the trained classifier to %s", store.classifier_path)
         return label_count
 
     @staticmethod
@@ -724,7 +727,27 @@ class BikiniScorer:
             embeddings_by_path = dict(zip(paths, embeddings, strict=False))
             label_count = self.train_classifier(embeddings_by_path, labels, store=store)
             axis_scores = self.axis_zero_shot_scores(embeddings)
-            scores = self.final_scores(embeddings, axis_scores=axis_scores)
+            scores = np.asarray(self.final_scores(embeddings, axis_scores=axis_scores), dtype=np.float32)
+            # The legacy pipeline skips the cascade, but the age gate is not a cascade
+            # feature that a pipeline setting may opt out of. Run it on the full frame
+            # and apply its exclusions here too, so `exclude_minors` means the same
+            # thing in both pipelines instead of being silently inert in this one.
+            stage: list[str] = []
+            reason: list[str] = []
+            excluded: np.ndarray | None = None
+            if self.config.exclude_minors and count:
+                gate = cascade_module.evaluate(self.full_region_table(embeddings), self.config, face_counts)
+                legacy_minor: np.ndarray = np.asarray(
+                    [value == cascade_module.STAGE_MINOR for value in gate.stage], dtype=bool
+                )
+                if legacy_minor.size == len(scores) and legacy_minor.any():
+                    scores = scores.copy()
+                    scores[legacy_minor] = 0.0
+                stage = [
+                    cascade_module.STAGE_MINOR if flagged else cascade_module.STAGE_SCORED for flagged in legacy_minor
+                ]
+                reason = [cascade_module.STAGE_REASONS[value] for value in stage]
+                excluded = legacy_minor
             return ScoreState(
                 paths=list(paths),
                 embeddings=embeddings,
@@ -735,6 +758,9 @@ class BikiniScorer:
                 classifier_trained=self.classifier is not None,
                 classifier_label_count=label_count,
                 scan_timestamp=scan_timestamp or datetime.now(timezone.utc).isoformat(),
+                cascade_stage=stage,
+                cascade_reason=reason,
+                excluded=excluded,
             )
 
         if region_table is None:

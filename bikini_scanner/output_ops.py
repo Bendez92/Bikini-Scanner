@@ -8,7 +8,7 @@ import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -225,8 +225,11 @@ def execute_transfer_plan(plan: Sequence[PlannedTransfer], move: bool = False) -
             if item.destination.exists() and item.action == "overwrite":
                 try:
                     item.destination.unlink()
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    # Not fatal on its own; the copy below either succeeds anyway or
+                    # fails and is counted per-item. Logged because a locked
+                    # destination is the usual cause and is worth seeing.
+                    LOGGER.warning("Could not remove %s before overwrite: %s", item.destination, exc)
             if move:
                 try:
                     if item.source.parent == item.destination.parent:
@@ -395,13 +398,20 @@ def write_image_metadata(path: str | Path, keyword: str, score: float | None = N
             _inject_jpeg_xmp(tmp, keyword, score)
         os.replace(tmp, source)
         return True
-    except Exception:  # noqa: BLE001
-        if tmp is not None and tmp.exists():
-            try:
-                tmp.unlink()
-            except Exception:  # noqa: BLE001
-                pass
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Could not write keyword metadata to %s: %s", source, exc)
+        _discard_temp(tmp)
         return False
+
+
+def _discard_temp(tmp: Path | None) -> None:
+    """Best-effort cleanup of a half-written temp file on an error path."""
+    if tmp is None or not tmp.exists():
+        return
+    try:
+        tmp.unlink()
+    except OSError as exc:
+        LOGGER.debug("Could not remove temporary file %s: %s", tmp, exc)
 
 
 def _xmp_packet(keyword: str, score: float | None) -> bytes:
@@ -457,11 +467,7 @@ def _write_pyexiv2_metadata(source: Path, keyword: str, score: float | None) -> 
         return True
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Optional pyexiv2 metadata write failed for %s: %s", source, exc)
-        if tmp is not None and tmp.exists():
-            try:
-                tmp.unlink()
-            except Exception:  # noqa: BLE001
-                pass
+        _discard_temp(tmp)
         return False
 
 
@@ -475,14 +481,43 @@ def _pnginfo(keyword: str, score: float | None):
     return info
 
 
-def trash_files(paths: Sequence[str | Path]) -> tuple[bool, str]:
+@dataclass(slots=True)
+class TrashOutcome:
+    """What a trash run actually did.
+
+    `available` is False only when send2trash itself could not be imported, i.e. when
+    nothing was attempted. Once the batch starts, individual failures are recorded per
+    file and the rest of the batch continues: aborting the loop on the first error used
+    to leave the earlier files already in the recycle bin while the caller reported that
+    recycle-bin support was unavailable and refreshed nothing.
+    """
+
+    available: bool
+    reason: str = ""
+    trashed: list[str] = field(default_factory=list)
+    failures: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def trashed_count(self) -> int:
+        return len(self.trashed)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failures)
+
+
+def trash_files(paths: Sequence[str | Path]) -> TrashOutcome:
     try:
         from send2trash import send2trash
     except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-    try:
-        for path in paths:
-            send2trash(str(path))
-        return True, ""
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
+        return TrashOutcome(available=False, reason=str(exc))
+    outcome = TrashOutcome(available=True)
+    for path in paths:
+        text = str(path)
+        try:
+            send2trash(text)
+            outcome.trashed.append(text)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Could not move %s to the recycle bin: %s", text, exc)
+            outcome.failures.append((text, str(exc)))
+    return outcome

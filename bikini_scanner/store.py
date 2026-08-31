@@ -556,8 +556,10 @@ class FolderStore:
         if self.sqlite_cache is not None:
             try:
                 self.sqlite_cache.close()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # rmtree below is what actually matters; a close failure only risks a
+                # locked file on Windows, and knowing that is why it is logged.
+                LOGGER.warning("Could not close the SQLite cache before clearing it: %s", exc)
         if self.cache_dir.exists():
             shutil.rmtree(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)

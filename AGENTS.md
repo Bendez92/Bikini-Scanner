@@ -22,7 +22,7 @@ Run these before committing to `main`:
 
 Expected outcomes:
 
-- 69 functional tests pass.
+- 83 functional tests pass.
 - Ruff reports `All checks passed!`.
 - Mypy reports `Success: no issues found in ... source files`.
 - Baseline reports `Baseline matches ...`.
@@ -78,6 +78,23 @@ The test suite sets `BIKINI_SCANNER_TEST_SQLITE_PRAGMAS=1`, which causes the
 SQLite cache to use `journal_mode=MEMORY` and `synchronous=OFF`. This keeps
 file-backed caches (so cross-instance cache reuse still works) while reducing
 disk I/O overhead during tests.
+
+## Trust Boundaries
+
+Two inputs are attacker-influenced whenever a downloaded or shared folder is scanned,
+and both are constrained on purpose:
+
+- **`.bikini_scanner_cache/config_override.json`** lives *inside the scanned folder*.
+  Only `FOLDER_OVERRIDE_ALLOWED_KEYS` (`config.py`) may come from one; anything that
+  could reach off this machine (`vlm_*`), run code (`enable_plugins`), fetch a remote
+  model (`backend`, `model_name`, `refine_model`), or weaken the age gate (`pipeline`,
+  `exclude_minors`, the minor thresholds, `axis_prompts`) is refused and reported to
+  the user. Route every new override read through `filter_folder_override`.
+- **`classifier.pkl`**, per-folder and global, is loaded with `RestrictedUnpickler`
+  (`store.py`). Never call bare `pickle.load` on either.
+
+The age gate is not a property of the cascade pipeline: `pipeline="legacy"` runs it too.
+`exclude_minors` must mean the same thing in both pipelines.
 
 ## Important Conventions
 

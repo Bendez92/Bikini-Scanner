@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import logging
 import re
@@ -92,6 +93,18 @@ def parse_axis_json(text: str, axes: tuple[str, ...] = VLM_AXES) -> dict[str, fl
     return result
 
 
+def is_local_endpoint(base_url: str) -> bool:
+    """True when `base_url` provably points at this machine.
+
+    Callers use this to decide whether uploading images to the endpoint needs to be
+    confirmed, so an unparseable or merely probable address counts as remote.
+    """
+    try:
+        return VLMClient._is_loopback(urlparse(base_url).netloc)
+    except ValueError:
+        return False
+
+
 class VLMClient:
     def __init__(
         self,
@@ -102,7 +115,9 @@ class VLMClient:
         concurrency: int = 4,
     ) -> None:
         parsed = urlparse(base_url)
-        if not parsed.scheme or not parsed.netloc:
+        # Enforce what the message has always claimed. urlopen also speaks ftp: and
+        # file:, and "has a scheme and a netloc" was not enough to keep those out.
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(f"VLM base URL must be a valid http/https URL: {base_url}")
         if parsed.scheme == "http" and api_key.strip():
             raise ValueError("Refusing to send the VLM API key over plain HTTP")
@@ -119,15 +134,26 @@ class VLMClient:
 
     @staticmethod
     def _is_loopback(netloc: str) -> bool:
-        """Best-effort loopback detection for the URL warning."""
-        host = netloc.split(":", 1)[0].lower().strip("[]")
-        if host in {"localhost", "127.0.0.1", "::1"}:
+        """Loopback detection for the "images will leave this machine" warning.
+
+        Deliberately errs towards *warning*: anything not provably loopback is treated
+        as remote. `ipaddress` handles the IPv6 spellings (::1, ::ffff:127.0.0.1, and
+        the zero-compressed forms) that a hand-rolled string check kept missing.
+        """
+        host = netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
+        if host.startswith("["):
+            host = host.partition("]")[0].lstrip("[")
+        host = host.lower().strip()
+        if host in {"localhost", "localhost.localdomain"}:
             return True
         try:
-            parts = [int(part) for part in host.split(".")]
-            return len(parts) == 4 and parts[0] == 127
+            address = ipaddress.ip_address(host)
         except ValueError:
             return False
+        if address.is_loopback:
+            return True
+        mapped = getattr(address, "ipv4_mapped", None)
+        return bool(mapped is not None and mapped.is_loopback)
 
     def probe(self) -> bool:
         try:

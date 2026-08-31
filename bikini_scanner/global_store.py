@@ -24,6 +24,7 @@ from typing import Any
 import numpy as np
 
 from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
+from .store import RestrictedUnpickler
 from .user_prefs import prefs_path
 
 LOGGER = logging.getLogger(__name__)
@@ -141,8 +142,17 @@ class GlobalLearningStore:
                 atomic_write_json(self.index_path, index)
 
                 def write_npz(tmp: Path) -> None:
+                    # No allow_pickle kwarg here on purpose: it only became a real
+                    # savez parameter in recent numpy, and on the older 2.x releases
+                    # this project still allows it would be swallowed as an *array*
+                    # named "allow_pickle" instead. Every value is already a plain
+                    # float32 ndarray, which savez never pickles, and the load side
+                    # passes allow_pickle=False, which is where it is enforced.
                     with tmp.open("wb") as handle:
-                        np.savez(handle, **features, allow_pickle=False)
+                        # numpy 2.5 types savez's second
+                        # parameter as allow_pickle, so **features trips the stub.
+                        # Keys here are sha1 hexdigests and can never collide with it.
+                        np.savez(handle, **features)  # type: ignore[arg-type]
 
                 atomic_replace(self.features_path, write_npz)
             except Exception:
@@ -166,8 +176,17 @@ class GlobalLearningStore:
                 atomic_write_json(self.index_path, index)
 
                 def write_npz(tmp: Path) -> None:
+                    # No allow_pickle kwarg here on purpose: it only became a real
+                    # savez parameter in recent numpy, and on the older 2.x releases
+                    # this project still allows it would be swallowed as an *array*
+                    # named "allow_pickle" instead. Every value is already a plain
+                    # float32 ndarray, which savez never pickles, and the load side
+                    # passes allow_pickle=False, which is where it is enforced.
                     with tmp.open("wb") as handle:
-                        np.savez(handle, **features, allow_pickle=False)
+                        # numpy 2.5 types savez's second
+                        # parameter as allow_pickle, so **features trips the stub.
+                        # Keys here are sha1 hexdigests and can never collide with it.
+                        np.savez(handle, **features)  # type: ignore[arg-type]
 
                 atomic_replace(self.features_path, write_npz)
             except Exception:
@@ -219,9 +238,13 @@ class GlobalLearningStore:
         if not self.classifier_path.exists():
             return None
         try:
+            # Same restricted unpickler the per-folder classifier cache uses: a
+            # classifier pickle is data, and nothing in one legitimately needs to
+            # import outside numpy and this package's own model classes.
             with self.classifier_path.open("rb") as handle:
-                payload = pickle.load(handle)
-        except Exception:  # noqa: BLE001
+                payload = RestrictedUnpickler(handle).load()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Ignoring unreadable global classifier %s: %s", self.classifier_path, exc)
             return None
         if not isinstance(payload, dict) or payload.get("classifier") is None:
             return None

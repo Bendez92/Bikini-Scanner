@@ -41,6 +41,8 @@ def emit(message: str) -> None:
     try:
         print(message)
     except Exception:  # noqa: BLE001
+        # A failed write to stdout (closed pipe, dead console) has nowhere left to be
+        # reported to; the log file already has the same information.
         pass
 
 

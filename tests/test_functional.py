@@ -19,10 +19,12 @@ from __future__ import annotations
 import io
 import json
 import os
+import pickle
 import shutil
 import sys
 import tempfile
 import threading
+import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,7 +56,7 @@ from bikini_scanner import (
 )
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
-from bikini_scanner.config import ScannerConfig
+from bikini_scanner.config import ScannerConfig, filter_folder_override
 from bikini_scanner.config_profiles import BUILTIN_PROFILES, profile_config, profile_names
 from bikini_scanner.global_store import GlobalLearningStore
 from bikini_scanner.regions import plan_regions
@@ -69,7 +71,7 @@ from bikini_scanner.scorer import (
 from bikini_scanner.skin import skin_fraction
 from bikini_scanner.store import FolderStore, collect_image_paths, content_hash_for_path
 from bikini_scanner.vision_analysis import FaceBox, detect_face_count
-from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, parse_axis_json
+from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, is_local_endpoint, parse_axis_json
 
 IMAGE_COUNT = 8
 _SHARED: dict[str, object] = {}
@@ -1136,6 +1138,213 @@ class IgnoreMarkers(unittest.TestCase):
             self.assertTrue((assets / ".bikini_scanner_ignore").is_file())
         finally:
             shutil.rmtree(destination, ignore_errors=True)
+
+
+class FolderOverrideTrust(unittest.TestCase):
+    """A config override ships inside the folder being scanned, so it is untrusted.
+
+    Anything that could reach off this machine, run code, or weaken the age gate must
+    be refused; local ranking and performance knobs are still allowed through.
+    """
+
+    def test_egress_and_safety_keys_are_refused(self) -> None:
+        hostile = {
+            "vlm_enabled": True,
+            "vlm_base_url": "https://attacker.example/v1",
+            "vlm_api_key": "stolen",
+            "enable_plugins": True,
+            "pipeline": "legacy",
+            "exclude_minors": False,
+            "minor_threshold": 1.0,
+            "axis_prompts": {"child": {"positive": ["x"], "negative": ["y"]}},
+            "backend": "clip-onnx",
+            "model_name": "attacker/model",
+            "refine_model": "attacker/model",
+            "global_learning": True,
+        }
+        accepted, refused = filter_folder_override(hostile)
+        self.assertEqual(accepted, {})
+        self.assertEqual(sorted(refused), sorted(hostile))
+
+    def test_benign_tuning_keys_are_allowed(self) -> None:
+        accepted, refused = filter_folder_override({"threshold": 0.5, "deep_scan": "always", "batch_size": 4})
+        self.assertEqual(accepted, {"threshold": 0.5, "deep_scan": "always", "batch_size": 4})
+        self.assertEqual(refused, [])
+
+    def test_hostile_override_cannot_reach_the_config(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_override_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        store = FolderStore(folder)
+        store.save_config_override({"vlm_enabled": True, "vlm_base_url": "https://attacker.example/v1"})
+
+        accepted, refused = filter_folder_override(store.load_config_override())
+        config = ScannerConfig.from_mapping({**ScannerConfig().to_dict(), **accepted})
+
+        self.assertFalse(config.vlm_enabled)
+        self.assertNotIn("attacker.example", config.vlm_base_url)
+        self.assertIn("vlm_base_url", refused)
+
+    def test_saved_override_round_trips_without_refusals(self) -> None:
+        """What the app writes itself must not warn when it is read back."""
+        payload, _ = filter_folder_override(ScannerConfig().to_dict())
+        _, refused = filter_folder_override(payload)
+        self.assertEqual(refused, [])
+
+
+class LegacyPipelineAgeGate(unittest.TestCase):
+    """`pipeline` is a scoring choice; it is not an opt-out from the age gate."""
+
+    AXES = (
+        "person",
+        "female",
+        "child",
+        "adult",
+        "bikini",
+        "bikini_top",
+        "bikini_bottom",
+        "cleavage",
+        "midriff",
+        "nsfw",
+    )
+
+    def _scorer(self, pipeline: str, exclude_minors: bool) -> BikiniScorer:
+        config = ScannerConfig()
+        config.pipeline = pipeline
+        config.exclude_minors = exclude_minors
+        axes = self.AXES
+
+        class _MinorScorer(BikiniScorer):
+            def axis_zero_shot_scores(self, embeddings, *args, **kwargs):  # type: ignore[no-untyped-def]
+                count = len(embeddings)
+                scores = {axis: np.full((count,), 0.5, dtype=np.float32) for axis in axes}
+                scores["person"][:] = 0.99
+                scores["female"][:] = 0.99
+                scores["child"][:] = 0.99
+                scores["adult"][:] = 0.01
+                for axis in ("bikini", "bikini_top", "bikini_bottom", "cleavage", "midriff"):
+                    scores[axis][:] = 0.99
+                return scores
+
+        return _MinorScorer(backend=_shared()["backend"], config=config)
+
+    @staticmethod
+    def _embeddings(count: int = 3) -> np.ndarray:
+        return np.tile(np.eye(1, 512, dtype=np.float32), (count, 1))
+
+    def test_legacy_pipeline_zeroes_and_hides_minors(self) -> None:
+        scorer = self._scorer("legacy", exclude_minors=True)
+        state = scorer.score_state(["a.jpg", "b.jpg", "c.jpg"], self._embeddings(), {})
+        np.testing.assert_allclose(state.scores, 0.0)
+        self.assertIsNotNone(state.excluded)
+        self.assertTrue(np.asarray(state.excluded).all())
+        self.assertFalse(scorer.state_visibility(state).any())
+        self.assertEqual(set(state.cascade_stage), {cascade.STAGE_MINOR})
+
+    def test_legacy_matches_cascade_on_the_age_gate(self) -> None:
+        embeddings = self._embeddings()
+        results = {}
+        for pipeline in ("cascade", "legacy"):
+            scorer = self._scorer(pipeline, exclude_minors=True)
+            state = scorer.score_state(["a.jpg", "b.jpg", "c.jpg"], embeddings, {})
+            results[pipeline] = scorer.state_visibility(state).tolist()
+        self.assertEqual(results["cascade"], results["legacy"])
+
+    def test_legacy_without_the_gate_still_scores(self) -> None:
+        """Turning the gate off is still the user's call, in either pipeline."""
+        scorer = self._scorer("legacy", exclude_minors=False)
+        state = scorer.score_state(["a.jpg", "b.jpg", "c.jpg"], self._embeddings(), {})
+        self.assertTrue((state.scores > 0).all())
+        self.assertIsNone(state.excluded)
+
+
+class TrashBatching(unittest.TestCase):
+    """A failure partway through a trash run is not "nothing happened"."""
+
+    def test_partial_failure_reports_both_halves(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_trash_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        paths = []
+        for index in range(4):
+            path = folder / f"f{index}.jpg"
+            path.write_bytes(_make_image_bytes())
+            paths.append(str(path))
+
+        removed: list[str] = []
+
+        def fake_send2trash(target: str) -> None:
+            if target == paths[1]:
+                raise OSError("locked by another process")
+            removed.append(target)
+
+        module = types.ModuleType("send2trash")
+        module.send2trash = fake_send2trash  # type: ignore[attr-defined]
+        original = sys.modules.get("send2trash")
+        sys.modules["send2trash"] = module
+        try:
+            outcome = output_ops.trash_files(paths)
+        finally:
+            if original is None:
+                sys.modules.pop("send2trash", None)
+            else:
+                sys.modules["send2trash"] = original
+
+        self.assertTrue(outcome.available)
+        # The batch continued past the failure instead of abandoning the rest.
+        self.assertEqual(outcome.trashed_count, 3)
+        self.assertEqual(outcome.failed_count, 1)
+        self.assertEqual(removed, [paths[0], paths[2], paths[3]])
+        self.assertEqual(outcome.failures[0][0], paths[1])
+
+    def test_missing_send2trash_attempts_nothing(self) -> None:
+        original = sys.modules.get("send2trash")
+        sys.modules["send2trash"] = None  # type: ignore[assignment]
+        try:
+            outcome = output_ops.trash_files(["a.jpg"])
+        finally:
+            if original is None:
+                sys.modules.pop("send2trash", None)
+            else:
+                sys.modules["send2trash"] = original
+        self.assertFalse(outcome.available)
+        self.assertEqual(outcome.trashed_count, 0)
+
+
+class VLMEndpointTrust(unittest.TestCase):
+    def test_non_http_schemes_are_rejected(self) -> None:
+        for url in ("ftp://host/v1", "file:///etc/passwd", "not a url", "gopher://host/v1"):
+            with self.assertRaises(ValueError):
+                VLMClient(url, "model")
+
+    def test_loopback_spellings_are_recognised(self) -> None:
+        for url in (
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:8080/v1",
+            "http://127.5.5.5/v1",
+            "http://[::1]:8080/v1",
+            "http://[::ffff:127.0.0.1]/v1",
+        ):
+            self.assertTrue(is_local_endpoint(url), url)
+
+    def test_remote_endpoints_are_not_treated_as_local(self) -> None:
+        for url in ("https://attacker.example/v1", "http://10.0.0.5/v1", "https://api.openai.com/v1"):
+            self.assertFalse(is_local_endpoint(url), url)
+
+
+class GlobalClassifierUnpickling(unittest.TestCase):
+    """The global classifier gets the same restricted unpickler as the per-folder one."""
+
+    def test_disallowed_module_is_refused(self) -> None:
+        store = GlobalLearningStore("restricted-unpickler-test")
+        store.classifier_path.parent.mkdir(parents=True, exist_ok=True)
+        # A payload whose unpickling would import os.system.
+        store.classifier_path.write_bytes(pickle.dumps({"classifier": os.system, "feature_version": 0}))
+        self.addCleanup(store.classifier_path.unlink, True)
+        self.assertIsNone(store.load_classifier())
+
+    def test_restricted_unpickler_blocks_arbitrary_imports(self) -> None:
+        blob = pickle.dumps(os.system)
+        with self.assertRaises(pickle.UnpicklingError):
+            store_module.RestrictedUnpickler(io.BytesIO(blob)).load()
 
 
 def _cleanup() -> None:

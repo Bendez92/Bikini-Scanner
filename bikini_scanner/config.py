@@ -551,3 +551,79 @@ def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
     return default
+
+
+# --- Folder-scoped override policy ------------------------------------------
+# A per-folder `config_override.json` lives *inside the folder being scanned*, so it is
+# only as trustworthy as that folder. Scanning a downloaded or shared folder must not
+# let the folder reconfigure the scanner. Only keys that tune local ranking and
+# performance may come from one; everything with a blast radius beyond this machine or
+# beyond ranking is refused and the global setting is kept.
+#
+# Deliberately excluded, and why:
+#   vlm_*            - can redirect every scanned image to an arbitrary remote endpoint
+#   enable_plugins   - executes arbitrary Python from the plugins directory
+#   backend,
+#   model_name,
+#   refine_model     - names a model to fetch and load from a remote hub
+#   pipeline         - "legacy" skips the cascade, and with it the age gate
+#   exclude_minors,
+#   minor_threshold,
+#   min_adult_confidence,
+#   child_adult_margin,
+#   strongly_minor_threshold,
+#   face_anchored_margin,
+#   weak_adult_detail - the age gate itself
+#   axis_prompts     - can redefine the "child"/"adult" axes and hollow out the age gate
+#   global_learning,
+#   max_learning_weight - writes to cross-folder state shared with every other folder
+FOLDER_OVERRIDE_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {
+        "device",
+        "precision",
+        "quantize_cpu",
+        "preload_backend",
+        "positive_prompts",
+        "negative_prompts",
+        "batch_size",
+        "threshold",
+        "zero_shot_scale",
+        "classifier_weight",
+        "zero_shot_weight",
+        "nsfw_filter",
+        "nsfw_threshold",
+        "require_person",
+        "person_threshold",
+        "enable_face_detection",
+        "deep_scan",
+        "person_gate_threshold",
+        "require_female",
+        "female_threshold",
+        "max_faces",
+        "refine_band",
+        "refine_max_images",
+        "refine_weight",
+        "detail_strongest_weight",
+        "detail_average_weight",
+        "detail_weights",
+    }
+)
+
+
+def filter_folder_override(mapping: Mapping[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
+    """Split a folder override into the keys it may set and the keys it may not.
+
+    Returns (accepted, refused_key_names). Refused keys are reported rather than
+    dropped quietly, so a folder that tries to reconfigure the scanner is visible to
+    the user instead of silently effective.
+    """
+    if not mapping:
+        return {}, []
+    accepted: dict[str, Any] = {}
+    refused: list[str] = []
+    for key, value in mapping.items():
+        if str(key) in FOLDER_OVERRIDE_ALLOWED_KEYS:
+            accepted[str(key)] = value
+        else:
+            refused.append(str(key))
+    return accepted, sorted(refused)

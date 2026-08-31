@@ -42,7 +42,7 @@ from PIL import Image, ImageTk
 from . import cascade, vision_analysis
 from .__version__ import __version__
 from .backend_utils import ImageEmbeddingBackend
-from .config import HIGH_ACCURACY_MODEL, ScannerConfig
+from .config import HIGH_ACCURACY_MODEL, ScannerConfig, filter_folder_override
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
 from .global_store import GlobalLearningStore
 from .image_formats import open_oriented, oriented_size
@@ -71,6 +71,7 @@ from .scorer import (
 from .store import MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES, FolderStore
 from .update_checker import check_for_update
 from .user_prefs import load_user_prefs, prefs_path, save_user_prefs
+from .vlm_backend import is_local_endpoint
 
 try:
     import psutil
@@ -1898,10 +1899,28 @@ class BikiniScannerApp:
         self.config = ScannerConfig.from_mapping(self.global_config.to_dict())
         folder_store = FolderStore(Path(folder))
         self.store = folder_store
-        override = folder_store.load_config_override()
-        self.folder_override_active = override is not None
+        # The override file lives inside the scanned folder, so it is only as
+        # trustworthy as that folder: anything that could reach off this machine, run
+        # code, or weaken the age gate is refused and reported rather than applied.
+        override, refused = filter_folder_override(folder_store.load_config_override())
+        self.folder_override_active = bool(override)
         if override:
             self.config = ScannerConfig.from_mapping({**self.global_config.to_dict(), **override})
+        if refused:
+            LOGGER.warning(
+                "Ignored %d restricted key(s) in the folder override for %s: %s",
+                len(refused),
+                folder,
+                ", ".join(refused),
+            )
+            messagebox.showwarning(
+                "Folder override restricted",
+                f"{folder}\n\nThis folder carries a settings override that tried to change "
+                f"{len(refused)} setting(s) a folder is not allowed to change:\n\n"
+                f"{', '.join(refused)}\n\n"
+                "Those were ignored and your global settings kept. The remaining override "
+                "settings were applied.",
+            )
         self.backend = None
         self.scorer = None
         self.override_var.set("Folder override active" if self.folder_override_active else "")
@@ -1928,7 +1947,10 @@ class BikiniScannerApp:
             messagebox.showinfo("Folder override", "Choose or scan a folder first.")
             return
         self.store = self.store or FolderStore(Path(folder))
-        self.store.save_config_override(self.config.to_dict())
+        # Only persist what a folder override is allowed to carry, so reopening the
+        # folder does not warn about restricted keys this app wrote itself.
+        payload, _refused = filter_folder_override(self.config.to_dict())
+        self.store.save_config_override(payload)
         self.folder_override_active = True
         self.override_var.set("Folder override active")
         self.status_var.set("Saved settings override for this folder.")
@@ -3062,6 +3084,23 @@ class BikiniScannerApp:
                 messagebox.showerror(
                     "Invalid settings", "VLM server URL and model are required when enabled.", parent=dialog
                 )
+                return
+            # Enabling the VLM pass uploads every adjudicated image to that endpoint.
+            # A local server is the documented setup and stays silent; anything else is
+            # confirmed once here, because the only other signal is a line in the log.
+            if (
+                bool(vlm_enabled_var.get())
+                and vlm_base_url != self.config.vlm_base_url
+                and not is_local_endpoint(vlm_base_url)
+                and not messagebox.askyesno(
+                    "Send images to a remote server?",
+                    f"{vlm_base_url}\n\nThis is not a local address. Every image the VLM pass "
+                    "adjudicates will be uploaded to it.\n\nUse this endpoint?",
+                    parent=dialog,
+                    default="no",
+                    icon="warning",
+                )
+            ):
                 return
             if zero_shot_scale <= 0:
                 messagebox.showerror("Invalid settings", "Zero-shot scale must be positive.", parent=dialog)
@@ -4523,12 +4562,28 @@ class BikiniScannerApp:
             return
         if not messagebox.askyesno("Move to trash", f"Send {len(paths)} files to the recycle bin/trash?"):
             return
-        ok, reason = trash_files(paths)
-        if not ok:
-            messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {reason}")
+        outcome = trash_files(paths)
+        if not outcome.available:
+            messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {outcome.reason}")
             return
-        messagebox.showinfo("Trash complete", f"Moved {len(paths)} files to the recycle bin/trash.")
-        self._refresh_after_output_change(move=True)
+        # Report what actually happened, and refresh whenever anything moved: a partial
+        # failure still changed the folder, so leaving the grid untouched would show
+        # files that are already in the recycle bin.
+        if outcome.failed_count:
+            LOGGER.warning("Trashed %d of %d files", outcome.trashed_count, len(paths))
+            first = "\n".join(f"{path}: {error}" for path, error in outcome.failures[:5])
+            more = f"\n...and {outcome.failed_count - 5} more." if outcome.failed_count > 5 else ""
+            messagebox.showwarning(
+                "Trash partly complete",
+                f"Moved {outcome.trashed_count} of {len(paths)} files to the recycle bin/trash.\n\n"
+                f"{outcome.failed_count} could not be moved:\n{first}{more}",
+            )
+        else:
+            messagebox.showinfo(
+                "Trash complete", f"Moved {outcome.trashed_count} files to the recycle bin/trash."
+            )
+        if outcome.trashed_count:
+            self._refresh_after_output_change(move=True)
 
     def show_log_viewer(self) -> None:
         path = configure_logging()
@@ -4596,14 +4651,28 @@ class BikiniScannerApp:
             parent=dialog,
         ):
             return
-        ok, reason = trash_files(duplicates)
-        if not ok:
-            messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {reason}", parent=dialog)
+        outcome = trash_files(duplicates)
+        if not outcome.available:
+            messagebox.showinfo(
+                "Trash unavailable", f"Recycle-bin support is unavailable: {outcome.reason}", parent=dialog
+            )
             return
-        LOGGER.info("Moved %d duplicate files to trash", len(duplicates))
-        messagebox.showinfo(
-            "Duplicates removed", f"Moved {len(duplicates)} duplicate files to the recycle bin/trash.", parent=dialog
-        )
+        LOGGER.info("Moved %d of %d duplicate files to trash", outcome.trashed_count, len(duplicates))
+        if outcome.failed_count:
+            first = "\n".join(f"{path}: {error}" for path, error in outcome.failures[:5])
+            more = f"\n...and {outcome.failed_count - 5} more." if outcome.failed_count > 5 else ""
+            messagebox.showwarning(
+                "Duplicates partly removed",
+                f"Moved {outcome.trashed_count} of {len(duplicates)} duplicate files to the recycle bin/trash.\n\n"
+                f"{outcome.failed_count} could not be moved:\n{first}{more}",
+                parent=dialog,
+            )
+        else:
+            messagebox.showinfo(
+                "Duplicates removed",
+                f"Moved {outcome.trashed_count} duplicate files to the recycle bin/trash.",
+                parent=dialog,
+            )
         dialog.destroy()
 
     def clear_cache(self) -> None:
