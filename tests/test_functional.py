@@ -1347,6 +1347,82 @@ class GlobalClassifierUnpickling(unittest.TestCase):
             store_module.RestrictedUnpickler(io.BytesIO(blob)).load()
 
 
+class RefineWeightSelection(unittest.TestCase):
+    """vlm_weight and refine_weight are separate knobs, so the blend must tell them apart."""
+
+    def _state(self, refine: RefineResult, vlm_weight: float, refine_weight: float) -> ScoreState:
+        config = ScannerConfig()
+        config.vlm_weight = vlm_weight
+        config.refine_weight = refine_weight
+        config.exclude_minors = False
+        scorer = BikiniScorer(backend=_shared()["backend"], config=config)
+        embeddings = np.tile(np.eye(1, 512, dtype=np.float32), (2, 1))
+        return scorer.score_state(["a.jpg", "b.jpg"], embeddings, {}, refine=refine)
+
+    def test_vlm_and_clip_sources_use_different_weights(self) -> None:
+        scores = np.array([1.0, 1.0], dtype=np.float32)
+        minor = np.zeros(2, dtype=bool)
+
+        vlm = self._state(RefineResult(scores, minor, source="vlm"), vlm_weight=1.0, refine_weight=0.0)
+        clip = self._state(RefineResult(scores, minor, source="clip"), vlm_weight=1.0, refine_weight=0.0)
+
+        # vlm_weight=1.0 hands the VLM pass the whole vote; refine_weight=0.0 gives the
+        # CLIP pass none. Identical inputs must therefore land on different scores.
+        self.assertFalse(np.allclose(vlm.zero_shot_scores, clip.zero_shot_scores))
+        np.testing.assert_allclose(vlm.zero_shot_scores, 1.0, atol=1e-6)
+
+    def test_refine_result_defaults_to_clip(self) -> None:
+        self.assertEqual(RefineResult(np.zeros(1, np.float32), np.zeros(1, bool)).source, "clip")
+
+
+class EmbeddingCacheIsolation(unittest.TestCase):
+    """Cached full-frame embeddings must not leak between models."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_ns_"))
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        self.image = self.folder / "one.jpg"
+        self.image.write_bytes(_make_image_bytes())
+
+    def test_changing_model_discards_derived_caches(self) -> None:
+        store = FolderStore(self.folder)
+        store.ensure_embedding_namespace("clip_torch-model_a")
+        store.save_embeddings({self.image: np.ones(512, dtype=np.float32)})
+        self.assertTrue(store.get_cached_embeddings([self.image]))
+
+        # Same model again: the cache survives.
+        store = FolderStore(self.folder)
+        store.ensure_embedding_namespace("clip_torch-model_a")
+        self.assertTrue(store.get_cached_embeddings([self.image]))
+
+        # Different model: the stale vectors go.
+        store = FolderStore(self.folder)
+        store.ensure_embedding_namespace("clip_torch-model_b")
+        self.assertFalse(store.get_cached_embeddings([self.image]))
+
+    def test_labels_survive_a_model_change(self) -> None:
+        store = FolderStore(self.folder)
+        store.ensure_embedding_namespace("model_a")
+        store.save_labels({str(self.image): 1})
+        store = FolderStore(self.folder)
+        store.ensure_embedding_namespace("model_b")
+        self.assertEqual(store.load_labels().get(str(self.image)), 1)
+
+    def test_wrong_width_embeddings_are_ignored(self) -> None:
+        store = FolderStore(self.folder)
+        store.save_embeddings({self.image: np.ones(512, dtype=np.float32)})
+        self.assertTrue(store.get_cached_embeddings([self.image], 512))
+        # A 768-d model must not be handed a 512-d vector.
+        self.assertFalse(store.get_cached_embeddings([self.image], 768))
+
+    def test_decode_version_and_namespace_coexist_in_cache_meta(self) -> None:
+        store = FolderStore(self.folder)
+        store.ensure_embedding_namespace("model_a")
+        payload = json.loads(store.cache_meta_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload.get("embedding_namespace"), "model_a")
+        self.assertIn("decode_version", payload)
+
+
 def _cleanup() -> None:
     shutil.rmtree(_STATE_DIR, ignore_errors=True)
     root = _SHARED.get("root")

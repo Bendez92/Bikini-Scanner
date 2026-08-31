@@ -441,7 +441,26 @@ class SQLiteCache:
         ).fetchall()
         return {str(row[0]): self._blob_to_array(row[1]) for row in rows}
 
+    def purge(self) -> None:
+        """Empty every table without needing the file to be deletable.
+
+        Deleting the database is the tidier reset, but it only works while nothing else
+        holds the file open - on Windows an open handle in another FolderStore makes the
+        unlink fail, and a cache that was supposed to be discarded would survive with a
+        warning. Emptying the tables first means the discard is real either way.
+        """
+        with self._lock:
+            try:
+                conn = self._connect()
+                with conn:
+                    # Table names are literals from this tuple, never caller input.
+                    for table in ("embeddings", "image_records", "face_counts", "region_embeddings"):
+                        conn.execute(f"DELETE FROM {table}")
+            except sqlite3.Error as exc:
+                LOGGER.warning("Could not empty the cache DB %s: %s", self.db_path, exc)
+
     def clear(self) -> None:
+        self.purge()
         with self._lock:
             try:
                 if self._connection is not None:

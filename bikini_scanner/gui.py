@@ -34,7 +34,7 @@ from tkinter import (
     ttk,
 )
 from tkinter import font as tkfont
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -2580,7 +2580,23 @@ class BikiniScannerApp:
         threading.Thread(target=worker, name="face-model-download", daemon=True).start()
 
     def open_settings_dialog(self) -> None:
-        dialog, form = self._create_modal("Settings", resizable=(False, False))
+        # This form runs to 40-odd grid rows. In a fixed-size window the lower half,
+        # including the Save and Cancel buttons, was simply unreachable on a short
+        # screen, so it lives in the same scrollable frame the other tall modals use.
+        dialog, outer = self._create_modal("Settings", resizable=(False, True))
+        canvas, form, scroll_window = self._modal_scroll_frame(outer)
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(scroll_window, width=event.width))
+
+        def scroll_settings(event: Any) -> None:
+            # Text widgets scroll themselves. Without this the wheel over the prompt
+            # boxes would scroll the dialog out from under the pointer instead.
+            if isinstance(event.widget, Text):
+                return
+            canvas.yview_scroll(-int(event.delta / 120), "units")
+
+        canvas.bind("<MouseWheel>", scroll_settings)
+        canvas.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"))
         palette = self._palette()
 
         backend_var = StringVar(value=self.config.backend)
@@ -3301,6 +3317,17 @@ class BikiniScannerApp:
             insertbackground=palette["fg"],
             highlightbackground=palette["panel"],
             relief="solid",
+        )
+        # Size the viewport to the form, but never past the screen: that cap is what
+        # makes the scrollbar do any work.
+        dialog.update_idletasks()
+        for child in form.winfo_children():
+            child.bind("<MouseWheel>", scroll_settings, add="+")
+            child.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"), add="+")
+            child.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"), add="+")
+        canvas.configure(
+            width=form.winfo_reqwidth(),
+            height=min(form.winfo_reqheight(), max(360, int(dialog.winfo_screenheight() * 0.8))),
         )
         backend_combo.focus_set()
 

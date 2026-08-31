@@ -178,28 +178,36 @@ class FolderStore:
             return contextlib.nullcontext()
         return self._lock.acquire(timeout=timeout)
 
-    def _discard_stale_derived_caches(self) -> None:
-        """Drop cached work that an older build derived from different pixels.
-
-        Everything here is keyed by content hash, which does not change when the way we
-        *decode* an image changes. So when the decoder changes - EXIF orientation being
-        the case that prompted this - a stale entry would be silently reused and the
-        whole folder would keep scoring as though the fix had never landed.
-
-        Labels, per-folder config overrides and the review session are the user's own
-        work and are never touched; only derived artefacts are discarded.
-        """
+    def _read_cache_meta(self) -> dict[str, Any]:
         try:
-            recorded = 0
             if self.cache_meta_path.is_file():
                 payload = json.loads(self.cache_meta_path.read_text(encoding="utf-8"))
                 if isinstance(payload, Mapping):
-                    recorded = int(payload.get("decode_version", 0) or 0)
+                    return dict(payload)
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            recorded = 0
-        if recorded == DECODE_VERSION:
-            return
+            pass
+        return {}
 
+    def _merge_cache_meta(self, **updates: Any) -> None:
+        """Merge keys into cache_meta rather than replacing it.
+
+        More than one thing invalidates derived caches now (the decoder version and the
+        embedding namespace); rewriting the whole file would drop whichever key the
+        other check owns.
+        """
+        meta = self._read_cache_meta()
+        meta.update(updates)
+        try:
+            atomic_write_json(self.cache_meta_path, meta)
+        except OSError as exc:
+            LOGGER.warning("Could not record the cache version in %s: %s", self.cache_meta_path, exc)
+
+    def _discard_derived_caches(self) -> list[str]:
+        """Delete every derived artefact. Returns the names discarded.
+
+        Labels, per-folder config overrides and the review session are the user's own
+        work and are never touched.
+        """
         derived = (
             self.embeddings_path,
             self.index_path,
@@ -224,6 +232,66 @@ class FolderStore:
                     discarded.append(path.name)
             except OSError as exc:
                 LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
+        self._embedding_cache = None
+        self._path_index_cache = None
+        self._face_count_cache = None
+        self._region_cache = None
+        self._vlm_cache = None
+        return discarded
+
+    def ensure_embedding_namespace(self, namespace: str) -> None:
+        """Discard derived caches when the embedding space changes.
+
+        Full-frame embeddings are keyed by content hash alone, which does not change
+        when the *model* does, so switching models silently reused the previous model's
+        vectors while the namespaced region cache correctly recomputed. Region
+        embeddings already carry a namespace; this gives the rest of the cache the same
+        protection.
+
+        A cache with no namespace recorded predates this check. It is labelled rather
+        than discarded, so upgrading does not force a full rescan on everyone; the
+        dimension guard on the read path catches the damaging half of that case.
+        """
+        namespace = str(namespace)
+        recorded = str(self._read_cache_meta().get("embedding_namespace", "") or "")
+        if recorded == namespace:
+            return
+        if recorded:
+            discarded = self._discard_derived_caches()
+            if discarded:
+                LOGGER.info(
+                    "Embedding model changed (%s -> %s); discarded %s in %s so they are rebuilt "
+                    "with the new model. Your labels were kept.",
+                    recorded,
+                    namespace,
+                    ", ".join(sorted(discarded)),
+                    self.cache_dir,
+                )
+        self._merge_cache_meta(embedding_namespace=namespace)
+
+    def _discard_stale_derived_caches(self) -> None:
+        """Drop cached work that an older build derived from different pixels.
+
+        Everything here is keyed by content hash, which does not change when the way we
+        *decode* an image changes. So when the decoder changes - EXIF orientation being
+        the case that prompted this - a stale entry would be silently reused and the
+        whole folder would keep scoring as though the fix had never landed.
+
+        Labels, per-folder config overrides and the review session are the user's own
+        work and are never touched; only derived artefacts are discarded.
+        """
+        try:
+            recorded = 0
+            if self.cache_meta_path.is_file():
+                payload = json.loads(self.cache_meta_path.read_text(encoding="utf-8"))
+                if isinstance(payload, Mapping):
+                    recorded = int(payload.get("decode_version", 0) or 0)
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            recorded = 0
+        if recorded == DECODE_VERSION:
+            return
+
+        discarded = self._discard_derived_caches()
         if discarded:
             LOGGER.info(
                 "Image decoding changed (v%d -> v%d); discarded %s in %s so they are rebuilt "
@@ -233,15 +301,7 @@ class FolderStore:
                 ", ".join(sorted(discarded)),
                 self.cache_dir,
             )
-        self._embedding_cache = None
-        self._path_index_cache = None
-        self._face_count_cache = None
-        self._region_cache = None
-        self._vlm_cache = None
-        try:
-            atomic_write_json(self.cache_meta_path, {"decode_version": DECODE_VERSION})
-        except OSError as exc:
-            LOGGER.warning("Could not record the cache version in %s: %s", self.cache_meta_path, exc)
+        self._merge_cache_meta(decode_version=DECODE_VERSION)
 
     def _load_vlm_cache(self) -> dict[str, dict[str, float]]:
         if self._vlm_cache is None:
@@ -359,13 +419,44 @@ class FolderStore:
             self._face_count_cache = sqlite.load_face_counts()
         return self._face_count_cache
 
-    def get_cached_image_records(self, paths: Iterable[Path]) -> dict[Path, dict[str, object]]:
+    def get_cached_image_records(
+        self, paths: Iterable[Path], embedding_dim: int | None = None
+    ) -> dict[Path, dict[str, object]]:
         sqlite = self.sqlite_cache
         assert sqlite is not None
-        return sqlite.get_cached_image_records(list(paths))
+        records = sqlite.get_cached_image_records(list(paths))
+        if embedding_dim is None:
+            return records
+        # A cached vector of the wrong width belongs to a different model. Dropping it
+        # here means the image is simply re-embedded instead of being scored against a
+        # mismatched embedding space.
+        kept: dict[Path, dict[str, object]] = {}
+        dropped = 0
+        for path, record in records.items():
+            embedding = record.get("embedding")
+            if isinstance(embedding, np.ndarray) and (
+                embedding.ndim != 1 or embedding.shape[0] != int(embedding_dim)
+            ):
+                dropped += 1
+                continue
+            kept[path] = record
+        if dropped:
+            LOGGER.info(
+                "Ignored %d cached embedding(s) in %s that do not match the current model's "
+                "%d-dimensional embedding space.",
+                dropped,
+                self.cache_dir,
+                int(embedding_dim),
+            )
+        return kept
 
-    def get_cached_embeddings(self, paths: Iterable[Path]) -> dict[Path, np.ndarray]:
-        return {path: cast(np.ndarray, record["embedding"]) for path, record in self.get_cached_image_records(paths).items()}
+    def get_cached_embeddings(
+        self, paths: Iterable[Path], embedding_dim: int | None = None
+    ) -> dict[Path, np.ndarray]:
+        return {
+            path: cast(np.ndarray, record["embedding"])
+            for path, record in self.get_cached_image_records(paths, embedding_dim).items()
+        }
 
     def lookup_content_embedding(self, content_hash: str) -> np.ndarray | None:
         sqlite = self.sqlite_cache

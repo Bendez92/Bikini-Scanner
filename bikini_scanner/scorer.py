@@ -776,7 +776,9 @@ class BikiniScorer:
                 # legacy CLIP refine path uses refine_weight (default 0.65); the VLM
                 # adjudication path uses vlm_weight. They are separate knobs now.
                 zero_shot = zero_shot.copy()
-                refine_weight = float(self.config.refine_weight)
+                refine_weight = float(
+                    self.config.vlm_weight if refine.source == "vlm" else self.config.refine_weight
+                )
                 refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
                     (1.0 - refine_weight) * zero_shot[refined_rows] + refine_weight * refine.scores[refined_rows]
@@ -882,6 +884,16 @@ class DeepPassResult:
     deep_scanned: int
     detail_regions: list[str] = field(default_factory=list)
     decoded_images: dict[int, Image.Image] = field(default_factory=dict)
+
+
+def _embedding_namespace(config: ScannerConfig) -> str:
+    """Identity of the embedding space full-frame vectors live in.
+
+    Cached embeddings are only comparable within one model, and the cache key is a
+    content hash that does not change when the model does.
+    """
+    raw = f"{config.backend}-{config.model_name or 'default'}"
+    return re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_").lower()
 
 
 def _region_namespace(config: ScannerConfig) -> str:
@@ -1062,10 +1074,17 @@ def run_deep_pass(
 
 @dataclass(slots=True)
 class RefineResult:
-    """Second-opinion scores, NaN where an image was not re-scored."""
+    """Second-opinion scores, NaN where an image was not re-scored.
+
+    `source` says which pass produced them, because the two are blended with different
+    weights: the legacy CLIP refine pass uses refine_weight, VLM adjudication uses
+    vlm_weight. Without it both paths were indistinguishable at the blend site and
+    vlm_weight was configurable but never read.
+    """
 
     scores: np.ndarray
     minor: np.ndarray
+    source: str = "clip"
 
     def any(self) -> bool:
         return bool(np.isfinite(self.scores).any())
@@ -1214,7 +1233,7 @@ def compute_vlm_scores(
         if result.score.size:
             scores[index] = float(result.score[0])
             minor[index] = bool(result.stage and result.stage[0] == cascade_module.STAGE_MINOR)
-    return RefineResult(scores=scores, minor=minor)
+    return RefineResult(scores=scores, minor=minor, source="vlm")
 
 
 def compute_refine_scores(
@@ -1308,7 +1327,7 @@ def compute_refine_scores(
         if on_progress is not None:
             on_progress(done, len(targets))
 
-    return RefineResult(scores=refine_scores, minor=refine_minor)
+    return RefineResult(scores=refine_scores, minor=refine_minor, source="clip")
 
 
 def bucketed_sampling(
@@ -1465,7 +1484,11 @@ def _scan_and_score_folder_impl(
         LOGGER.warning("Large folder detected: %d images in %s", len(paths), store.folder)
     else:
         LOGGER.info("Starting scan of %d images in %s", len(paths), store.folder)
-    cached_records = store.get_cached_image_records(paths)
+    # Both guards against scoring one model's images with another model's vectors:
+    # the namespace discards a cache built by a different model, and the dimension
+    # filter catches leftovers from before the namespace was recorded.
+    store.ensure_embedding_namespace(_embedding_namespace(scorer.config))
+    cached_records = store.get_cached_image_records(paths, backend.image_embedding_dim)
     content_embeddings: dict[str, np.ndarray] = {}
     content_face_counts: dict[str, int] = {}
     path_records: dict[Path, dict[str, int | str]] = {}
