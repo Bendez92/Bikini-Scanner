@@ -652,12 +652,15 @@ class GuiConcurrency(unittest.TestCase):
         finally:
             threading.Thread = real_thread
         self.assertEqual(len(spawned), 1, "each Retrain click started its own worker")
-        self.assertTrue(self.app._retrain_pending, "the extra clicks should be coalesced, not dropped")
+        self.assertTrue(
+            self.app.scan_controller.retrain_pending,
+            "the extra clicks should be coalesced, not dropped",
+        )
 
     def test_a_second_scan_is_refused_while_one_runs(self) -> None:
         launched: list[bool] = []
+        self.app.update_algorithm()
         self.app._launch_background_scan = lambda full_rescan: launched.append(full_rescan)
-        self.app._scan_active = True
         from tkinter import messagebox
 
         original = messagebox.showinfo
@@ -670,9 +673,13 @@ class GuiConcurrency(unittest.TestCase):
 
     def test_the_cancel_token_is_not_orphaned(self) -> None:
         self.app.update_algorithm()
-        first = self.app._scan_cancel_event
+        first = self.app.scan_controller.cancel_event
         self.app.update_algorithm()
-        self.assertIs(self.app._scan_cancel_event, first, "Stop would no longer reach the running pass")
+        self.assertIs(
+            self.app.scan_controller.cancel_event,
+            first,
+            "Stop would no longer reach the running pass",
+        )
 
 
 class NumericPrimitives(unittest.TestCase):
