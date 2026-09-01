@@ -58,14 +58,13 @@ from .output_ops import (
 )
 from .plugins import apply_plugins
 from .safe_io import atomic_write_json, quarantine_broken_file
+from .scan_controller import ScanCallbacks, ScanController, ScanRequest
 from .scorer import (
     PHASE_EMBED,
     BikiniScorer,
-    ScanCancelled,
     ScanProgress,
     ScoreState,
     bucketed_sampling,
-    scan_and_score_folder,
     state_disagreement,
 )
 from .store import MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES, FolderStore
@@ -190,15 +189,16 @@ class BikiniScannerApp:
         self.store: FolderStore | None = None
         self.backend: ImageEmbeddingBackend | None = None
         self.scorer: BikiniScorer | None = None
-        self._refresh_generation = 0
-        self._scan_start_monotonic: float | None = None
-        self._scan_cancel_event: threading.Event | None = None
         self._backend_preload_started = False
-        self._scan_active = False
-        # Set when a retrain is asked for while one is already running, so labelling a
-        # run of photos quickly produces one retrain at the end rather than a thread per
-        # click, all racing each other over the same scorer and label store.
-        self._retrain_pending = False
+        self.scan_controller = ScanController(
+            dispatch=lambda thunk: self._after(0, thunk),
+            callbacks=ScanCallbacks(
+                progress=self._scan_progress_update,
+                completed=self._scan_completed,
+                failed=self._scan_failed,
+                cancelled=self._scan_cancelled,
+            ),
+        )
         self._closing = False
         self._first_run_guide_shown = bool(self.user_prefs.get("first_run_guide_shown", False))
         try:
@@ -1557,7 +1557,7 @@ class BikiniScannerApp:
                 # Either way the bar must leave indeterminate mode, or a later scan
                 # keeps animating instead of showing real percentages. A scan started
                 # while the model was still loading already owns the bar, so leave it be.
-                if not self._scan_active:
+                if not self.scan_controller.active:
                     self._reset_progress_bar()
                     self._show_progress(False)
                 if loaded:
@@ -1844,7 +1844,12 @@ class BikiniScannerApp:
 
     def _watch_poll(self) -> None:
         self._watch_after_id = None
-        if not self.watch_enabled_var.get() or self.queue_active or self._scan_active or self.current_state is None:
+        if (
+            not self.watch_enabled_var.get()
+            or self.queue_active
+            or self.scan_controller.active
+            or self.current_state is None
+        ):
             self._schedule_watch_poll()
             return
         if self.store is None:
@@ -1863,8 +1868,7 @@ class BikiniScannerApp:
 
     def _on_close(self) -> None:
         self._closing = True
-        if self._scan_cancel_event is not None:
-            self._scan_cancel_event.set()
+        self.scan_controller.cancel()
         self.queue_active = False
         # Every scheduled after() callback must be cancelled before destroy(), or it
         # fires into a half-torn-down interpreter and raises TclError. _watch_after_id
@@ -3521,7 +3525,7 @@ class BikiniScannerApp:
         ).pack(side=RIGHT)
 
     def run_scan(self) -> None:
-        if self._scan_active:
+        if self.scan_controller.active:
             # Two scans of one folder race each other over the same scorer and the same
             # embedding cache, and only the newest could be stopped.
             messagebox.showinfo(
@@ -3575,9 +3579,8 @@ class BikiniScannerApp:
         self._launch_background_scan(full_rescan=True)
 
     def cancel_scan(self) -> None:
-        if not self._scan_active or self._scan_cancel_event is None:
+        if not self.scan_controller.cancel():
             return
-        self._scan_cancel_event.set()
         self.status_var.set("Stopping scan after the current batch...")
         self.stop_scan_button.configure(state="disabled")
 
@@ -3588,12 +3591,12 @@ class BikiniScannerApp:
         if self.current_state is None:
             messagebox.showinfo("Not ready", "Run a scan first.")
             return
-        if self._scan_active:
+        if self.scan_controller.active:
             # Coalesce instead of stacking threads: labelling several photos in a row
             # used to start one rescore per click. They shared one scorer and one label
             # store, and an older one's `forget` pass could drop a label a newer one had
             # just written. One retrain after the current pass gives the same answer.
-            self._retrain_pending = True
+            self.scan_controller.queue_retrain()
             self.status_var.set("Retrain queued — it will run when the current pass finishes.")
             return
         if not self._ensure_scorer():
@@ -3604,21 +3607,17 @@ class BikiniScannerApp:
 
     def _run_pending_retrain(self) -> None:
         """Start the retrain that was asked for while another pass was running."""
-        if not self._retrain_pending or self._scan_active or self.queue_active:
+        if not self.scan_controller.retrain_pending or self.scan_controller.active or self.queue_active:
             return
-        self._retrain_pending = False
+        if not self.scan_controller.claim_retrain():
+            return
         self.update_algorithm()
 
     def _launch_background_scan(self, full_rescan: bool) -> None:
         assert self.store is not None
         assert self.backend is not None
         assert self.scorer is not None
-        generation = self._refresh_generation = self._refresh_generation + 1
         source_state = self.current_state
-        self._scan_start_monotonic = time.monotonic()
-        self._scan_active = True
-        cancel_event = threading.Event()
-        self._scan_cancel_event = cancel_event
         self.stop_scan_button.configure(state="normal")
         self._show_progress(True)
         if full_rescan or source_state is None:
@@ -3638,75 +3637,34 @@ class BikiniScannerApp:
         backend = self.backend
         scorer = self.scorer
         assert store is not None and backend is not None and scorer is not None
-
-        def worker() -> None:
-            def report_progress(progress: ScanProgress) -> None:
-                self._after(0, self._scan_progress_update, progress)
-
-            try:
-                if full_rescan or source_state is None:
-                    state, samples = scan_and_score_folder(
-                        backend,
-                        store,
-                        scorer,
-                        threshold=threshold,
-                        batch_size=batch_size,
-                        cancel_event=cancel_event,
-                        progress_callback=report_progress,
-                    )
-                else:
-                    labels = store.load_labels()
-                    state, samples = scorer.rescore_state(
-                        source_state,
-                        labels,
-                        threshold=threshold,
-                        store=store,
-                        cancel_event=cancel_event,
-                    )
-            except ScanCancelled:
-                self._after(0, lambda token=generation: self._scan_cancelled(token))
-                return
-            except Exception as exc:  # noqa: BLE001
-                self._after(0, lambda error=exc, token=generation: self._scan_failed(error, token))
-                return
-            self._after(
-                0,
-                lambda token=generation, new_state=state, new_samples=samples, is_full=full_rescan: (
-                    self._scan_completed(
-                        token,
-                        new_state,
-                        new_samples,
-                        is_full,
-                    )
-                ),
+        self.scan_controller.start(
+            ScanRequest(
+                store=store,
+                backend=backend,
+                scorer=scorer,
+                threshold=threshold,
+                batch_size=batch_size,
+                full_rescan=full_rescan,
+                source_state=source_state,
             )
+        )
 
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _scan_cancelled(self, generation: int) -> None:
-        if generation != self._refresh_generation:
-            return
-        self._scan_active = False
-        self._scan_cancel_event = None
+    def _scan_cancelled(self) -> None:
         self.stop_scan_button.configure(state="disabled")
         self._reset_progress_bar()
         self._show_progress(False)
         # Stop means stop: a retrain queued behind this pass is dropped, not run.
-        self._retrain_pending = False
+        self.scan_controller.drop_retrain()
         self.status_var.set("Scan stopped. Cached work is available for the next scan.")
         if self.queue_active:
             self.queue_active = False
             self.status_var.set("Scan stopped; queue paused.")
 
-    def _scan_failed(self, exc: Exception, generation: int) -> None:
-        if generation != self._refresh_generation:
-            return
-        self._scan_active = False
-        self._scan_cancel_event = None
+    def _scan_failed(self, exc: Exception) -> None:
         self.stop_scan_button.configure(state="disabled")
         self._reset_progress_bar()
         self._show_progress(False)
-        self._retrain_pending = False
+        self.scan_controller.drop_retrain()
         self.status_var.set("Scan failed.")
         LOGGER.error("Scan failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
         # Map common failures to user-friendly text with a suggested action.
@@ -3741,15 +3699,10 @@ class BikiniScannerApp:
 
     def _scan_completed(
         self,
-        generation: int,
         state: ScoreState,
         samples: list[dict[str, object]],
         full_rescan: bool,
     ) -> None:
-        if generation != self._refresh_generation:
-            return
-        self._scan_active = False
-        self._scan_cancel_event = None
         self.stop_scan_button.configure(state="disabled")
         # Land on a full bar before it goes away, so a fast cached scan does not look
         # like it stopped halfway.
@@ -3832,7 +3785,7 @@ class BikiniScannerApp:
                 self._after(0, self._start_next_queue_item)
             else:
                 self._after(0, self._finish_queue)
-        elif self._retrain_pending:
+        elif self.scan_controller.retrain_pending:
             # Labels arrived while this pass was running; fold them in now.
             self._after(0, self._run_pending_retrain)
 
