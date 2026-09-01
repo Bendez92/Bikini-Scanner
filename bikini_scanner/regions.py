@@ -154,6 +154,22 @@ def crop_regions(image: Image.Image, regions: Sequence[ImageRegion]) -> list[tup
     return crops
 
 
+def region_subject(key: str) -> int:
+    """Which detected face a region belongs to, or -1 when it is not face-anchored.
+
+    Face-anchored keys carry the face's rank as a suffix (`face0`, `chest0`, `waist0`,
+    `torso0`), so every crop derived from one person shares an index. The age gate needs
+    that link: "is a minor in this photo?" and "is the subject of this swimwear a minor?"
+    are different questions, and only the second one should decide whether an image is
+    surfaced. The fallback bands and the full frame belong to nobody and return -1.
+    """
+    for prefix in ("face", "chest", "waist", "torso"):
+        if key.startswith(prefix):
+            suffix = key[len(prefix) :]
+            return int(suffix) if suffix.isdigit() else -1
+    return -1
+
+
 def region_kind(key: str) -> str:
     """Recover a region's kind from its key, for scoring rules that depend on it.
 

@@ -43,7 +43,13 @@ MODEL_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4
 MODEL_APPROX_BYTES = 232589
 
 DETECT_MAX_SIDE = 640
-_SCORE_THRESHOLD = 0.7
+# YuNet confidence needed to accept a face. Deliberately low. A missed face is far more
+# costly than a spurious one now that the age gate reasons per subject: an undetected
+# person's body becomes unattributed evidence, and a photo whose only *detected* faces
+# are children is excluded outright - which is exactly what happened to adults looking
+# down or away at 0.7. A spurious box, by contrast, yields a face crop with no age
+# signal either way, which the gate simply does not act on.
+_SCORE_THRESHOLD = 0.3
 _MIN_FACE_PX = 16
 
 _LOCK = threading.Lock()

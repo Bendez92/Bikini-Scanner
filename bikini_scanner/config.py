@@ -17,9 +17,10 @@ DEFAULT_DEVICE = "auto"
 DEFAULT_PRECISION = "auto"
 DEFAULT_BIKINI_POSITIVE_PROMPTS = [
     "a person wearing a bikini",
-    "a woman in a bikini top and bikini bottom",
+    "a woman in a bikini top or bikini bottom",
     "a person with a bare midriff and exposed stomach",
     "a person in swimwear at the beach or pool",
+    "cleavage",
 ]
 DEFAULT_BIKINI_NEGATIVE_PROMPTS = [
     "a fully clothed person",
@@ -27,10 +28,8 @@ DEFAULT_BIKINI_NEGATIVE_PROMPTS = [
     "a photo of food",
     "an indoor scene with no people",
     "a close-up of an object",
-    "lingerie and intimate apparel",
-    "underwear and bra and panties",
-    "a sports bra and athletic wear",
     "a man in swim trunks",
+    "text-only photos",
 ]
 # Compatibility aliases for callers that imported the original names.
 DEFAULT_POSITIVE_PROMPTS = DEFAULT_BIKINI_POSITIVE_PROMPTS

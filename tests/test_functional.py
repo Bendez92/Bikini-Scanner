@@ -363,6 +363,79 @@ class AgeGate(unittest.TestCase):
         mask = scorer.visibility_mask(result.axis_scores, None, result.excluded)
         self.assertFalse(mask.any())
 
+    # --- per-subject gating ------------------------------------------------
+    # A photo of an adult in swimwear standing beside her children used to be excluded
+    # outright: the age axes read the whole frame, the frame contained children, and the
+    # score was forced to zero at any threshold. These cover the subject-attributed gate
+    # that replaced that behaviour when face-anchored crops are available.
+
+    def _subject_table(self, people: list[tuple[float, float, float]]) -> cascade.RegionScoreTable:
+        """One image, one face+chest row pair per (child, adult, detail) person."""
+        owner: list[int] = [0]
+        kinds: list[str] = ["full"]
+        subject: list[int] = [-1]
+        child: list[float] = [0.9]  # the whole frame reads "child", as a group photo does
+        adult: list[float] = [0.1]
+        detail: list[float] = [0.5]
+        for index, (person_child, person_adult, person_detail) in enumerate(people):
+            owner += [0, 0]
+            kinds += ["face", "chest"]
+            subject += [index, index]
+            child += [person_child, 0.5]
+            adult += [person_adult, 0.5]
+            detail += [0.5, person_detail]
+        axis = {name: np.asarray(detail, dtype=np.float32) for name in cascade.DETAIL_AXES}
+        axis["child"] = np.asarray(child, dtype=np.float32)
+        axis["adult"] = np.asarray(adult, dtype=np.float32)
+        axis["person"] = np.full(len(owner), 0.9, dtype=np.float32)
+        axis["female"] = np.full(len(owner), 0.9, dtype=np.float32)
+        axis["nsfw"] = np.full(len(owner), 0.5, dtype=np.float32)
+        return cascade.RegionScoreTable(
+            owner=np.asarray(owner, dtype=np.int64),
+            kinds=np.array(kinds, dtype=object),
+            axis_scores=axis,
+            image_count=1,
+            full_row=np.zeros((1,), dtype=np.int64),
+            subject=np.asarray(subject, dtype=np.int64),
+        )
+
+    def test_adult_beside_children_is_scored_not_excluded(self) -> None:
+        """The regression this whole mechanism exists for."""
+        table = self._subject_table([(0.05, 0.95, 0.99), (0.99, 0.05, 0.6), (0.95, 0.05, 0.6)])
+        result = cascade.evaluate(table, self.config)
+        self.assertFalse(result.excluded.any())
+        self.assertGreater(float(result.score[0]), 0.0)
+
+    def test_only_the_adults_crops_contribute_to_the_score(self) -> None:
+        """A suppressed minor's body must not raise the score, even when it scores high."""
+        weak_adult = self._subject_table([(0.05, 0.95, 0.30), (0.99, 0.05, 0.99)])
+        strong_adult = self._subject_table([(0.05, 0.95, 0.99), (0.99, 0.05, 0.99)])
+        self.assertLess(
+            float(cascade.evaluate(weak_adult, self.config).score[0]),
+            float(cascade.evaluate(strong_adult, self.config).score[0]),
+        )
+
+    def test_every_subject_a_minor_is_still_excluded(self) -> None:
+        table = self._subject_table([(0.99, 0.05, 0.99), (0.95, 0.05, 0.9)])
+        result = cascade.evaluate(table, self.config)
+        self.assertTrue(result.excluded.all())
+        self.assertEqual(result.stage[0], cascade.STAGE_MINOR)
+        np.testing.assert_allclose(result.score, 0.0)
+
+    def test_a_minors_crops_cannot_win_the_detail_slot(self) -> None:
+        table = self._subject_table([(0.05, 0.95, 0.4), (0.99, 0.05, 0.99)])
+        subjects = cascade.analyse_subjects(table, self.config)
+        assert subjects is not None
+        # Rows 3 and 4 are the minor's face and chest.
+        self.assertTrue(subjects.row_minor[3] and subjects.row_minor[4])
+        self.assertFalse(subjects.row_minor[1] or subjects.row_minor[2])
+
+    def test_images_without_faces_keep_the_whole_frame_gate(self) -> None:
+        """No attribution means no change in behaviour: the old rules still apply."""
+        self.assertIsNone(cascade.analyse_subjects(self._table(child=0.99, adult=0.5, detail=0.9), self.config))
+        result = cascade.evaluate(self._table(child=0.99, adult=0.5, detail=0.99), self.config)
+        self.assertTrue(result.excluded.all())
+
     def test_the_gate_is_reachable_from_the_settings_dialog(self) -> None:
         """The toggle exists in code; it also has to be visible and clickable.
 

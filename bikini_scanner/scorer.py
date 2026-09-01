@@ -39,6 +39,7 @@ from .regions import (
     crop_regions,
     plan_regions,
     region_kind,
+    region_subject,
 )
 from .safe_io import resolved_str
 from .store import FolderStore, collect_image_paths, safe_stat
@@ -579,6 +580,7 @@ class BikiniScorer:
             axis_scores=self.axis_zero_shot_scores(embeddings),
             image_count=count,
             full_row=rows,
+            subject=np.full((count,), -1, dtype=np.int64),
         )
 
     def build_region_table(
@@ -602,6 +604,7 @@ class BikiniScorer:
             axis_scores=self.axis_zero_shot_scores(row_embeddings),
             image_count=int(image_count),
             full_row=full_row,
+            subject=np.array([region_subject(key) for key in region_keys], dtype=np.int64),
         )
 
     def build_features(
@@ -1110,11 +1113,18 @@ def run_deep_pass(
     # learned model should train on. Each row only votes on the axes its position allows,
     # so a bottom-of-frame band cannot win the slot by "detecting cleavage".
     row_detail = cascade_module.combine_detail_rows(table.axis_scores, scorer.config.detail_weights, list(table.kinds))
+    # A crop belonging to someone the age gate reads as a minor is never eligible for
+    # this slot, whatever it scores. Otherwise a photo that surfaces on an adult's
+    # evidence could still be represented by - and train the learned model on - a
+    # child's crop.
+    subjects = cascade_module.analyse_subjects(table, scorer.config)
+    blocked_rows = subjects.row_minor if subjects is not None else np.zeros(matrix.shape[0], dtype=bool)
     if row_detail.size == matrix.shape[0]:
         for index, rows in detail_rows.items():
-            if not rows:
+            eligible = [row for row in rows if not blocked_rows[row]]
+            if not eligible:
                 continue
-            best_row = max(rows, key=lambda row: float(row_detail[row]))
+            best_row = max(eligible, key=lambda row: float(row_detail[row]))
             if float(row_detail[best_row]) > float(row_detail[index]):
                 detail_embeddings[index] = matrix[best_row]
                 detail_regions[index] = region_keys[best_row]

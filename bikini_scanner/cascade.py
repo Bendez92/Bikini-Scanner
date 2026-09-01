@@ -69,6 +69,10 @@ AXIS_REGION_KINDS: dict[str, frozenset[str]] = {
 
 DETAIL_AXES = ("bikini", "cleavage", "midriff", "bikini_top", "bikini_bottom")
 
+# The crops that show one detected person's body. Their age comes from their face
+# crop; these are what their swimwear evidence is read from.
+SUBJECT_BODY_KINDS = frozenset({KIND_CHEST, KIND_WAIST, KIND_TORSO})
+
 # How much of an unanchored band's excess over the full frame counts. A face-anchored
 # chest crop is where the geometry says it is and gets a full vote; a band is a guess,
 # and taking a plain max over four guesses inflates every image. Measured on a real
@@ -114,9 +118,19 @@ class RegionScoreTable:
     axis_scores: dict[str, np.ndarray]
     image_count: int
     full_row: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.int64))
+    # Which detected person each row belongs to (-1 for the full frame and the
+    # unanchored bands). Empty for tables built before subjects existed, which
+    # `subject_ids` reads as "nothing is attributed".
+    subject: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.int64))
     _axis_masks: dict[str, tuple[np.ndarray, np.ndarray]] | None = field(
         init=False, default=None, repr=False
     )
+
+    def subject_ids(self) -> np.ndarray:
+        """Per-row subject index, or all -1 when this table has no attribution."""
+        if self.subject.size == self.owner.size:
+            return np.asarray(self.subject, dtype=np.int64)
+        return np.full((self.owner.size,), -1, dtype=np.int64)
 
     def _ensure_masks(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         if self._axis_masks is None:
@@ -138,25 +152,51 @@ class RegionScoreTable:
                 )
         return self._axis_masks
 
-    def aggregate(self, axis: str) -> np.ndarray:
+    def aggregate(
+        self,
+        axis: str,
+        row_filter: np.ndarray | None = None,
+        full_allowed: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Best evidence for one axis per image, over that axis's eligible regions.
 
         Anchored crops win outright when they beat the full frame. Unanchored bands only
         get `UNANCHORED_CROP_SHARE` of the distance they claim above the full frame, so a
         single lucky slice of a photo can nudge the score without deciding it.
+
+        `row_filter` drops individual rows from consideration and `full_allowed` drops
+        the full-frame row for individual images. Both exist for the age gate: once a
+        detected person reads as a minor, none of their crops — and not the whole frame
+        that contains them — may contribute evidence to the image's score.
         """
         scores = self.axis_scores.get(axis)
         if scores is None or self.image_count == 0:
             return np.zeros((self.image_count,), dtype=np.float32)
-        # Always seed with the full-frame score so every image has a value even when no
-        # eligible crop exists.
-        full: np.ndarray = np.zeros((self.image_count,), dtype=np.float32)
+        # Seed with the full-frame score so every image has a value even when no
+        # eligible crop exists. 0.5 is the sigmoid's neutral point, so an image whose
+        # full frame is suppressed starts from "no evidence" rather than from evidence
+        # against.
+        full: np.ndarray = np.full((self.image_count,), 0.5, dtype=np.float32)
         if self.full_row.size:
             full[:] = scores[self.full_row]
+        if full_allowed is not None:
+            full = np.where(np.asarray(full_allowed, dtype=bool), full, 0.5).astype(np.float32)
         if AXIS_REGION_KINDS.get(axis) is None:
             return full.astype(np.float32)
 
         anchored_mask, unanchored_mask = self._ensure_masks()[axis]
+        if row_filter is not None:
+            keep = np.asarray(row_filter, dtype=bool)
+            anchored_mask = anchored_mask & keep
+            unanchored_mask = unanchored_mask & keep
+        if full_allowed is not None:
+            # Several axes list KIND_FULL among their eligible kinds, so the full-frame
+            # row also travels the anchored path. Suppressing it in the seed above is
+            # not enough - it has to be dropped as a row too, or it comes straight back.
+            allowed = np.asarray(full_allowed, dtype=bool)
+            suppressed_full = (np.asarray(self.kinds) == KIND_FULL) & ~allowed[self.owner]
+            anchored_mask = anchored_mask & ~suppressed_full
+            unanchored_mask = unanchored_mask & ~suppressed_full
         anchored = full.copy()
         unanchored = full.copy()
         if anchored_mask.any():
@@ -250,6 +290,137 @@ def combine_detail_rows(
     return combine_detail(masked, weights)
 
 
+@dataclass(slots=True)
+class SubjectAnalysis:
+    """Who is in an image, which of them read as minors, and what that suppresses.
+
+    The age gate used to ask "does this photo contain a minor?", scored on the whole
+    frame. That is the wrong question for an ordinary family photo: an adult in swimwear
+    standing next to her children was hard-excluded because the frame, taken as a whole,
+    read as "children". The evidence for the match sat on her chest crop; the evidence
+    that binned it came from two toddlers three feet away.
+
+    With face-anchored crops the right question is answerable. Every crop derived from
+    one detected face shares a subject index, so each person's age can be read from
+    their own face and each person's swimwear evidence from their own body. Then:
+
+      * a subject who reads as a minor contributes nothing - none of their crops may
+        score, and the full frame is suppressed too, because it contains them;
+      * an image where *every* detected person reads as a minor is excluded outright;
+      * an image with at least one adult subject is scored from the adult subjects
+        alone, so a photo only surfaces on the strength of an adult's own crops.
+
+    This is strictly narrower than the old whole-frame rule in what it lets through: a
+    minor's body can no longer contribute to any score, where previously a minor's crop
+    could win the detail slot outright on an image the whole-frame gate happened to
+    clear. It is wider only in that other people's ages no longer condemn the subject.
+
+    Images with no detected faces have no subjects and are not covered here at all -
+    they keep the whole-frame gate unchanged, because without attribution there is no
+    honest way to tell whose body the evidence belongs to.
+    """
+
+    row_minor: np.ndarray  # per row: belongs to a subject that reads as a minor
+    full_allowed: np.ndarray  # per image: may the full frame still contribute evidence
+    has_subjects: np.ndarray  # per image: at least one face-anchored subject exists
+    all_minor: np.ndarray  # per image: every detected subject reads as a minor
+    subject_child: np.ndarray  # (image, subject) child evidence, from face crops
+    subject_adult: np.ndarray  # (image, subject) adult evidence, from face crops
+    subject_detail: np.ndarray  # (image, subject) detail evidence, from body crops
+    subject_minor: np.ndarray  # (image, subject) minor verdict
+    subject_present: np.ndarray  # (image, subject) this subject exists in this image
+
+
+def analyse_subjects(table: RegionScoreTable, config: ScannerConfig) -> SubjectAnalysis | None:
+    """Per-person age and detail evidence. None when no image has attributed crops."""
+    count = table.image_count
+    subject = table.subject_ids()
+    if count == 0 or subject.size == 0 or int(subject.max(initial=-1)) < 0:
+        return None
+
+    owner = np.asarray(table.owner, dtype=np.int64)
+    kinds = np.asarray(table.kinds)
+    slots = int(subject.max()) + 1
+    shape = (count, slots)
+    attributed = subject >= 0
+    face_rows = attributed & (kinds == KIND_FACE)
+    body_rows = attributed & np.isin(kinds, list(SUBJECT_BODY_KINDS))
+
+    present: np.ndarray = np.zeros(shape, dtype=bool)
+    present[owner[attributed], subject[attributed]] = True
+    has_face: np.ndarray = np.zeros(shape, dtype=bool)
+    has_face[owner[face_rows], subject[face_rows]] = True
+
+    def _best(rows: np.ndarray, axis: str) -> np.ndarray:
+        """Strongest raw score for one axis over the given rows, per (image, subject)."""
+        # 0.5 is the sigmoid's neutral point: a subject with no eligible crop for this
+        # axis must read as "no evidence", not as evidence against.
+        out: np.ndarray = np.full(shape, 0.5, dtype=np.float32)
+        scores = table.axis_scores.get(axis)
+        if scores is not None and rows.any():
+            np.maximum.at(out, (owner[rows], subject[rows]), np.asarray(scores, dtype=np.float32)[rows])
+        return out
+
+    child = evidence(_best(face_rows, "child"))
+    adult = evidence(_best(face_rows, "adult"))
+    detail = combine_detail(
+        {axis: _best(body_rows, axis).reshape(-1) for axis in DETAIL_AXES if axis in table.axis_scores},
+        config.detail_weights,
+        strongest_weight=float(config.detail_strongest_weight),
+        average_weight=float(config.detail_average_weight),
+    )
+    detail = (
+        detail.reshape(shape) if detail.size == count * slots else np.zeros(shape, dtype=np.float32)
+    )
+
+    if config.exclude_minors:
+        threshold = float(config.minor_threshold)
+        # The same four tests the whole-frame gate applies, but read off one person's own
+        # face crop. All four are the face-anchored variants: a subject only exists here
+        # because a face was detected for them.
+        looks_minor = (child >= threshold) & (child > adult + float(config.child_adult_margin))
+        strongly_minor = child >= float(config.strongly_minor_threshold)
+        reads_younger = (child > adult + float(config.face_anchored_margin)) & (child >= threshold * 0.4)
+        # `weak_adult` - "strong swimwear evidence but no positive adult evidence" - is
+        # deliberately NOT applied per subject, though it still guards the whole-frame
+        # path in `evaluate`. There it is the only thing standing between an unaged
+        # subject and a match. Here the three tests above already read a real face crop,
+        # and requiring positive adult evidence on top of them excluded adults whose
+        # face is simply turned away or shadowed: the crop yields neither child nor
+        # adult evidence, and "no signal" was being treated as "minor".
+        #
+        # The trade-off is real: a subject whose face reads ambiguously now passes on
+        # the absence of child evidence rather than on the presence of adult evidence.
+        # The three tests that remain all fire on positive child evidence, so a subject
+        # who reads even slightly young is still suppressed.
+        minor = has_face & (looks_minor | strongly_minor | reads_younger)
+    else:
+        minor = np.zeros(shape, dtype=bool)
+    minor &= present
+
+    has_subjects = present.any(axis=1)
+    any_minor = minor.any(axis=1)
+    all_minor = has_subjects & ~(present & ~minor).any(axis=1)
+
+    row_minor: np.ndarray = np.zeros(owner.size, dtype=bool)
+    row_minor[attributed] = minor[owner[attributed], subject[attributed]]
+    # The full frame contains everyone, so it stops being usable evidence the moment any
+    # subject in it reads as a minor. Images with no minor keep it.
+    full_allowed = ~(has_subjects & any_minor)
+
+    return SubjectAnalysis(
+        row_minor=row_minor,
+        full_allowed=full_allowed,
+        has_subjects=has_subjects,
+        all_minor=all_minor,
+        subject_child=child,
+        subject_adult=adult,
+        subject_detail=detail,
+        subject_minor=minor,
+        subject_present=present,
+    )
+
+
 def evaluate(
     table: RegionScoreTable,
     config: ScannerConfig,
@@ -268,7 +439,18 @@ def evaluate(
             axis_scores={},
         )
 
-    aggregated = {axis: table.aggregate(axis) for axis in table.axis_scores}
+    # Per-person age reading, when face-anchored crops exist. Everything downstream is
+    # then computed with minors' crops (and the frame that contains them) suppressed, so
+    # no part of the score can be traced back to a minor's body.
+    subjects = analyse_subjects(table, config)
+    if subjects is None:
+        aggregated = {axis: table.aggregate(axis) for axis in table.axis_scores}
+    else:
+        keep_rows = ~subjects.row_minor
+        aggregated = {
+            axis: table.aggregate(axis, row_filter=keep_rows, full_allowed=subjects.full_allowed)
+            for axis in table.axis_scores
+        }
     # Every gate compares *evidence*, not the raw sigmoid: a raw 0.5 means the axis saw
     # nothing either way, so thresholds applied to raw scores would fire on every image.
     person = evidence(aggregated.get("person", np.full((count,), 0.5, dtype=np.float32)))
@@ -322,6 +504,12 @@ def evaluate(
         age_fail = looks_minor | strongly_minor | reads_younger | weak_adult
     else:
         age_fail = np.zeros((count,), dtype=bool)
+
+    if subjects is not None:
+        # Where people were actually detected, their own faces decide. The whole-frame
+        # tests above only still apply to images with no attributed subject, because for
+        # those there is nothing to attribute the evidence to.
+        age_fail = np.where(subjects.has_subjects, subjects.all_minor, age_fail)
 
     if config.require_person:
         person_conf = _ramp(person, float(config.person_gate_threshold), float(config.person_gate_threshold) + 0.2)
