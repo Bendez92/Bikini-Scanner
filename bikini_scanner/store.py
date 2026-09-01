@@ -233,6 +233,9 @@ class FolderStore:
                     discarded.append(path.name)
             except OSError as exc:
                 LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
+        if self.sqlite_cache is not None:
+            # Recreate the schema after Unix permits unlinking the open database.
+            self.sqlite_cache = SQLiteCache(self.cache_db_path)
         self._embedding_cache = None
         self._path_index_cache = None
         self._face_count_cache = None
