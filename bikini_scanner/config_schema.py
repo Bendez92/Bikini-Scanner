@@ -217,13 +217,24 @@ def _label(key: str) -> str:
 
 
 def coerce_float(key: str, value: object, default: float) -> float:
-    """Parse a persisted float, clamping it into the spec range."""
+    """Parse a float setting, rejecting values the rest of the app cannot cope with.
+
+    The Settings dialog range-checks every one of these, but from_mapping is the funnel
+    for input the dialog never sees - imported settings files, saved profiles and
+    per-folder overrides. Without the same bounds here a hand-edited or corrupted file
+    could set a NaN threshold (nothing ever matches, silently), a zero prompt scale
+    (every axis flattens to "no opinion"), or a zero minor_threshold (the age gate
+    excludes nearly everything) with no indication anything was wrong.
+    """
     spec = _spec(key, "float")
     if value is None:
         return default
+    if not isinstance(value, (int, float, str)):
+        LOGGER.warning("Ignoring invalid setting %r; using %r", value, default)
+        return default
     try:
-        parsed = float(value)  # type: ignore[arg-type]
-    except Exception:  # noqa: BLE001
+        parsed = float(value)
+    except ValueError:
         LOGGER.warning("Ignoring invalid setting %r; using %r", value, default)
         return default
     if not math.isfinite(parsed):
@@ -244,9 +255,12 @@ def coerce_int(key: str, value: object, default: int) -> int:
     spec = _spec(key, "int")
     if value is None:
         return default
+    if not isinstance(value, (int, float, str)):
+        LOGGER.warning("Ignoring invalid setting %r; using %r", value, default)
+        return default
     try:
-        parsed = int(value)  # type: ignore[call-overload]
-    except Exception:  # noqa: BLE001
+        parsed = int(value)
+    except (ValueError, OverflowError):
         LOGGER.warning("Ignoring invalid setting %r; using %r", value, default)
         return default
     below = spec.minimum is not None and parsed < spec.minimum
