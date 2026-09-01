@@ -44,6 +44,7 @@ from .__version__ import __version__
 from .backend_utils import ImageEmbeddingBackend
 from .config import HIGH_ACCURACY_MODEL, ScannerConfig, filter_folder_override
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
+from .config_schema import FieldError, parse_choice_entry, parse_float_entry, parse_int_entry
 from .global_store import GlobalLearningStore
 from .image_formats import open_oriented, oriented_size
 from .logging_setup import configure_logging, log_path, read_log_tail
@@ -3045,12 +3046,9 @@ class BikiniScannerApp:
                 messagebox.showerror("Invalid settings", "Model name cannot be empty.", parent=dialog)
                 return
             try:
-                batch_size = int(batch_var.get().strip())
-            except Exception:  # noqa: BLE001
-                messagebox.showerror("Invalid settings", "Batch size must be a positive integer.", parent=dialog)
-                return
-            if batch_size < 1:
-                messagebox.showerror("Invalid settings", "Batch size must be a positive integer.", parent=dialog)
+                batch_size = parse_int_entry("batch_size", batch_var.get())
+            except FieldError as exc:
+                messagebox.showerror("Invalid settings", str(exc), parent=dialog)
                 return
             try:
                 thumbnail_cache_size = int(thumbnail_cache_var.get().strip())
@@ -3065,34 +3063,17 @@ class BikiniScannerApp:
                 )
                 return
             try:
-                zero_shot_scale = float(scale_var.get().strip())
-                classifier_weight = float(classifier_weight_var.get().strip())
-                zero_shot_weight = float(zero_shot_weight_var.get().strip())
-                threshold = float(threshold_var.get().strip())
-                nsfw_threshold = float(nsfw_threshold_var.get().strip())
-                person_threshold = float(person_threshold_var.get().strip())
-                vlm_concurrency = int(vlm_concurrency_var.get().strip())
-                vlm_band = float(vlm_band_var.get().strip())
-                vlm_max_images = int(vlm_max_images_var.get().strip())
-            except Exception:  # noqa: BLE001
-                messagebox.showerror(
-                    "Invalid settings",
-                    "Scale, weights, thresholds, and person/NSFW values must be numeric.",
-                    parent=dialog,
-                )
-                return
-            if not 1 <= vlm_concurrency <= 64:
-                messagebox.showerror("Invalid settings", "VLM concurrency must be from 1 to 64.", parent=dialog)
-                return
-            if not 0.0 <= vlm_band <= 1.0:
-                messagebox.showerror("Invalid settings", "VLM band must be between 0 and 1.", parent=dialog)
-                return
-            if not 0 <= vlm_max_images <= 1_000_000:
-                messagebox.showerror(
-                    "Invalid settings",
-                    "VLM maximum images must be from 0 to 1,000,000.",
-                    parent=dialog,
-                )
+                zero_shot_scale = parse_float_entry("zero_shot_scale", scale_var.get())
+                classifier_weight = parse_float_entry("classifier_weight", classifier_weight_var.get())
+                zero_shot_weight = parse_float_entry("zero_shot_weight", zero_shot_weight_var.get())
+                threshold = parse_float_entry("threshold", threshold_var.get())
+                nsfw_threshold = parse_float_entry("nsfw_threshold", nsfw_threshold_var.get())
+                person_threshold = parse_float_entry("person_threshold", person_threshold_var.get())
+                vlm_concurrency = parse_int_entry("vlm_concurrency", vlm_concurrency_var.get())
+                vlm_band = parse_float_entry("vlm_band", vlm_band_var.get())
+                vlm_max_images = parse_int_entry("vlm_max_images", vlm_max_images_var.get())
+            except FieldError as exc:
+                messagebox.showerror("Invalid settings", str(exc), parent=dialog)
                 return
             vlm_base_url = vlm_base_url_var.get().strip()
             vlm_model = vlm_model_var.get().strip()
@@ -3118,53 +3099,19 @@ class BikiniScannerApp:
                 )
             ):
                 return
-            if zero_shot_scale <= 0:
-                messagebox.showerror("Invalid settings", "Zero-shot scale must be positive.", parent=dialog)
-                return
-            if classifier_weight < 0 or zero_shot_weight < 0:
-                messagebox.showerror("Invalid settings", "Blend weights must be non-negative.", parent=dialog)
-                return
-            if not (0.0 <= threshold <= 1.0):
-                messagebox.showerror("Invalid settings", "Threshold must be between 0 and 1.", parent=dialog)
-                return
-            if not (0.0 <= nsfw_threshold <= 1.0):
-                messagebox.showerror("Invalid settings", "NSFW threshold must be between 0 and 1.", parent=dialog)
-                return
-            if not (0.0 <= person_threshold <= 1.0):
-                messagebox.showerror("Invalid settings", "Person threshold must be between 0 and 1.", parent=dialog)
+            try:
+                minor_threshold = parse_float_entry("minor_threshold", minor_threshold_var.get())
+                female_threshold = parse_float_entry("female_threshold", female_threshold_var.get())
+            except FieldError as exc:
+                messagebox.showerror("Invalid settings", str(exc), parent=dialog)
                 return
             try:
-                minor_threshold = float(minor_threshold_var.get().strip())
-                female_threshold = float(female_threshold_var.get().strip())
-            except Exception:  # noqa: BLE001
-                messagebox.showerror("Invalid settings", "Minor and female cut-offs must be numeric.", parent=dialog)
-                return
-            if not (0.0 < minor_threshold <= 1.0):
-                messagebox.showerror(
-                    "Invalid settings",
-                    "Minor sensitivity must be above 0 and at most 1. Lower is stricter; to turn the age gate "
-                    "off entirely, clear the 'Exclude images that may show a minor' checkbox.",
-                    parent=dialog,
-                )
-                return
-            if not (0.0 <= female_threshold <= 1.0):
-                messagebox.showerror("Invalid settings", "Female cut-off must be between 0 and 1.", parent=dialog)
-                return
-            deep_scan = deep_scan_var.get().strip()
-            if deep_scan not in {"candidates", "always", "off"}:
-                messagebox.showerror("Invalid settings", "Deep scan must be candidates, always, or off.", parent=dialog)
-                return
-            nsfw_mode = nsfw_mode_var.get().strip()
-            if nsfw_mode not in {"include", "exclude", "only"}:
-                messagebox.showerror("Invalid settings", "NSFW mode must be include, exclude, or only.", parent=dialog)
-                return
-            device = device_var.get().strip()
-            if device not in {"auto", "cpu", "cuda"}:
-                messagebox.showerror("Invalid settings", "Device must be auto, cpu, or cuda.", parent=dialog)
-                return
-            precision = precision_var.get().strip()
-            if precision not in {"auto", "fp32", "fp16"}:
-                messagebox.showerror("Invalid settings", "Precision must be auto, fp32, or fp16.", parent=dialog)
+                deep_scan = parse_choice_entry("deep_scan", deep_scan_var.get())
+                nsfw_mode = parse_choice_entry("nsfw_filter", nsfw_mode_var.get())
+                device = parse_choice_entry("device", device_var.get())
+                precision = parse_choice_entry("precision", precision_var.get())
+            except FieldError as exc:
+                messagebox.showerror("Invalid settings", str(exc), parent=dialog)
                 return
 
             backend_changed = backend != self.config.backend or model_name != self.config.model_name

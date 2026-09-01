@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+from .config_schema import (
+    FIELD_SPECS,
+    coerce_choice,
+    coerce_float,
+    coerce_int,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -195,8 +201,8 @@ class ScannerConfig:
             return config
         config.backend = _coerce_str(mapping.get("backend"), config.backend)
         config.model_name = _coerce_str(mapping.get("model_name"), config.model_name)
-        config.device = _coerce_choice(mapping.get("device"), config.device, {"auto", "cpu", "cuda"})
-        config.precision = _coerce_choice(mapping.get("precision"), config.precision, {"auto", "fp32", "fp16"})
+        config.device = coerce_choice("device", mapping.get("device"), config.device)
+        config.precision = coerce_choice("precision", mapping.get("precision"), config.precision)
         config.quantize_cpu = _coerce_bool(mapping.get("quantize_cpu"), config.quantize_cpu)
         config.preload_backend = _coerce_bool(mapping.get("preload_backend"), config.preload_backend)
         config.positive_prompts = _coerce_list(mapping.get("positive_prompts"), config.positive_prompts)
@@ -218,71 +224,78 @@ class ScannerConfig:
                     )
             if parsed_axes:
                 config.axis_prompts.update(parsed_axes)
-        # Bounds mirror the Settings dialog's validation, which this path bypasses.
-        config.batch_size = _coerce_int(mapping.get("batch_size"), config.batch_size, minimum=1, maximum=1024)
-        config.threshold = _coerce_float(mapping.get("threshold"), config.threshold, 0.0, 1.0)
-        config.zero_shot_scale = _coerce_float(mapping.get("zero_shot_scale"), config.zero_shot_scale, 0.01, 1000.0)
-        config.classifier_weight = _coerce_float(mapping.get("classifier_weight"), config.classifier_weight, 0.0, 100.0)
-        config.zero_shot_weight = _coerce_float(mapping.get("zero_shot_weight"), config.zero_shot_weight, 0.0, 100.0)
-        config.nsfw_filter = _coerce_choice(
-            mapping.get("nsfw_filter"), config.nsfw_filter, {"include", "exclude", "only"}
+        config.batch_size = coerce_int("batch_size", mapping.get("batch_size"), config.batch_size)
+        config.threshold = coerce_float("threshold", mapping.get("threshold"), config.threshold)
+        config.zero_shot_scale = coerce_float("zero_shot_scale", mapping.get("zero_shot_scale"), config.zero_shot_scale)
+        config.classifier_weight = coerce_float(
+            "classifier_weight", mapping.get("classifier_weight"), config.classifier_weight
         )
-        config.nsfw_threshold = _coerce_float(mapping.get("nsfw_threshold"), config.nsfw_threshold, 0.0, 1.0)
+        config.zero_shot_weight = coerce_float(
+            "zero_shot_weight", mapping.get("zero_shot_weight"), config.zero_shot_weight
+        )
+        config.nsfw_filter = coerce_choice("nsfw_filter", mapping.get("nsfw_filter"), config.nsfw_filter)
+        config.nsfw_threshold = coerce_float("nsfw_threshold", mapping.get("nsfw_threshold"), config.nsfw_threshold)
         config.require_person = _coerce_bool(mapping.get("require_person"), config.require_person)
-        config.person_threshold = _coerce_float(mapping.get("person_threshold"), config.person_threshold, 0.0, 1.0)
+        config.person_threshold = coerce_float(
+            "person_threshold", mapping.get("person_threshold"), config.person_threshold
+        )
         config.enable_face_detection = _coerce_bool(mapping.get("enable_face_detection"), config.enable_face_detection)
-        config.pipeline = _coerce_choice(mapping.get("pipeline"), config.pipeline, {"cascade", "legacy"})
-        config.deep_scan = _coerce_choice(mapping.get("deep_scan"), config.deep_scan, {"candidates", "always", "off"})
-        config.person_gate_threshold = _coerce_float(
-            mapping.get("person_gate_threshold"), config.person_gate_threshold, 0.0, 1.0
+        config.pipeline = coerce_choice("pipeline", mapping.get("pipeline"), config.pipeline)
+        config.deep_scan = coerce_choice("deep_scan", mapping.get("deep_scan"), config.deep_scan)
+        config.person_gate_threshold = coerce_float(
+            "person_gate_threshold", mapping.get("person_gate_threshold"), config.person_gate_threshold
         )
         config.require_female = _coerce_bool(mapping.get("require_female"), config.require_female)
-        config.female_threshold = _coerce_float(mapping.get("female_threshold"), config.female_threshold, 0.0, 1.0)
+        config.female_threshold = coerce_float(
+            "female_threshold", mapping.get("female_threshold"), config.female_threshold
+        )
         config.exclude_minors = _coerce_bool(mapping.get("exclude_minors"), config.exclude_minors)
         # Floored above zero on purpose: at 0 the age gate matches essentially every
         # image, which looks like the scanner finding nothing rather than a bad setting.
-        config.minor_threshold = _coerce_float(mapping.get("minor_threshold"), config.minor_threshold, 0.01, 1.0)
-        config.min_adult_confidence = _coerce_float(
-            mapping.get("min_adult_confidence"), config.min_adult_confidence, 0.0, 1.0
+        config.minor_threshold = coerce_float("minor_threshold", mapping.get("minor_threshold"), config.minor_threshold)
+        config.min_adult_confidence = coerce_float(
+            "min_adult_confidence", mapping.get("min_adult_confidence"), config.min_adult_confidence
         )
-        config.max_faces = _coerce_int(mapping.get("max_faces"), config.max_faces, minimum=1, maximum=32)
+        config.max_faces = coerce_int("max_faces", mapping.get("max_faces"), config.max_faces)
         # Age-gate constants: minimums prevent a profile from weakening the safety gate
         # to the point of uselessness. Upper bound is 1.0 for all (evidence space).
-        config.child_adult_margin = _coerce_float(
-            mapping.get("child_adult_margin"), config.child_adult_margin, 0.05, 1.0
+        config.child_adult_margin = coerce_float(
+            "child_adult_margin", mapping.get("child_adult_margin"), config.child_adult_margin
         )
-        config.strongly_minor_threshold = _coerce_float(
-            mapping.get("strongly_minor_threshold"), config.strongly_minor_threshold, 0.50, 1.0
+        config.strongly_minor_threshold = coerce_float(
+            "strongly_minor_threshold", mapping.get("strongly_minor_threshold"), config.strongly_minor_threshold
         )
-        config.face_anchored_margin = _coerce_float(
-            mapping.get("face_anchored_margin"), config.face_anchored_margin, 0.02, 1.0
+        config.face_anchored_margin = coerce_float(
+            "face_anchored_margin", mapping.get("face_anchored_margin"), config.face_anchored_margin
         )
-        config.weak_adult_detail = _coerce_float(mapping.get("weak_adult_detail"), config.weak_adult_detail, 0.20, 1.0)
+        config.weak_adult_detail = coerce_float(
+            "weak_adult_detail", mapping.get("weak_adult_detail"), config.weak_adult_detail
+        )
         config.refine_model = _coerce_str(mapping.get("refine_model"), config.refine_model)
-        config.refine_band = _coerce_float(mapping.get("refine_band"), config.refine_band, 0.0, 1.0)
-        config.refine_max_images = _coerce_int(
-            mapping.get("refine_max_images"), config.refine_max_images, minimum=0, maximum=1_000_000
+        config.refine_band = coerce_float("refine_band", mapping.get("refine_band"), config.refine_band)
+        config.refine_max_images = coerce_int(
+            "refine_max_images", mapping.get("refine_max_images"), config.refine_max_images
         )
-        config.refine_weight = _coerce_float(mapping.get("refine_weight"), config.refine_weight, 0.0, 1.0)
+        config.refine_weight = coerce_float("refine_weight", mapping.get("refine_weight"), config.refine_weight)
         config.vlm_enabled = _coerce_bool(mapping.get("vlm_enabled"), config.vlm_enabled)
         config.vlm_base_url = _coerce_str(mapping.get("vlm_base_url"), config.vlm_base_url)
         config.vlm_model = _coerce_str(mapping.get("vlm_model"), config.vlm_model)
         config.vlm_api_key = _coerce_str(mapping.get("vlm_api_key"), config.vlm_api_key)
-        config.vlm_band = _coerce_float(mapping.get("vlm_band"), config.vlm_band, 0.0, 1.0)
-        config.vlm_max_images = _coerce_int(mapping.get("vlm_max_images"), config.vlm_max_images, 0, 1_000_000)
-        config.vlm_concurrency = _coerce_int(mapping.get("vlm_concurrency"), config.vlm_concurrency, 1, 64)
-        config.vlm_timeout = _coerce_float(mapping.get("vlm_timeout"), config.vlm_timeout, 1.0, 600.0)
-        config.vlm_weight = _coerce_float(mapping.get("vlm_weight"), config.vlm_weight, 0.0, 1.0)
+        config.vlm_band = coerce_float("vlm_band", mapping.get("vlm_band"), config.vlm_band)
+        config.vlm_max_images = coerce_int("vlm_max_images", mapping.get("vlm_max_images"), config.vlm_max_images)
+        config.vlm_concurrency = coerce_int("vlm_concurrency", mapping.get("vlm_concurrency"), config.vlm_concurrency)
+        config.vlm_timeout = coerce_float("vlm_timeout", mapping.get("vlm_timeout"), config.vlm_timeout)
+        config.vlm_weight = coerce_float("vlm_weight", mapping.get("vlm_weight"), config.vlm_weight)
         config.enable_plugins = _coerce_bool(mapping.get("enable_plugins"), config.enable_plugins)
         config.global_learning = _coerce_bool(mapping.get("global_learning"), config.global_learning)
-        config.max_learning_weight = _coerce_float(
-            mapping.get("max_learning_weight"), config.max_learning_weight, 0.0, 0.95
+        config.max_learning_weight = coerce_float(
+            "max_learning_weight", mapping.get("max_learning_weight"), config.max_learning_weight
         )
-        config.detail_strongest_weight = _coerce_float(
-            mapping.get("detail_strongest_weight"), config.detail_strongest_weight, 0.0, 1.0
+        config.detail_strongest_weight = coerce_float(
+            "detail_strongest_weight", mapping.get("detail_strongest_weight"), config.detail_strongest_weight
         )
-        config.detail_average_weight = _coerce_float(
-            mapping.get("detail_average_weight"), config.detail_average_weight, 0.0, 1.0
+        config.detail_average_weight = coerce_float(
+            "detail_average_weight", mapping.get("detail_average_weight"), config.detail_average_weight
         )
         config.detail_weights = _coerce_weights(mapping.get("detail_weights"), config.detail_weights)
         return config
@@ -460,13 +473,6 @@ def _coerce_str(value: Any, default: str) -> str:
     return default if not isinstance(value, str) or not value else value
 
 
-def _coerce_choice(value: Any, default: str, choices: set[str]) -> str:
-    if not isinstance(value, str):
-        return default
-    value = value.strip()
-    return value if value in choices else default
-
-
 def _coerce_list(value: Any, default: list[str]) -> list[str]:
     if not isinstance(value, list):
         return list(default)
@@ -509,44 +515,6 @@ def _coerce_weights(value: Any, default: dict[str, float]) -> dict[str, float]:
     return weights or dict(default)
 
 
-def _coerce_int(value: Any, default: int, minimum: int = 0, maximum: int | None = None) -> int:
-    try:
-        parsed = int(value)
-    except Exception:  # noqa: BLE001
-        return default
-    if parsed < minimum or (maximum is not None and parsed > maximum):
-        LOGGER.warning("Ignoring out-of-range setting %r; using %r", parsed, default)
-        return default
-    return parsed
-
-
-def _coerce_float(value: Any, default: float, minimum: float | None = None, maximum: float | None = None) -> float:
-    """Parse a float setting, rejecting values the rest of the app cannot cope with.
-
-    The Settings dialog range-checks every one of these, but from_mapping is the funnel
-    for input the dialog never sees — imported settings files, saved profiles and
-    per-folder overrides. Without the same bounds here a hand-edited or corrupted file
-    could set a NaN threshold (nothing ever matches, silently), a zero prompt scale
-    (every axis flattens to "no opinion"), or a zero minor_threshold (the age gate
-    excludes nearly everything) with no indication anything was wrong.
-    """
-    try:
-        parsed = float(value)
-    except Exception:  # noqa: BLE001
-        return default
-    if not math.isfinite(parsed):
-        LOGGER.warning("Ignoring non-finite setting %r; using %r", value, default)
-        return default
-    clamped = parsed
-    if minimum is not None:
-        clamped = max(clamped, minimum)
-    if maximum is not None:
-        clamped = min(clamped, maximum)
-    if clamped != parsed:
-        LOGGER.warning("Clamped out-of-range setting %r to %r", parsed, clamped)
-    return clamped
-
-
 def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -578,36 +546,8 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 #   global_learning,
 #   max_learning_weight - writes to cross-folder state shared with every other folder
 FOLDER_OVERRIDE_ALLOWED_KEYS: frozenset[str] = frozenset(
-    {
-        "device",
-        "precision",
-        "quantize_cpu",
-        "preload_backend",
-        "positive_prompts",
-        "negative_prompts",
-        "batch_size",
-        "threshold",
-        "zero_shot_scale",
-        "classifier_weight",
-        "zero_shot_weight",
-        "nsfw_filter",
-        "nsfw_threshold",
-        "require_person",
-        "person_threshold",
-        "enable_face_detection",
-        "deep_scan",
-        "person_gate_threshold",
-        "require_female",
-        "female_threshold",
-        "max_faces",
-        "refine_band",
-        "refine_max_images",
-        "refine_weight",
-        "detail_strongest_weight",
-        "detail_average_weight",
-        "detail_weights",
-    }
-)
+    spec.key for spec in FIELD_SPECS if spec.folder_overridable
+) | {"positive_prompts", "negative_prompts", "detail_weights"}
 
 
 def filter_folder_override(mapping: Mapping[str, Any] | None) -> tuple[dict[str, Any], list[str]]:
