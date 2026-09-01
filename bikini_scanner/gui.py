@@ -831,11 +831,11 @@ class BikiniScannerApp:
             try:
                 import winreg
 
-                with winreg.OpenKey(
-                    winreg.HKEY_CURRENT_USER,
+                with winreg.OpenKey(  # type: ignore[attr-defined]
+                    winreg.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
                     r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
                 ) as key:
-                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+                    value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")  # type: ignore[attr-defined]
                     return int(value) == 0
             except Exception:  # noqa: BLE001
                 return False
@@ -1185,14 +1185,14 @@ class BikiniScannerApp:
             import ctypes
 
             self.root.update_idletasks()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())  # type: ignore[attr-defined]
             if not hwnd:
                 return
             value = ctypes.c_int(1 if self._theme_is_dark() else 0)
             # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE on Windows 10 1903+/11;
             # 19 was the pre-release attribute id on older builds.
             for attribute in (20, 19):
-                result = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                result = ctypes.windll.dwmapi.DwmSetWindowAttribute(  # type: ignore[attr-defined]
                     hwnd, ctypes.c_int(attribute), ctypes.byref(value), ctypes.sizeof(value)
                 )
                 if result == 0:
