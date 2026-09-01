@@ -65,9 +65,7 @@ class SQLiteCache:
         # check_same_thread is disabled because we guard the connection with our own
         # lock. This is simpler than a connection-per-thread pool for a single local DB.
         if self._connection is None:
-            self._connection = sqlite3.connect(
-                str(self.db_path), check_same_thread=False, isolation_level=None
-            )
+            self._connection = sqlite3.connect(str(self.db_path), check_same_thread=False, isolation_level=None)
             if os.environ.get("BIKINI_SCANNER_TEST_SQLITE_PRAGMAS") == "1":
                 self._connection.execute("PRAGMA journal_mode=MEMORY")
                 self._connection.execute("PRAGMA synchronous=OFF")
@@ -172,10 +170,7 @@ class SQLiteCache:
         face_counts_path: Path,
     ) -> bool:
         """Import existing NPZ/JSON caches once, then remove them."""
-        has_legacy = any(
-            path.is_file()
-            for path in (embeddings_path, index_path, region_path, face_counts_path)
-        )
+        has_legacy = any(path.is_file() for path in (embeddings_path, index_path, region_path, face_counts_path))
         if not has_legacy:
             return False
         if self._has_data():
@@ -193,8 +188,7 @@ class SQLiteCache:
                 if embeddings_path.is_file():
                     with np.load(embeddings_path, allow_pickle=False) as archive:
                         rows: list[tuple[Any, ...]] = [
-                            (str(key), self._array_to_blob(archive[key].astype(np.float32)))
-                            for key in archive.files
+                            (str(key), self._array_to_blob(archive[key].astype(np.float32))) for key in archive.files
                         ]
                     if rows:
                         self._executemany(
@@ -229,10 +223,7 @@ class SQLiteCache:
                 if face_counts_path.is_file():
                     payload = json.loads(face_counts_path.read_text(encoding="utf-8"))
                     if isinstance(payload, dict):
-                        rows = [
-                            (str(content_hash), int(value))
-                            for content_hash, value in payload.items()
-                        ]
+                        rows = [(str(content_hash), int(value)) for content_hash, value in payload.items()]
                         if rows:
                             self._executemany(
                                 "INSERT OR REPLACE INTO face_counts(content_hash, face_count) VALUES (?, ?)",
@@ -324,9 +315,7 @@ class SQLiteCache:
                     conn,
                 )
 
-    def get_cached_image_records(
-        self, paths: list[Path]
-    ) -> dict[Path, dict[str, object]]:
+    def get_cached_image_records(self, paths: list[Path]) -> dict[Path, dict[str, object]]:
         if not paths:
             return {}
         path_strings = [str(path.resolve()) for path in paths]

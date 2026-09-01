@@ -29,6 +29,8 @@ def _mark_ignored_directory(directory: Path) -> None:
         (directory / IGNORE_MARKER_FILENAME).touch(exist_ok=True)
     except OSError:
         pass
+
+
 OUTPUT_ORGANIZATIONS = {"flat", "score_band", "label", "score_band_label"}
 DUPLICATE_POLICIES = {"skip", "rename", "overwrite"}
 DEFAULT_HTML_EMBED_LIMIT = 512

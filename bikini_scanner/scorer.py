@@ -299,9 +299,7 @@ class BikiniScorer:
             negative_weights=negative_weights,
         )
 
-    def _classifier_signature(
-        self, labeled_paths: Sequence[tuple[str, int]], feature_width: int | None = None
-    ) -> str:
+    def _classifier_signature(self, labeled_paths: Sequence[tuple[str, int]], feature_width: int | None = None) -> str:
         labeled_entries: list[dict[str, object]] = []
         for path, label in sorted((str(path), int(label)) for path, label in labeled_paths if label in (0, 1)):
             entry: dict[str, object] = {"path": path, "label": int(label)}
@@ -776,9 +774,7 @@ class BikiniScorer:
                 # legacy CLIP refine path uses refine_weight (default 0.65); the VLM
                 # adjudication path uses vlm_weight. They are separate knobs now.
                 zero_shot = zero_shot.copy()
-                refine_weight = float(
-                    self.config.vlm_weight if refine.source == "vlm" else self.config.refine_weight
-                )
+                refine_weight = float(self.config.vlm_weight if refine.source == "vlm" else self.config.refine_weight)
                 refine_weight = float(np.clip(refine_weight, 0.0, 1.0))
                 zero_shot[refined_rows] = (
                     (1.0 - refine_weight) * zero_shot[refined_rows] + refine_weight * refine.scores[refined_rows]
@@ -795,7 +791,9 @@ class BikiniScorer:
         scores = learning.blend(zero_shot, learned, outcome.weight)
         # No amount of learned confidence may resurrect an age-gated image.
         if result.stage:
-            minor_rows: np.ndarray = np.asarray([stage == cascade_module.STAGE_MINOR for stage in result.stage], dtype=bool)
+            minor_rows: np.ndarray = np.asarray(
+                [stage == cascade_module.STAGE_MINOR for stage in result.stage], dtype=bool
+            )
             if minor_rows.any():
                 scores = np.asarray(scores, dtype=np.float32)
                 scores[minor_rows] = 0.0
@@ -1008,11 +1006,7 @@ def run_deep_pass(
                 ]
                 materialised = crop_regions(image, planned)
                 pending_crops.extend((index, key, crop) for key, crop in materialised)
-                pending_meta.extend(
-                    (index, str(content_hash), key)
-                    for key, _ in materialised
-                    if content_hash
-                )
+                pending_meta.extend((index, str(content_hash), key) for key, _ in materialised if content_hash)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Deep pass skipped %s: %s", path, exc)
 
@@ -1041,7 +1035,9 @@ def run_deep_pass(
                 detail_rows.setdefault(index, []).append(len(row_embeddings) - 1)
         if store is not None:
             for (index, content_hash, key), vector in zip(pending_meta, vectors, strict=False):
-                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(vector, dtype=np.float32)
+                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(
+                    vector, dtype=np.float32
+                )
                 pending_cache[store.region_cache_key(content_hash, namespace, "__faces__")] = np.asarray(
                     [max(int(updated_faces[index]), 0)], dtype=np.float32
                 )
@@ -1069,7 +1065,9 @@ def run_deep_pass(
         resolved_faces = updated_faces
     elif face_counts is not None:
         resolved_faces = np.asarray(face_counts, dtype=np.int32)
-    return DeepPassResult(table, detail_embeddings, resolved_faces, len(candidate_indices), detail_regions, decoded_images)
+    return DeepPassResult(
+        table, detail_embeddings, resolved_faces, len(candidate_indices), detail_regions, decoded_images
+    )
 
 
 @dataclass(slots=True)

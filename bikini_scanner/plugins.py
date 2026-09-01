@@ -14,9 +14,7 @@ def plugins_dir() -> Path:
     return prefs_path().parent / "plugins"
 
 
-def apply_plugins(
-    state: Any, samples: list[dict[str, object]], enabled: bool = False
-) -> list[dict[str, object]]:
+def apply_plugins(state: Any, samples: list[dict[str, object]], enabled: bool = False) -> list[dict[str, object]]:
     result = samples
     if not enabled:
         return result

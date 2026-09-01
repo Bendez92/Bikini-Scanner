@@ -1454,7 +1454,8 @@ class BikiniScannerApp:
             return
         for folder in self.recent_folders[:10]:
             self.recent_menu.add_command(
-                label=folder, command=lambda value=folder: self._open_recent_folder(value)  # type: ignore[misc]
+                label=folder,
+                command=lambda value=folder: self._open_recent_folder(value),  # type: ignore[misc]
             )
 
     def _open_recent_folder(self, folder: str) -> None:
@@ -1485,6 +1486,7 @@ class BikiniScannerApp:
             return True
         try:
             from .clip_backend import get_backend
+
             self.backend = get_backend(self.config)
             return True
         except Exception as exc:
@@ -2062,9 +2064,7 @@ class BikiniScannerApp:
         if self.current_state is None or not samples:
             return list(samples)
         try:
-            processed = apply_plugins(
-                self.current_state, list(samples), enabled=self.config.enable_plugins
-            )
+            processed = apply_plugins(self.current_state, list(samples), enabled=self.config.enable_plugins)
         except Exception:
             LOGGER.exception("Review sample plugin processing failed; using unmodified samples.")
             return list(samples)
@@ -2486,7 +2486,9 @@ class BikiniScannerApp:
         button_row = ttk.Frame(outer)
         button_row.grid(row=5, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(
-            button_row, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+            button_row,
+            text="Close",
+            command=dialog._safe_close,  # type: ignore[attr-defined]
         ).pack(side=RIGHT, padx=(8, 0))
         ttk.Button(button_row, text="Test", command=run_test).pack(side=RIGHT)
         run_test()
@@ -3517,7 +3519,9 @@ class BikiniScannerApp:
         ttk.Button(buttons, text="Save as...", command=save_as).pack(side=LEFT, padx=6)
         ttk.Button(buttons, text="Delete", command=delete).pack(side=LEFT)
         ttk.Button(
-            buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+            buttons,
+            text="Close",
+            command=dialog._safe_close,  # type: ignore[attr-defined]
         ).pack(side=RIGHT)
 
     def run_scan(self) -> None:
@@ -4296,6 +4300,7 @@ class BikiniScannerApp:
                 score=score,
             )
             self.photo_refs.append(photo)
+
         def _on_click(_event: object, candidate: str = path) -> None:
             self.focus_path(candidate)
 
@@ -4606,9 +4611,7 @@ class BikiniScannerApp:
                 f"{outcome.failed_count} could not be moved:\n{first}{more}",
             )
         else:
-            messagebox.showinfo(
-                "Trash complete", f"Moved {outcome.trashed_count} files to the recycle bin/trash."
-            )
+            messagebox.showinfo("Trash complete", f"Moved {outcome.trashed_count} files to the recycle bin/trash.")
         if outcome.trashed_count:
             self._refresh_after_output_change(move=True)
 
@@ -4630,7 +4633,9 @@ class BikiniScannerApp:
             side=LEFT, padx=8
         )
         ttk.Button(
-            buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+            buttons,
+            text="Close",
+            command=dialog._safe_close,  # type: ignore[attr-defined]
         ).pack(side=RIGHT)
 
     @staticmethod
@@ -4664,7 +4669,9 @@ class BikiniScannerApp:
             buttons, text="Keep first, trash rest", command=lambda: self._trash_duplicate_remainders(groups, dialog)
         ).pack(side=LEFT)
         ttk.Button(
-            buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
+            buttons,
+            text="Close",
+            command=dialog._safe_close,  # type: ignore[attr-defined]
         ).pack(side=RIGHT)
 
     def _trash_duplicate_remainders(self, groups: dict[str, list[str]], dialog: Toplevel) -> None:
@@ -4800,7 +4807,9 @@ class BikiniScannerApp:
         button_row = ttk.Frame(outer)
         button_row.pack(side=TOP, fill=BOTH, pady=(10, 0))
         ttk.Button(
-            button_row, text="Cancel", command=dialog._safe_close  # type: ignore[attr-defined]
+            button_row,
+            text="Cancel",
+            command=dialog._safe_close,  # type: ignore[attr-defined]
         ).pack(side=RIGHT, padx=(8, 0))
 
         def proceed() -> None:
