@@ -23,6 +23,8 @@ from typing import Any
 
 import numpy as np
 
+from .safe_io import resolved_str
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -298,7 +300,7 @@ class SQLiteCache:
             if path_records:
                 rows = [
                     (
-                        str(path.resolve()),
+                        resolved_str(path),
                         str(record["content_hash"]),
                         int(record["mtime_ns"]),
                         int(record["size"]),
@@ -329,7 +331,7 @@ class SQLiteCache:
     ) -> dict[Path, dict[str, object]]:
         if not paths:
             return {}
-        path_strings = [str(path.resolve()) for path in paths]
+        path_strings = [resolved_str(path) for path in paths]
         placeholders = ",".join("?" * len(path_strings))
         rows = self._execute(
             f"""
@@ -344,8 +346,9 @@ class SQLiteCache:
             row[0]: (row[1], row[2], row[3], self._blob_to_array(row[4])) for row in rows
         }
         cached: dict[Path, dict[str, object]] = {}
-        for path in paths:
-            entry = by_path.get(str(path.resolve()))
+        # Zipped against the strings computed above rather than resolving a second time.
+        for path, resolved in zip(paths, path_strings, strict=False):
+            entry = by_path.get(resolved)
             if entry is None:
                 continue
             content_hash, mtime_ns, size, embedding = entry

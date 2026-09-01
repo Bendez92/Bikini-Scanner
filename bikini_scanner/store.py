@@ -23,7 +23,7 @@ except Exception:  # noqa: BLE001
     _FILELOCK_AVAILABLE = False
 
 from .image_formats import DECODE_VERSION
-from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
+from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file, resolved_str
 from .sqlite_cache import SQLiteCache
 
 # Pickle is used only for the classifier cache. Rather than deleting legacy caches, a
@@ -125,6 +125,7 @@ class FolderStore:
     embeddings_path: Path = field(init=False)
     index_path: Path = field(init=False)
     labels_path: Path = field(init=False)
+    notes_path: Path = field(init=False)
     metadata_path: Path = field(init=False)
     face_counts_path: Path = field(init=False)
     classifier_path: Path = field(init=False)
@@ -137,6 +138,7 @@ class FolderStore:
     lock_path: Path = field(init=False)
     sqlite_cache: SQLiteCache | None = field(init=False, default=None, repr=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
+    _notes_cache: dict[str, str] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
     _face_count_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
@@ -151,6 +153,7 @@ class FolderStore:
         self.embeddings_path = self.cache_dir / "embeddings.npz"
         self.index_path = self.cache_dir / "embeddings_index.json"
         self.labels_path = self.cache_dir / "labels.json"
+        self.notes_path = self.cache_dir / "notes.json"
         self.metadata_path = self.cache_dir / SCAN_METADATA_FILENAME
         self.face_counts_path = self.cache_dir / FACE_COUNTS_FILENAME
         self.classifier_path = self.cache_dir / CLASSIFIER_FILENAME
@@ -336,6 +339,29 @@ class FolderStore:
             cache[str(key)] = {str(axis): float(score) for axis, score in value.items()}
         atomic_write_json(self.vlm_verdicts_path, cache)
 
+    def load_notes(self) -> dict[str, str]:
+        """Free-text note per image. Accept/REJECT records the decision; this records why."""
+        if self._notes_cache is None:
+            if not self.notes_path.exists():
+                self._notes_cache = {}
+            else:
+                try:
+                    payload = json.loads(self.notes_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        raise TypeError("invalid payload type")
+                    self._notes_cache = {str(path): str(note) for path, note in payload.items()}
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    LOGGER.warning("Ignoring unreadable notes %s: %s", self.notes_path, exc)
+                    quarantine_broken_file(self.notes_path, LOGGER, "invalid JSON")
+                    self._notes_cache = {}
+        return dict(self._notes_cache)
+
+    def save_notes(self, notes: dict[str, str]) -> None:
+        """Persist notes, then adopt them, in that order — same rule as save_labels."""
+        normalized = {str(path): str(note) for path, note in notes.items() if str(note).strip()}
+        atomic_write_json(self.notes_path, dict(sorted(normalized.items())))
+        self._notes_cache = normalized
+
     def load_labels(self) -> dict[str, int]:
         if self._labels_cache is None:
             if not self.labels_path.exists():
@@ -388,6 +414,15 @@ class FolderStore:
             self.config_override_path.unlink()
         except FileNotFoundError:
             pass
+
+    def cached_path_count(self, paths: Iterable[Path]) -> int:
+        """How many of these images already have an embedding on file.
+
+        Public so a caller can report what a scan would cost without reaching into the
+        index itself, and without starting the scan to find out.
+        """
+        known = self._load_path_index()
+        return sum(1 for path in paths if str(path) in known)
 
     def _load_path_index(self) -> dict[str, dict[str, int | str]]:
         if self._path_index_cache is None:
@@ -496,7 +531,7 @@ class FolderStore:
         if self._path_index_cache is None:
             self._path_index_cache = {}
         for path, record in path_records.items():
-            key = str(path.resolve())
+            key = resolved_str(path)
             self._path_index_cache[key] = {
                 "path": key,
                 "content_hash": str(record["content_hash"]),
@@ -535,8 +570,9 @@ class FolderStore:
         if self._path_index_cache is None:
             self._path_index_cache = {}
         for path, record in normalized_records.items():
-            self._path_index_cache[str(path.resolve())] = {
-                "path": str(path.resolve()),
+            resolved = resolved_str(path)
+            self._path_index_cache[resolved] = {
+                "path": resolved,
                 "content_hash": record["content_hash"],
                 "mtime_ns": record["mtime_ns"],
                 "size": record["size"],
@@ -621,7 +657,7 @@ class FolderStore:
 
     def duplicate_groups(self, paths: Iterable[Path] | None = None) -> dict[str, list[str]]:
         index = self._load_path_index()
-        allowed = {str(path.resolve()) for path in paths} if paths is not None else None
+        allowed = {resolved_str(path) for path in paths} if paths is not None else None
         groups: dict[str, list[str]] = {}
         for path, record in index.items():
             if allowed is not None and path not in allowed:
@@ -643,7 +679,33 @@ class FolderStore:
                     continue
         return total
 
-    def clear_cache(self) -> None:
+    def clear_cache(self, keep_decisions: bool = True) -> None:
+        """Delete this folder's derived data.
+
+        `keep_decisions` preserves the three files in here that no amount of rescanning
+        can rebuild: the labels, the notes, and the folder's pinned settings override.
+        Everything else — embeddings, region scores, face counts, the trained
+        classifier, scan metadata — is recomputed from the images themselves.
+
+        It defaults to True because this used to rmtree the lot, and an action named
+        for the recomputable half was quietly taking hours of human decisions with it.
+        """
+        preserved: dict[str, bytes] = {}
+        if keep_decisions:
+            for path in (self.labels_path, self.notes_path, self.config_override_path):
+                try:
+                    if path.exists():
+                        preserved[path.name] = path.read_bytes()
+                except OSError as exc:
+                    LOGGER.warning("Could not preserve %s while clearing the cache: %s", path, exc)
+        self._clear_cache_dir()
+        for name, payload in preserved.items():
+            try:
+                (self.cache_dir / name).write_bytes(payload)
+            except OSError as exc:
+                LOGGER.exception("Could not restore %s after clearing the cache: %s", name, exc)
+
+    def _clear_cache_dir(self) -> None:
         if self.sqlite_cache is not None:
             try:
                 self.sqlite_cache.close()
@@ -661,16 +723,28 @@ class FolderStore:
         self.face_counts_path = self.cache_dir / FACE_COUNTS_FILENAME
         self.classifier_path = self.cache_dir / CLASSIFIER_FILENAME
         self.config_override_path = self.cache_dir / CONFIG_OVERRIDE_FILENAME
+        self.notes_path = self.cache_dir / "notes.json"
         self.review_session_path = self.cache_dir / "review_session.json"
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
         self.cache_db_path = self.cache_dir / "cache.db"
         self.sqlite_cache = SQLiteCache(self.cache_db_path)
         self._labels_cache = None
+        self._notes_cache = None
         self._path_index_cache = None
         self._embedding_cache = None
         self._face_count_cache = None
         self._region_cache = None
         self._vlm_cache = None
+
+    def delete_decisions(self) -> None:
+        """Delete the labels and notes for this folder. Nothing else touches these."""
+        for path in (self.labels_path, self.notes_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.exception("Could not delete %s: %s", path, exc)
+        self._labels_cache = None
+        self._notes_cache = None
 
     def build_scan_metadata(
         self,

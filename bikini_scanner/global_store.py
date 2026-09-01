@@ -17,7 +17,7 @@ import pickle
 import re
 import threading
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,15 @@ class GlobalLearningStore:
 
     model_name: str
     root: Path = None  # type: ignore[assignment]
+    # Everything below is an in-process read cache, stamped with the (mtime, size) of
+    # the file it came from. A retrain used to re-read and re-parse the whole index and
+    # the whole feature archive, then stat every labelled path, to add three rows. The
+    # stamp is two stats; a mismatch (another instance wrote) falls back to a real read.
+    _index_cache: dict = field(init=False, default_factory=dict, repr=False)
+    _index_stamp: tuple = field(init=False, default=(), repr=False)
+    _features_cache: dict = field(init=False, default_factory=dict, repr=False)
+    _features_stamp: tuple = field(init=False, default=(), repr=False)
+    _training_cache: dict = field(init=False, default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.root = global_dir() / _namespace(self.model_name)
@@ -89,29 +98,59 @@ class GlobalLearningStore:
         return self.root / "classifier.pkl"
 
     # --- persistence --------------------------------------------------------
+    @staticmethod
+    def _stamp(path: Path) -> tuple:
+        """Cheap identity for a file: modification time and size, or () if absent."""
+        try:
+            info = path.stat()
+        except OSError:
+            return ()
+        return (info.st_mtime_ns, info.st_size)
+
     def _load_index(self) -> dict[str, dict[str, Any]]:
+        stamp = self._stamp(self.index_path)
+        if stamp and stamp == self._index_stamp:
+            return self._index_cache
         if not self.index_path.exists():
+            self._index_cache, self._index_stamp = {}, stamp
             return {}
         try:
             payload = json.loads(self.index_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Ignoring unreadable global label index %s: %s", self.index_path, exc)
             quarantine_broken_file(self.index_path, LOGGER, "invalid JSON")
+            self._index_cache, self._index_stamp = {}, ()
             return {}
         if not isinstance(payload, dict):
+            self._index_cache, self._index_stamp = {}, stamp
             return {}
-        return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        parsed = {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        self._index_cache, self._index_stamp = parsed, stamp
+        return parsed
 
     def _load_features(self) -> dict[str, np.ndarray]:
+        stamp = self._stamp(self.features_path)
+        if stamp and stamp == self._features_stamp:
+            return self._features_cache
         if not self.features_path.exists():
+            self._features_cache, self._features_stamp = {}, stamp
             return {}
         try:
             with np.load(self.features_path, allow_pickle=False) as archive:
-                return {str(key): archive[key].astype(np.float32) for key in archive.files}
+                loaded = {str(key): archive[key].astype(np.float32) for key in archive.files}
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Ignoring unreadable global feature cache %s: %s", self.features_path, exc)
             quarantine_broken_file(self.features_path, LOGGER, "invalid NPZ")
+            self._features_cache, self._features_stamp = {}, ()
             return {}
+        self._features_cache, self._features_stamp = loaded, stamp
+        return loaded
+
+    def _adopt(self, index: dict[str, dict[str, Any]], features: dict[str, np.ndarray]) -> None:
+        """Take the just-written state as the cache, and drop derived results."""
+        self._index_cache, self._index_stamp = index, self._stamp(self.index_path)
+        self._features_cache, self._features_stamp = features, self._stamp(self.features_path)
+        self._training_cache = {}
 
     def record(self, entries: Iterable[tuple[str, int, np.ndarray]], sequence: int) -> int:
         """Add or update labelled examples. Returns the total kept afterwards."""
@@ -155,6 +194,7 @@ class GlobalLearningStore:
                         np.savez(handle, **features)  # type: ignore[arg-type]
 
                 atomic_replace(self.features_path, write_npz)
+                self._adopt(index, features)
             except Exception:
                 LOGGER.exception("Could not persist global learning memory")
             return len(index)
@@ -189,12 +229,20 @@ class GlobalLearningStore:
                         np.savez(handle, **features)  # type: ignore[arg-type]
 
                 atomic_replace(self.features_path, write_npz)
+                self._adopt(index, features)
             except Exception:
                 LOGGER.exception("Could not update global learning memory")
 
     def training_set(self, expected_dim: int | None = None) -> TrainingSet:
         index = self._load_index()
         features = self._load_features()
+        # Building this walks every labelled row and stats every labelled path to drop
+        # ones whose file is gone. That answer only changes when the store changes, so
+        # it is derived once per (index, features, dim) rather than once per retrain.
+        cache_key = (self._index_stamp, self._features_stamp, expected_dim)
+        cached = self._training_cache.get(cache_key)
+        if cached is not None:
+            return cached
         rows: list[np.ndarray] = []
         labels: list[int] = []
         paths: list[str] = []
@@ -223,16 +271,25 @@ class GlobalLearningStore:
             self.forget(vanished)
         if not rows:
             dim = int(expected_dim or 0)
-            return TrainingSet(
+            empty = TrainingSet(
                 features=np.empty((0, dim), dtype=np.float32),
                 labels=np.empty((0,), dtype=np.int64),
                 paths=[],
             )
-        return TrainingSet(
-            features=np.vstack(rows).astype(np.float32),
-            labels=np.asarray(labels, dtype=np.int64),
-            paths=paths,
+            return self._remember(cache_key, empty)
+        return self._remember(
+            cache_key,
+            TrainingSet(
+                features=np.vstack(rows).astype(np.float32),
+                labels=np.asarray(labels, dtype=np.int64),
+                paths=paths,
+            ),
         )
+
+    def _remember(self, cache_key: tuple, result: TrainingSet) -> TrainingSet:
+        # One entry per shape is plenty: callers ask with a single expected_dim.
+        self._training_cache = {cache_key: result}
+        return result
 
     def load_classifier(self) -> dict[str, Any] | None:
         if not self.classifier_path.exists():

@@ -16,6 +16,11 @@
 
 .PARAMETER SkipBuild
     Skip PyInstaller and only recompile the installer from the existing dist folder.
+
+.NOTES
+    The experimental clip-onnx backend is not bundled by default: its exported graphs
+    are ~577 MB and its runtime another ~38 MB, roughly half the installer, for a
+    backend Settings describes as optional. Set BIKINI_BUNDLE_ONNX=1 to include them.
 #>
 [CmdletBinding()]
 param(
@@ -111,6 +116,9 @@ $Version = $Version.Trim()
 # --- 3. PyInstaller ---------------------------------------------------------
 if (-not $SkipBuild) {
     Write-Step "Building application bundle v$Version (this takes several minutes)"
+    if ($env:BIKINI_BUNDLE_ONNX) {
+        Write-Step "BIKINI_BUNDLE_ONNX is set - the ONNX backend and its ~577 MB of graphs will be bundled"
+    }
     & $VenvPython -m PyInstaller bikini_scanner.spec --noconfirm
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 }

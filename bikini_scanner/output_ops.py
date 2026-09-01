@@ -281,6 +281,7 @@ def build_html_report(
     thumb_size: int = 240,
     max_embedded_thumbnails: int | None = DEFAULT_HTML_EMBED_LIMIT,
     assets_dir: str | Path | None = None,
+    match_threshold: float = 0.0,
 ) -> Path:
     output = Path(output_path)
     use_assets = assets_dir is not None or (
@@ -310,9 +311,12 @@ def build_html_report(
             axis_parts = [f"{html.escape(name)}: {float(value):.3f}" for name, value in key_scores.items()]
             if axis_parts:
                 axes_html = f"<div class='axes'>{' • '.join(axis_parts)}</div>"
+        matched = "yes" if score >= match_threshold else "no"
         rows.append(
             f"""
-            <article class="card">
+            <article class="card" data-name="{html.escape(path.name.lower())}" data-score="{score:.6f}"
+                     data-label="{html.escape(label.lower())}" data-match="{matched}"
+                     data-bucket="{html.escape(str(sample.get("bucket", "")).lower())}">
               <div class="thumb">{image_html}</div>
               <div class="meta">
                 <div class="name">{html.escape(path.name)}</div>
@@ -335,13 +339,73 @@ body {{ font-family: sans-serif; background: #111; color: #eee; margin: 0; paddi
 .thumb img {{ width: 120px; height: 120px; object-fit: cover; border-radius: 6px; }}
 .name {{ font-weight: 700; margin-bottom: 4px; }}
 .score, .axes, .path {{ font-size: 12px; color: #cfcfcf; margin-top: 4px; word-break: break-word; }}
+.controls {{ display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 0 0 16px; font-size: 14px; }}
+.controls input[type=search] {{ padding: 6px 8px; min-width: 260px; background: #1f1f1f; color: #eee;
+  border: 1px solid #444; border-radius: 6px; }}
+.controls select {{ background: #1f1f1f; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 4px; }}
+#shown {{ color: #9f9f9f; }}
 </style>
 </head>
 <body>
 <h1>{html.escape(title)}</h1>
-<div class="grid">
+<div class="controls">
+  <input id="q" type="search" placeholder="Filter by filename, label or bucket…" oninput="applyFilter()">
+  <label><input id="matchesOnly" type="checkbox" onchange="applyFilter()"> matches only</label>
+  <label><input id="hideDecided" type="checkbox" onchange="applyFilter()"> hide decided</label>
+  <label>Sort
+    <select id="sort" onchange="applySort()">
+      <option value="score-desc">score, highest first</option>
+      <option value="score-asc">score, lowest first</option>
+      <option value="name-asc">filename A-Z</option>
+      <option value="name-desc">filename Z-A</option>
+    </select>
+  </label>
+  <span id="shown"></span>
+</div>
+<div class="grid" id="grid">
 {"".join(rows)}
 </div>
+<script>
+// The report is read by someone who cannot re-run the scan — often from an email
+// attachment or a USB stick — so the sorting and filtering has to travel inside the
+// file. No dependencies and no network for exactly that reason.
+var grid = document.getElementById("grid");
+var cards = Array.prototype.slice.call(grid.querySelectorAll(".card"));
+function applyFilter() {{
+  var query = (document.getElementById("q").value || "").toLowerCase();
+  var matchesOnly = document.getElementById("matchesOnly").checked;
+  var hideDecided = document.getElementById("hideDecided").checked;
+  var shown = 0;
+  cards.forEach(function (card) {{
+    var label = card.dataset.label || "";
+    // Anything that carries a label at all. LABEL_NAMES writes good/bad/skip here,
+    // which is not the wording the app shows, so test for the absence of "unlabeled"
+    // rather than for a list that has to be kept in step with two vocabularies.
+    var decided = label !== "" && label !== "unlabeled";
+    var haystack = (card.dataset.name || "") + " " + label + " " + (card.dataset.bucket || "");
+    var visible = (!query || haystack.indexOf(query) !== -1)
+      && (!matchesOnly || card.dataset.match === "yes")
+      && (!hideDecided || !decided);
+    card.style.display = visible ? "" : "none";
+    if (visible) shown += 1;
+  }});
+  document.getElementById("shown").textContent = shown + " of " + cards.length + " shown";
+}}
+function applySort() {{
+  var mode = document.getElementById("sort").value;
+  var byScore = mode.indexOf("score") === 0;
+  var ascending = mode.indexOf("-asc") !== -1;
+  cards.sort(function (a, b) {{
+    var cmp = byScore
+      ? parseFloat(a.dataset.score) - parseFloat(b.dataset.score)
+      : (a.dataset.name || "").localeCompare(b.dataset.name || "");
+    return ascending ? cmp : -cmp;
+  }});
+  cards.forEach(function (card) {{ grid.appendChild(card); }});
+}}
+applySort();
+applyFilter();
+</script>
 </body>
 </html>"""
     output.parent.mkdir(parents=True, exist_ok=True)

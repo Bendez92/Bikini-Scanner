@@ -40,10 +40,15 @@ from .regions import (
     plan_regions,
     region_kind,
 )
+from .safe_io import resolved_str
 from .store import FolderStore, collect_image_paths, safe_stat
 from .vision_analysis import detect_face_boxes, detect_face_count
 
 LOGGER = logging.getLogger(__name__)
+
+# Re-run the regularisation sweep once the training set is this much bigger than it was
+# when C was last chosen. 1.5 keeps it to a handful of sweeps over a long session.
+C_RESELECT_GROWTH = 1.5
 
 # Axis order in the learned feature vector. Fixed, because features are pooled across
 # folders and scans - appending is safe, reordering is not.
@@ -115,7 +120,31 @@ PHASE_LABELS = {
 # Shares of the overall bar. Deliberately not equal: embedding dominates a cold scan.
 PHASE_SHARES = {PHASE_EMBED: 0.65, PHASE_DETAIL: 0.30, PHASE_REFINE: 0.03, PHASE_SCORE: 0.01}
 # Shares when no region pass will run, so the bar still reaches 100%.
-PHASE_SHARES_NO_DETAIL = {PHASE_EMBED: 0.95, PHASE_DETAIL: 0.0, PHASE_REFINE: 0.03, PHASE_SCORE: 0.01}
+# 0.96, not 0.95: these have to add to 1.0 or the bar stops at 99% and sits there.
+PHASE_SHARES_NO_DETAIL = {PHASE_EMBED: 0.96, PHASE_DETAIL: 0.0, PHASE_REFINE: 0.03, PHASE_SCORE: 0.01}
+
+
+def phase_shares(uncached: int, total: int, runs_detail_pass: bool) -> dict[str, float]:
+    """Weight the bar by the work this particular scan has to do.
+
+    The embed phase walks every image but only pays for the ones that are not already
+    cached — reading a row from SQLite against running the model is not a comparable
+    cost. With fixed shares a rescan of an already-cached folder leapt to 65% in a
+    second and then crawled through the region pass, which is the opposite of what the
+    numbers were tuned for.
+    """
+    if not runs_detail_pass:
+        return dict(PHASE_SHARES_NO_DETAIL)
+    if total <= 0:
+        return dict(PHASE_SHARES)
+    tail = PHASE_SHARES[PHASE_REFINE] + PHASE_SHARES[PHASE_SCORE]
+    embed = PHASE_SHARES[PHASE_EMBED] * (max(0, min(uncached, total)) / total)
+    return {
+        PHASE_EMBED: embed,
+        PHASE_DETAIL: max(0.0, 1.0 - embed - tail),
+        PHASE_REFINE: PHASE_SHARES[PHASE_REFINE],
+        PHASE_SCORE: PHASE_SHARES[PHASE_SCORE],
+    }
 
 
 @dataclass(slots=True)
@@ -274,6 +303,10 @@ class BikiniScorer:
     classifier_weight: float = field(init=False, default=DEFAULT_CLASSIFIER_WEIGHT, repr=False)
     zero_shot_weight: float = field(init=False, default=DEFAULT_ZERO_SHOT_WEIGHT, repr=False)
     learning_outcome: learning.LearningOutcome = field(init=False, default_factory=learning.LearningOutcome, repr=False)
+    # Label count the regularisation sweep last ran at. The sweep costs folds x grid
+    # fits and is the bulk of a retrain; it is redone once the evidence has grown by
+    # C_RESELECT_GROWTH, not every time three more photos are judged.
+    _c_selected_at: int = field(init=False, default=0, repr=False)
     _global_cache: GlobalLearningStore | None = field(init=False, default=None, repr=False)
     _global_signature: str = field(init=False, default="", repr=False)
 
@@ -662,12 +695,29 @@ class BikiniScorer:
 
         if not train_rows:
             self.learning_outcome = learning.LearningOutcome()
+            self._c_selected_at = 0
             return self.learning_outcome
+        # A retrain lands a few labels after the last one, so the previous solution is
+        # a much better starting point than zero, and the regularisation strength it
+        # settled on is still the right one. Both are re-derived from scratch whenever
+        # the evidence has grown enough to plausibly change the answer.
+        previous = self.learning_outcome
+        reuse_c: float | None = None
+        if (
+            previous.chosen_c is not None
+            and self._c_selected_at > 0
+            and len(train_labels) < self._c_selected_at * C_RESELECT_GROWTH
+        ):
+            reuse_c = float(previous.chosen_c)
         outcome = learning.fit(
             np.vstack(train_rows).astype(np.float32),
             np.asarray(train_labels, dtype=np.int64),
             max_weight=float(self.config.max_learning_weight),
+            warm_start=previous.classifier,
+            reuse_c=reuse_c,
         )
+        if reuse_c is None and outcome.chosen_c is not None:
+            self._c_selected_at = len(train_labels)
         # Split this folder's labels out of the pooled total so the status bar can be
         # reconciled against the reviewer's own Accepted/Rejected tally.
         outcome.local_count = len(local_labels)
@@ -1379,7 +1429,6 @@ def bucketed_sampling(
     ) -> list[dict[str, object]]:
         ranked = sorted(items, key=sort_key, reverse=reverse)
         selected: list[dict[str, object]] = []
-        selected_vectors: list[np.ndarray] = []
         if embedding_array is None:
             for item in ranked:
                 path = str(item["path"])
@@ -1392,28 +1441,55 @@ def bucketed_sampling(
             return selected
 
         candidates = [item for item in ranked if str(item["path"]) not in used_paths]
-        while candidates and len(selected) < per_bucket:
-            if not selected_vectors:
-                best_index = 0
+        if not candidates:
+            return selected
+        # Picking six diverse images used to compare every remaining candidate against
+        # every image already picked, one Python call per pair. On a folder of 5 000
+        # that was ~1.07 s of the 1.47 s a retrain took — more than the model fit and
+        # the rescoring put together, all to choose thirty photos.
+        #
+        # Same greedy farthest-point choice, done as one matrix-vector product per
+        # selection: the running minimum distance to the chosen set is updated in bulk
+        # instead of recomputed from scratch for every candidate.
+        positions: np.ndarray = np.fromiter(
+            (cast(int, item["index"]) for item in candidates), dtype=np.int64, count=len(candidates)
+        )
+        vectors = embedding_array[positions]
+        norms = np.linalg.norm(vectors, axis=1)
+        unit = vectors / np.where(norms > 0, norms, 1.0)[:, None]
+        candidate_scores: np.ndarray = np.fromiter(
+            (cast(float, item["score"]) for item in candidates), dtype=np.float64, count=len(candidates)
+        )
+        # Secondary and tertiary keys never change, so they are computed once.
+        distance_to_threshold = np.abs(candidate_scores - threshold)
+        available: np.ndarray = np.ones(len(candidates), dtype=bool)
+        min_distance: np.ndarray | None = None
+        while available.any() and len(selected) < per_bucket:
+            if min_distance is None:
+                best_index = int(np.flatnonzero(available)[0])
             else:
-                best_index = max(
-                    range(len(candidates)),
-                    key=lambda idx: (
-                        min(
-                            _cosine_distance(embedding_array[cast(int, candidates[idx]["index"])], vector)
-                            for vector in selected_vectors
-                        ),
-                        -abs(cast(float, candidates[idx]["score"]) - threshold),
-                        cast(float, candidates[idx]["score"]),
-                    ),
+                # lexsort's last key is the primary one and the sort is stable, so this
+                # reproduces max() over (distance, -|score-threshold|, score) exactly,
+                # ties included: the earliest-ranked candidate still wins.
+                ranked_order = np.lexsort(
+                    (-candidate_scores, distance_to_threshold, -np.where(available, min_distance, -np.inf))
                 )
-            item = candidates.pop(best_index)
+                best_index = int(next(index for index in ranked_order if available[index]))
+            item = candidates[best_index]
+            available[best_index] = False
             path = str(item["path"])
             if path in used_paths:
                 continue
             used_paths.add(path)
             selected.append({k: v for k, v in item.items() if k != "index"} | {"bucket": bucket_name})
-            selected_vectors.append(embedding_array[cast(int, item["index"])])
+            similarity = np.clip(unit @ unit[best_index], -1.0, 1.0)
+            distance = 1.0 - similarity
+            # A zero-length vector has no direction to differ in; the scalar version
+            # returned distance 0 for it and this has to agree.
+            distance = (
+                np.zeros_like(distance) if norms[best_index] <= 0 else np.where(norms > 0, distance, 0.0)
+            )
+            min_distance = distance if min_distance is None else np.minimum(min_distance, distance)
         return selected
 
     contested = _take(
@@ -1509,7 +1585,9 @@ def _scan_and_score_folder_impl(
     processed = 0
     scan_timestamp = datetime.now(timezone.utc).isoformat()
     runs_detail_pass = scorer.config.pipeline != "legacy" and scorer.config.deep_scan != "off"
-    reporter = _ProgressReporter(progress_callback, PHASE_SHARES if runs_detail_pass else PHASE_SHARES_NO_DETAIL)
+    reporter = _ProgressReporter(
+        progress_callback, phase_shares(len(uncached_paths), len(paths), runs_detail_pass)
+    )
     reporter.start_phase(PHASE_EMBED, len(paths))
 
     def _notify() -> None:
@@ -1549,7 +1627,7 @@ def _scan_and_score_folder_impl(
         image_records.append(
             {
                 "filename": path.name,
-                "path": str(path.resolve()),
+                "path": resolved_str(path),
                 "score": None,
                 "zero_shot_score": None,
                 "axis_scores": {},
@@ -1631,7 +1709,7 @@ def _scan_and_score_folder_impl(
                 image_records.append(
                     {
                         "filename": record.path.name,
-                        "path": str(record.path.resolve()),
+                        "path": resolved_str(record.path),
                         "score": None,
                         "zero_shot_score": None,
                         "axis_scores": {},
@@ -1678,7 +1756,7 @@ def _scan_and_score_folder_impl(
                     image_records.append(
                         {
                             "filename": path.name,
-                            "path": str(path.resolve()),
+                            "path": resolved_str(path),
                             "score": None,
                             "zero_shot_score": None,
                             "axis_scores": {},
@@ -1694,7 +1772,7 @@ def _scan_and_score_folder_impl(
                 skipped_records.append(
                     {
                         "filename": record.path.name,
-                        "path": str(record.path.resolve()),
+                        "path": resolved_str(record.path),
                         "error": record.error,
                         "timestamp": scan_timestamp,
                     }

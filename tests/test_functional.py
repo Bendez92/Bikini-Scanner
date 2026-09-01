@@ -24,6 +24,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -53,7 +54,9 @@ from bikini_scanner import (
     linear_model,
     output_ops,
     regions,
+    safe_io,
 )
+from bikini_scanner import run as run_module
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
 from bikini_scanner.config import ScannerConfig, filter_folder_override
@@ -387,14 +390,16 @@ class AgeGate(unittest.TestCase):
                 for child in widget.winfo_children():
                     yield from walk(child)
 
-            cells: dict[tuple[int, int], int] = {}
+            # Keyed by the containing widget as well as the cell: the dialog is a
+            # notebook now, so row 7 column 0 exists once per tab and a bare (row,
+            # column) key would count unrelated tabs as a collision.
+            cells: dict[tuple[str, int, int], int] = {}
             age_box = None
             for widget in walk(dialog):
                 info = widget.grid_info() if hasattr(widget, "grid_info") else None
                 if info:
-                    cells[(int(info["row"]), int(info["column"]))] = (
-                        cells.get((int(info["row"]), int(info["column"])), 0) + 1
-                    )
+                    key = (str(widget.winfo_parent()), int(info["row"]), int(info["column"]))
+                    cells[key] = cells.get(key, 0) + 1
                 try:
                     if "may show a minor" in str(widget.cget("text")):
                         age_box = widget
@@ -403,7 +408,11 @@ class AgeGate(unittest.TestCase):
 
             self.assertIsNotNone(age_box, "the age-gate checkbox is missing from Settings")
             self.assertTrue(age_box.winfo_ismapped(), "the age-gate checkbox is not displayed")
-            position = (int(age_box.grid_info()["row"]), int(age_box.grid_info()["column"]))
+            position = (
+                str(age_box.winfo_parent()),
+                int(age_box.grid_info()["row"]),
+                int(age_box.grid_info()["column"]),
+            )
             self.assertEqual(cells[position], 1, "another widget shares the checkbox's grid cell")
             variable = str(age_box.cget("variable"))
             initial = root.getvar(variable)
@@ -412,6 +421,53 @@ class AgeGate(unittest.TestCase):
             app._closing = True
         finally:
             root.destroy()
+
+
+class SettingsWindow(unittest.TestCase):
+    """The form has to fit its own labels, and the user has to be able to widen it."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        before = set(self.root.winfo_children())
+        self.app.open_settings_dialog()
+        self.root.update()
+        self.dialog = next(w for w in self.root.winfo_children() if w not in before)
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+
+    def test_the_window_can_be_widened(self) -> None:
+        # It was fixed-width, so a label wider than the form had nowhere to go.
+        self.assertEqual(
+            tuple(bool(value) for value in self.dialog.resizable()),
+            (True, True),
+            "the settings window cannot be resized in both directions",
+        )
+
+    def test_it_opens_wide_enough_for_its_own_contents(self) -> None:
+        self.root.update_idletasks()
+        self.assertGreaterEqual(
+            int(self.dialog.winfo_width()),
+            int(self.dialog.winfo_reqwidth()),
+            "the settings window opens narrower than the widest tab needs, so text is clipped",
+        )
+
+    def test_every_group_of_settings_is_reachable(self) -> None:
+        notebook = self.app.settings_notebook
+        tabs = [str(notebook.tab(index, "text")) for index in range(notebook.index("end"))]
+        self.assertEqual(tabs, ["Detection", "Model", "Prompts", "Advanced"])
+        # Detection is what a reviewer opens Settings for, so it is the tab on top.
+        self.assertEqual(notebook.index(notebook.select()), 0)
 
 
 class RegionAggregation(unittest.TestCase):
@@ -691,6 +747,10 @@ class GuiReviewQueue(unittest.TestCase):
         self.folder = Path(tempfile.mkdtemp(prefix="bikini_queue_"))
         _make_images(self.folder, count=6)
         self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        # Both are saved preferences shared by every app built in this run, so a test
+        # that changes one would otherwise decide what the next test sees.
+        self.app.label_filter_var.set("all")
+        self.app.hide_decided_var.set(True)
         self.app._set_folder(str(self.folder))
         self.paths = [str(path) for path in collect_image_paths(self.folder)]
         self.app.current_state = scorer_module.ScoreState(
@@ -792,6 +852,177 @@ class GuiReviewQueue(unittest.TestCase):
         self.app.next_page()
         self.assertEqual(len(self.app.page_samples), 10, "the last page should hold the remainder")
 
+    def test_a_decided_photo_leaves_the_grid_immediately(self) -> None:
+        """The reported bug: Accept/REJECT re-rendered the same photos.
+
+        The grid only rebuilt when the background retrain landed, and the retrain
+        rebuilt the same list, so nothing on screen ever moved.
+        """
+        self.app.update_algorithm = lambda: None  # type: ignore[method-assign]
+        self.app.focused_path = self.paths[0]
+        self.app.set_label(self.paths[0], 1)
+        shown = [str(sample["path"]) for sample in self.app.page_samples]
+        self.assertNotIn(self.paths[0], shown, "the accepted photo is still in the grid")
+        self.assertEqual(len(shown), len(self.paths) - 1)
+        self.assertEqual(self.app.focused_path, self.paths[1], "the active picture did not move on")
+
+    def test_the_detected_view_advances_too(self) -> None:
+        self.app.update_algorithm = lambda: None  # type: ignore[method-assign]
+        self.app.view_mode = "detected"
+        self.app.current_samples = [
+            {"path": path, "score": 0.9, "bucket": "Bikini"} for path in self.paths
+        ]
+        self.app._refresh_displayed_results()
+        self.app.focused_path = self.paths[0]
+        self.app.set_label(self.paths[0], 0)
+        self.assertNotIn(
+            self.paths[0],
+            [str(sample["path"]) for sample in self.app.page_samples],
+            "the rejected photo stayed in the detected-files grid",
+        )
+
+    def test_asking_for_the_labeled_ones_still_shows_them(self) -> None:
+        assert self.app.store is not None
+        self.app.store.save_labels({self.paths[0]: 1})
+        self.app.label_filter_var.set("labeled")
+        # Asked in the detected view, which lists everything found. The review queue is
+        # assembled out of undecided photos, so a labelled one is never in it to show.
+        self.app.view_mode = "detected"
+        self.app.current_samples = [
+            {"path": path, "score": 0.9, "bucket": "Bikini"} for path in self.paths
+        ]
+        self.app._refresh_displayed_results()
+        self.assertEqual(
+            [str(sample["path"]) for sample in self.app.page_samples],
+            [self.paths[0]],
+            "'Show: labeled' was overruled by the hide-decided rule",
+        )
+
+    def test_decided_photos_come_back_when_the_rule_is_switched_off(self) -> None:
+        assert self.app.store is not None
+        self.app.store.save_labels(dict.fromkeys(self.paths[:3], 1))
+        # Asked of the detected view: the review queue is assembled out of undecided
+        # photos in the first place, so there is nothing there for the rule to hide.
+        self.app.view_mode = "detected"
+        self.app.current_samples = [
+            {"path": path, "score": 0.9, "bucket": "Bikini"} for path in self.paths
+        ]
+        self.app._refresh_displayed_results()
+        self.assertEqual(len(self.app.page_samples), len(self.paths) - 3)
+        self.app.hide_decided_var.set(False)
+        self.assertEqual(
+            len(self.app.page_samples),
+            len(self.paths),
+            "unticking 'Hide decided' did not bring the decided photos back",
+        )
+
+    def test_a_run_of_decisions_costs_one_retrain(self) -> None:
+        """A retrain refits the model and rescores every image in the folder.
+
+        Firing one per click meant a reviewer working at a photo a second queued work
+        faster than the machine could clear it — measured at 1.5-1.8 s a click on
+        5 000 images. The decisions are saved immediately either way; only the re-rank
+        waits for a pause.
+        """
+        launched: list[bool] = []
+        self.app._launch_background_scan = lambda full_rescan: launched.append(full_rescan)  # type: ignore[method-assign]
+        self.app._ensure_scorer = lambda: True  # type: ignore[method-assign]
+        for path in self.paths[:5]:
+            self.app.focused_path = path
+            self.app.set_label(path, 1)
+        self.assertEqual(launched, [], "labelling started a retrain per click instead of batching them")
+        self.assertTrue(self.app._retrain_pending, "the queued labels were forgotten rather than deferred")
+        self.assertEqual(self.app._labels_since_retrain, 5)
+        # Whatever fires it — the idle timer, the burst cap, or Tools > Update
+        # rankings — one pass folds in everything that accumulated.
+        self.app._flush_retrain()
+        self.assertEqual(launched, [False], "the queued labels never reached the model")
+        self.assertFalse(self.app._retrain_pending)
+        self.assertEqual(self.app._labels_since_retrain, 0)
+
+    def test_the_grid_keeps_the_cards_that_are_staying(self) -> None:
+        """Removing one card must not rebuild the other nineteen.
+
+        A card is ~17 Tk widgets; tearing down and rebuilding a whole page per
+        decision profiled at over a second.
+        """
+        self.app._launch_background_scan = lambda full_rescan: None  # type: ignore[method-assign]
+        self.app._ensure_scorer = lambda: True  # type: ignore[method-assign]
+        self.app._refresh_displayed_results()
+        decided = str(self.app.page_samples[0]["path"])
+        survivor = str(self.app.page_samples[1]["path"])
+        survivor_widget = self.app.cards[survivor].frame
+        self.app.focused_path = decided
+        self.app.set_label(decided, 1)
+        self.assertNotIn(decided, self.app.cards, "the decided card was left in the grid")
+        self.assertIs(
+            self.app.cards[survivor].frame,
+            survivor_widget,
+            "the whole page was torn down and rebuilt to remove a single card",
+        )
+
+    def test_a_retrain_does_not_move_the_photo_you_are_about_to_judge(self) -> None:
+        """A re-rank must not reorder the page under the reviewer.
+
+        The model re-ranks everything, so without pinning, the photo being lined up
+        for an Accept slides elsewhere the moment the retrain lands and the click
+        goes to something else.
+        """
+        self.app._launch_background_scan = lambda full_rescan: None  # type: ignore[method-assign]
+        self.app._refresh_displayed_results()
+        before = [str(sample["path"]) for sample in self.app.page_samples]
+        # The re-rank arrives and reverses the ranking outright.
+        for index, sample in enumerate(self.app.current_samples):
+            sample["score"] = float(index) / len(self.app.current_samples)
+        self.app._refresh_displayed_results(reset_page=False)
+        self.assertEqual(
+            [str(sample["path"]) for sample in self.app.page_samples],
+            before,
+            "the re-rank reshuffled the page the reviewer was working through",
+        )
+        # Turning the page is the boundary where the new ranking is allowed in.
+        self.app.page_size_var.set(3)
+        self.app._page_order = []
+        self.app._refresh_displayed_results(reset_page=True)
+        self.app.next_page()
+        self.app.previous_page()
+        self.assertNotEqual(
+            [str(sample["path"]) for sample in self.app.page_samples],
+            before[:3],
+            "the new ranking never took effect, even after a page turn",
+        )
+
+    def test_undo_says_what_it_would_undo(self) -> None:
+        self.app._launch_background_scan = lambda full_rescan: None  # type: ignore[method-assign]
+        self.assertEqual(self.app.undo_hint_var.get(), "", "there is nothing to undo yet")
+        self.app.focused_path = self.paths[0]
+        self.app.set_label(self.paths[0], 1)
+        self.assertIn("Accept", self.app.undo_hint_var.get())
+        self.assertIn(Path(self.paths[0]).name, self.app.undo_hint_var.get())
+        # A bulk edit has to be distinguishable from a single misclick before you
+        # press Ctrl+Z, which is the whole point.
+        self.app._apply_label_batch(dict.fromkeys(self.paths, 0), status="bulk", retrain=False)
+        self.assertIn(f"REJECT {len(self.paths)} photos", self.app.undo_hint_var.get())
+
+    def test_focus_mode_decides_without_the_grid(self) -> None:
+        self.app._launch_background_scan = lambda full_rescan: None  # type: ignore[method-assign]
+        self.app._refresh_displayed_results()
+        self.app.focused_path = str(self.app.page_samples[0]["path"])
+        first = self.app.focused_path
+        self.app.enter_focus_mode()
+        self.root.update()
+        try:
+            self.assertIsNotNone(self.app._focus_window, "focus mode did not open")
+            self.app._focus_decide(1)
+            self.root.update()
+            self.assertNotEqual(self.app.focused_path, first, "the queue did not advance")
+            assert self.app.store is not None
+            self.assertEqual(self.app.store.load_labels().get(first), 1, "the decision was not recorded")
+        finally:
+            self.app.exit_focus_mode()
+            self.root.update()
+        self.assertIsNone(self.app._focus_window, "focus mode did not close")
+
     def test_a_retrain_reports_what_the_labels_changed(self) -> None:
         state = self.app.current_state
         assert state is not None
@@ -808,6 +1039,458 @@ class GuiReviewQueue(unittest.TestCase):
         state.classifier_label_count = 0
         report = self.app._retrain_report(state, {}, threshold=0.5)
         self.assertIn("zero-shot", report)
+
+
+class WorkflowTools(unittest.TestCase):
+    """The queue, notes, browse mode and bulk scopes, driven the way a user drives them."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_tools_"))
+        _make_images(self.folder, count=5)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app.label_filter_var.set("all")
+        self.app.hide_decided_var.set(True)
+        self.app._launch_background_scan = lambda full_rescan: None  # type: ignore[method-assign]
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_a_folder_can_be_reviewed_without_scanning_it(self) -> None:
+        """Judging photos should not require a model download and an embedding pass."""
+        self.app.browse_without_scanning(str(self.folder))
+        self.root.update()
+        self.assertEqual(self.app.view_mode, "browse")
+        self.assertTrue(self.app.page_samples, "browsing showed nothing")
+        target = str(self.app.page_samples[0]["path"])
+        self.app.focused_path = target
+        self.app.set_label(target, 1)
+        assert self.app.store is not None
+        # The decision lands in the same file a scan reads, so a later scan starts
+        # already knowing it.
+        self.assertEqual(self.app.store.load_labels().get(target), 1)
+        self.assertNotIn(target, [str(sample["path"]) for sample in self.app.page_samples])
+
+    def test_the_scan_queue_can_be_reordered_and_pruned(self) -> None:
+        self.app.scan_queue = ["/one", "/two", "/three"]
+        self.app._reload_queue_listbox()
+        self.app.queue_listbox.selection_set(2)
+        self.app.move_queue_item(-1)
+        self.assertEqual(self.app.scan_queue, ["/one", "/three", "/two"])
+        self.app.queue_listbox.selection_clear(0, "end")
+        self.app.queue_listbox.selection_set(0)
+        self.app.remove_queue_item()
+        self.assertEqual(self.app.scan_queue, ["/three", "/two"])
+
+    def test_a_note_survives_and_reaches_the_places_that_show_it(self) -> None:
+        self.app.browse_without_scanning(str(self.folder))
+        self.root.update()
+        assert self.app.store is not None
+        target = str(self.app.page_samples[0]["path"])
+        self.app.store.save_notes({target: "second opinion needed"})
+        self.assertEqual(self.app.note_for(target), "second opinion needed")
+        self.assertIn("second opinion needed", self.app._card_label_text(target))
+        self.assertIn("second opinion needed", self.app._preview_caption_text(target))
+        # Blank clears rather than storing an empty string.
+        self.app.store.save_notes({target: "   "})
+        self.assertEqual(self.app.note_for(target), "")
+
+    def test_bulk_actions_say_what_they_will_touch(self) -> None:
+        self.app.browse_without_scanning(str(self.folder))
+        self.root.update()
+        paths, scope = self.app._output_scope()
+        self.assertEqual(len(paths), len(self.app.displayed_samples))
+        self.assertIn("image", scope)
+        # "Visible" now depends on hide-decided as well as the filters and paging, so
+        # the confirmation has to name that rather than leave it implied.
+        self.assertIn("already decided", scope)
+
+    def test_find_similar_can_be_backed_out_of(self) -> None:
+        self.app.browse_without_scanning(str(self.folder))
+        self.root.update()
+        before = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app._view_return = (
+            self.app.view_mode,
+            list(self.app.current_samples),
+            self.app.page_index,
+            self.app.focused_path,
+        )
+        self.app.view_mode = "similar"
+        self.app.current_samples = [{"path": before[0], "score": 1.0, "bucket": "Similar"}]
+        self.app._refresh_displayed_results()
+        self.assertEqual(len(self.app.page_samples), 1)
+        self.app.go_back()
+        self.assertEqual(self.app.view_mode, "browse")
+        self.assertEqual([str(sample["path"]) for sample in self.app.page_samples], before)
+
+
+class CacheAndDecisions(unittest.TestCase):
+    """Clearing a cache must not take the work that cannot be recomputed."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_clear_"))
+        _make_images(self.folder, count=3)
+        self.store = FolderStore(self.folder)
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+        self.store.save_labels({self.paths[0]: 1, self.paths[1]: 0})
+        self.store.save_notes({self.paths[0]: "keep this one"})
+        self.store.config_override_path.write_text(json.dumps({"threshold": 0.5}), encoding="utf-8")
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_clearing_the_cache_keeps_decisions_notes_and_the_override(self) -> None:
+        """The old behaviour rmtree'd the lot, including hours of hand-made decisions."""
+        self.store.clear_cache()
+        self.assertEqual(self.store.load_labels(), {self.paths[0]: 1, self.paths[1]: 0})
+        self.assertEqual(self.store.load_notes(), {self.paths[0]: "keep this one"})
+        self.assertTrue(self.store.config_override_path.exists(), "the folder's saved settings were destroyed")
+
+    def test_clearing_everything_is_still_possible_when_asked_for(self) -> None:
+        self.store.clear_cache(keep_decisions=False)
+        self.assertEqual(self.store.load_labels(), {})
+        self.assertEqual(self.store.load_notes(), {})
+
+    def test_deleting_decisions_leaves_the_cache_alone(self) -> None:
+        marker = self.store.cache_dir / "cache.db"
+        self.store.delete_decisions()
+        self.assertEqual(self.store.load_labels(), {})
+        self.assertEqual(self.store.load_notes(), {})
+        self.assertTrue(marker.exists(), "deleting decisions should not touch cached scan data")
+
+    def test_cached_path_count_reports_what_a_scan_would_reuse(self) -> None:
+        paths = collect_image_paths(self.folder)
+        self.assertEqual(self.store.cached_path_count(paths), 0)
+
+
+class ResolvedPathMemo(unittest.TestCase):
+    """The path memo has to agree with Path.resolve, or the cache keys drift."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_resolve_"))
+        _make_images(self.folder, count=2)
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_it_matches_path_resolve(self) -> None:
+        for path in collect_image_paths(self.folder):
+            self.assertEqual(safe_io.resolved_str(path), str(path.resolve()))
+
+    def test_it_agrees_across_equivalent_spellings(self) -> None:
+        """A cache keyed on this must not split one file into two entries."""
+        path = next(iter(collect_image_paths(self.folder)))
+        roundabout = Path(str(path.parent)) / "." / path.name
+        self.assertEqual(safe_io.resolved_str(roundabout), safe_io.resolved_str(path))
+
+    def test_a_missing_file_still_resolves(self) -> None:
+        # Scan metadata records skipped and vanished files, so this must not raise.
+        missing = self.folder / "gone.jpg"
+        self.assertEqual(safe_io.resolved_str(missing), str(missing.resolve()))
+
+
+class GridLayout(unittest.TestCase):
+    """Column fitting and the grid's share of the window."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.gui_module = gui_module
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+
+    def test_a_wider_window_fits_more_cards_not_bigger_ones(self) -> None:
+        """Auto columns; widening used to make two cards larger instead of adding a third."""
+        self.app.columns_var.set(0)
+        self.app.thumbnail_size_var.set(240)
+        self.root.geometry("1500x950")
+        self.root.update()
+        wide = self.app._grid_columns()
+        self.root.geometry("900x700")
+        self.root.update()
+        narrow = self.app._grid_columns()
+        self.assertGreater(wide, narrow, "the column count did not follow the window width")
+        self.assertGreaterEqual(wide, 2)
+
+    def test_an_explicit_column_count_is_still_obeyed(self) -> None:
+        self.app.columns_var.set(2)
+        self.root.geometry("1900x1000")
+        self.root.update()
+        self.assertEqual(self.app._grid_columns(), 2, "a pinned column count was overridden by auto-fit")
+
+    def test_the_grid_keeps_room_for_a_whole_card(self) -> None:
+        """The floor has to cover the thumbnail *and* its action row.
+
+        With a flat floor the Accept/REJECT buttons sat below the fold at 950x700.
+        """
+        for thumb in (160, 240, 400):
+            self.app.thumbnail_size_var.set(thumb)
+            self.assertGreater(
+                self.app._min_grid_height(),
+                thumb,
+                "the grid floor must leave room for the card chrome, not just the image",
+            )
+
+    def test_the_preview_never_outgrows_its_pane(self) -> None:
+        # Rendering taller than the pane clipped the bottom off the photo.
+        self.root.geometry("950x700")
+        self.root.update()
+        _, height = self.app._preview_size()
+        self.assertLessEqual(height, 700 - self.app._min_grid_height())
+
+
+class ThumbnailFraming(unittest.TestCase):
+    """Grid thumbnails fill their slot; the preview still shows the whole frame."""
+
+    def test_a_portrait_photo_fills_a_square_slot(self) -> None:
+        from bikini_scanner import gui as gui_module
+
+        source = Image.new("RGB", (400, 1200), (10, 20, 30))
+        filled = gui_module.BikiniScannerApp._thumbnail_fill(source, 240, 240)
+        self.assertEqual(filled.size, (240, 240), "the thumbnail did not fill its slot")
+
+    def test_a_landscape_photo_fills_a_square_slot(self) -> None:
+        from bikini_scanner import gui as gui_module
+
+        source = Image.new("RGB", (1600, 500), (10, 20, 30))
+        self.assertEqual(gui_module.BikiniScannerApp._thumbnail_fill(source, 240, 240).size, (240, 240))
+
+    def test_the_preview_still_letterboxes(self) -> None:
+        """Cropping is right for a contact sheet and wrong for judging a photo."""
+        from bikini_scanner import gui as gui_module
+
+        source = Image.new("RGB", (400, 1200), (10, 20, 30))
+        boxed = gui_module.BikiniScannerApp._preview_letterbox(source, 800, 300)
+        self.assertEqual(boxed.height, 300)
+        self.assertLess(boxed.width, 800, "the preview must not crop to fill")
+
+
+class ProgressWeighting(unittest.TestCase):
+    """The bar has to reflect the work this scan actually has to do."""
+
+    def test_a_cached_rescan_does_not_hand_the_bar_to_the_embed_phase(self) -> None:
+        cold = scorer_module.phase_shares(uncached=1000, total=1000, runs_detail_pass=True)
+        warm = scorer_module.phase_shares(uncached=0, total=1000, runs_detail_pass=True)
+        self.assertAlmostEqual(sum(cold.values()), 1.0, places=6)
+        self.assertAlmostEqual(sum(warm.values()), 1.0, places=6)
+        self.assertGreater(cold[scorer_module.PHASE_EMBED], 0.5, "a cold scan is mostly embedding")
+        self.assertLess(
+            warm[scorer_module.PHASE_EMBED],
+            0.05,
+            "a fully cached rescan gave the embed phase 65% of the bar and then crawled",
+        )
+        self.assertGreater(warm[scorer_module.PHASE_DETAIL], cold[scorer_module.PHASE_DETAIL])
+
+    def test_no_detail_pass_still_reaches_one(self) -> None:
+        shares = scorer_module.phase_shares(uncached=10, total=10, runs_detail_pass=False)
+        self.assertAlmostEqual(sum(shares.values()), 1.0, places=6)
+        self.assertEqual(shares[scorer_module.PHASE_DETAIL], 0.0)
+
+
+class ShortcutGuard(unittest.TestCase):
+    """A single letter must not label a photo from the wrong widget."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+
+    def test_the_queue_listbox_swallows_its_own_keystrokes(self) -> None:
+        """Selecting a queue folder and pressing 'd' used to reject the active photo."""
+        # The queue panel is collapsed by default and an unmapped widget cannot take
+        # focus, so open it first. focus_force because a suite run has no window
+        # manager focus, which would leave focus_get() returning None.
+        self.app._toggle_panel("queue")
+        self.root.update()
+        self.app.queue_listbox.focus_force()
+        self.root.update()
+        if self.root.focus_get() is not self.app.queue_listbox:
+            self.skipTest("the window manager did not grant focus to the test window")
+        self.assertTrue(
+            self.app._focus_is_text_input(),
+            "a Listbox with focus must not let single-letter label shortcuts through",
+        )
+
+    def test_the_grid_still_receives_shortcuts(self) -> None:
+        self.app.grid_canvas.focus_force()
+        self.root.update()
+        if self.root.focus_get() is not self.app.grid_canvas:
+            self.skipTest("the window manager did not grant focus to the test window")
+        self.assertFalse(self.app._focus_is_text_input(), "the results grid must still take shortcuts")
+
+
+class ProfileContent(unittest.TestCase):
+    """A profile should capture a way of working, not one number."""
+
+    def test_built_ins_cover_whole_setups(self) -> None:
+        self.assertGreaterEqual(len(BUILTIN_PROFILES), 5)
+        thorough = profile_config("Thorough")
+        triage = profile_config("Fast triage")
+        assert thorough is not None and triage is not None
+        self.assertEqual(thorough.deep_scan, "always")
+        self.assertTrue(thorough.refine_model)
+        self.assertEqual(triage.deep_scan, "off")
+        self.assertFalse(triage.refine_model)
+
+    def test_a_saved_profile_round_trips_every_setting(self) -> None:
+        config = ScannerConfig()
+        config.threshold = 0.42
+        config.deep_scan = "always"
+        config.positive_prompts = ["a distinctive prompt"]
+        config_profiles.save_profile("Round trip", config)
+        try:
+            restored = profile_config("Round trip")
+            assert restored is not None
+            self.assertAlmostEqual(restored.threshold, 0.42)
+            self.assertEqual(restored.deep_scan, "always")
+            self.assertEqual(restored.positive_prompts, ["a distinctive prompt"])
+        finally:
+            config_profiles.delete_profile("Round trip")
+
+
+class HeadlessLabelExchange(unittest.TestCase):
+    """Batch runs and interactive review have to be able to feed each other."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_exchange_"))
+        _make_images(self.folder, count=3)
+        self.store = FolderStore(self.folder)
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_labels_import_by_filename_and_from_another_machine(self) -> None:
+        source = self.folder / "labels.json"
+        source.write_text(
+            json.dumps(
+                {
+                    Path(self.paths[0]).name: 1,
+                    "/somewhere/else/" + Path(self.paths[1]).name: 0,
+                    "not_in_this_folder.jpg": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        merged = run_module._merge_labels(self.store, source)
+        self.assertEqual(merged, 2, "a label for a file that is not here should be skipped")
+        labels = self.store.load_labels()
+        self.assertEqual(labels.get(self.paths[0]), 1)
+        self.assertEqual(labels.get(self.paths[1]), 0)
+
+    def test_out_of_range_labels_are_refused(self) -> None:
+        source = self.folder / "labels.json"
+        source.write_text(json.dumps({Path(self.paths[0]).name: 9, Path(self.paths[1]).name: "x"}), encoding="utf-8")
+        self.assertEqual(run_module._merge_labels(self.store, source), 0)
+        self.assertEqual(self.store.load_labels(), {})
+
+    def test_a_non_object_payload_is_rejected(self) -> None:
+        source = self.folder / "labels.json"
+        source.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            run_module._merge_labels(self.store, source)
+
+
+class LogisticConvergence(unittest.TestCase):
+    """The optimiser has to recognise when it has finished."""
+
+    @staticmethod
+    def _separable(rows: int, columns: int, seed: int = 3):
+        rng = np.random.default_rng(seed)
+        features = rng.normal(size=(rows, columns)).astype(np.float32)
+        labels = (rng.random(rows) < 0.5).astype(np.int64)
+        features[labels == 1] += 0.6
+        return features, labels
+
+    def test_an_ordinary_fit_stops_well_before_the_cap(self) -> None:
+        features, labels = self._separable(80, 40)
+        model = linear_model.LogisticRegression().fit(features, labels)
+        self.assertTrue(model.converged, "a well-posed fit still reported non-convergence")
+        self.assertLess(model.n_iter, model.max_iter, "the fit burned every iteration it was allowed")
+
+    def test_a_warm_start_reaches_the_same_answer_sooner(self) -> None:
+        features, labels = self._separable(80, 40)
+        cold = linear_model.LogisticRegression().fit(features, labels)
+        warm = linear_model.LogisticRegression().fit(
+            features, labels, init_coef=cold.coef, init_intercept=cold.intercept
+        )
+        self.assertLess(warm.n_iter, cold.n_iter, "warm starting did not save any work")
+        # Same optimum, so the ranking a reviewer sees is unchanged.
+        np.testing.assert_allclose(
+            cold.decision_function(features), warm.decision_function(features), atol=2e-2
+        )
+
+    def test_the_regularisation_sweep_can_be_skipped(self) -> None:
+        features, labels = self._separable(60, 20)
+        swept = learning.fit(features, labels)
+        self.assertIsNotNone(swept.chosen_c)
+        reused = learning.fit(features, labels, reuse_c=swept.chosen_c)
+        self.assertEqual(reused.chosen_c, swept.chosen_c, "reuse_c did not pin the value it was given")
+
+
+class QueueSelection(unittest.TestCase):
+    """Building the review queue must stay exact while being fast enough to run."""
+
+    def test_diverse_selection_handles_ties_and_empty_vectors(self) -> None:
+        rng = np.random.default_rng(11)
+        count = 120
+        paths = [f"p{index:03d}.jpg" for index in range(count)]
+        scores = rng.random(count)
+        scores[:40] = 0.5  # exact ties on the secondary key
+        embeddings = rng.normal(size=(count, 32)).astype(np.float32)
+        embeddings[:10] = embeddings[0]  # duplicates
+        embeddings[10:13] = 0.0  # zero-length vectors
+        samples = bucketed_sampling(
+            paths, scores, [], embeddings=embeddings, threshold=0.35, disagreement=rng.random(count) * 0.3
+        )
+        chosen = [str(sample["path"]) for sample in samples]
+        self.assertTrue(samples, "the queue came back empty")
+        self.assertEqual(len(chosen), len(set(chosen)), "the same photo was queued twice")
+
+    def test_the_queue_is_built_without_scanning_every_pair(self) -> None:
+        """Guards the vectorised selection: this shape took over a second per retrain."""
+        rng = np.random.default_rng(5)
+        count = 4000
+        paths = [f"p{index:05d}.jpg" for index in range(count)]
+        scores = rng.random(count)
+        embeddings = rng.normal(size=(count, 256)).astype(np.float32)
+        started = time.perf_counter()
+        bucketed_sampling(
+            paths, scores, [], embeddings=embeddings, threshold=0.35, disagreement=rng.random(count) * 0.3
+        )
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 1.0, f"building the review queue took {elapsed:.2f}s for {count} images")
 
 
 class LearningReadout(unittest.TestCase):

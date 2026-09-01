@@ -152,13 +152,27 @@ def _make_estimator(c_value: float) -> Any:
     return LogisticRegression(C=float(c_value))
 
 
-def _cross_validated_auc(features: np.ndarray, labels: np.ndarray, c_value: float) -> float | None:
+def warm_start_of(model: Any) -> tuple[np.ndarray | None, float | None]:
+    """Coefficients to start the next fit from, unwrapping a calibrator if present."""
+    inner = getattr(model, "model", model)
+    if not isinstance(inner, LogisticRegression) or not inner.fitted or inner.coef.size == 0:
+        return None, None
+    return inner.coef, float(inner.intercept)
+
+
+def _cross_validated_auc(
+    features: np.ndarray,
+    labels: np.ndarray,
+    c_value: float,
+    init_coef: np.ndarray | None = None,
+    init_intercept: float | None = None,
+) -> float | None:
     counts = np.bincount(labels, minlength=2)
     folds = int(min(5, counts.min()))
     if folds < 3:
         return None
     try:
-        predictions = cross_val_scores(features, labels, float(c_value), folds)
+        predictions = cross_val_scores(features, labels, float(c_value), folds, init_coef, init_intercept)
         scored = np.isfinite(predictions)
         if not scored.all():
             # A fold that could not be trained against contributes no measurement.
@@ -170,15 +184,28 @@ def _cross_validated_auc(features: np.ndarray, labels: np.ndarray, c_value: floa
         return None
 
 
-def _select_c(features: np.ndarray, labels: np.ndarray) -> tuple[float, float | None]:
-    """Pick C by cross-validated AUC; fall back to a middling value when unmeasurable."""
+def _select_c(
+    features: np.ndarray,
+    labels: np.ndarray,
+    only: float | None = None,
+    init_coef: np.ndarray | None = None,
+    init_intercept: float | None = None,
+) -> tuple[float, float | None]:
+    """Pick C by cross-validated AUC; fall back to a middling value when unmeasurable.
+
+    `only` restricts the search to a single value - used when the caller has already
+    chosen C on more data than this retrain added. Sweeping the whole grid costs folds
+    x grid fits, which is the bulk of the work in a retrain, and the answer does not
+    move for the sake of three new labels.
+    """
     counts = np.bincount(labels, minlength=2)
     if len(labels) < 12 or counts.min() < 3:
         return 1.0, None
-    best_c = 1.0
+    grid = (float(only),) if only is not None else _C_GRID
+    best_c = float(only) if only is not None else 1.0
     best_auc: float | None = None
-    for candidate in _C_GRID:
-        auc = _cross_validated_auc(features, labels, candidate)
+    for candidate in grid:
+        auc = _cross_validated_auc(features, labels, candidate, init_coef, init_intercept)
         if auc is None:
             continue
         if best_auc is None or auc > best_auc:
@@ -187,32 +214,50 @@ def _select_c(features: np.ndarray, labels: np.ndarray) -> tuple[float, float | 
     return best_c, best_auc
 
 
-def _calibrate(estimator: Any, features: np.ndarray, labels: np.ndarray) -> Any:
+def _calibrate(
+    estimator: Any,
+    features: np.ndarray,
+    labels: np.ndarray,
+    init_coef: np.ndarray | None = None,
+    init_intercept: float | None = None,
+) -> Any:
     """Hold out a slice to calibrate probabilities when there is enough data."""
     counts = np.bincount(labels, minlength=2)
     if counts.min() < 4 or len(labels) < 16:
-        estimator.fit(features, labels)
+        estimator.fit(features, labels, init_coef=init_coef, init_intercept=init_intercept)
         return estimator
     try:
         test_size = max(4, int(round(len(labels) * 0.25)))
         if len(labels) - test_size < 8:
-            estimator.fit(features, labels)
+            estimator.fit(features, labels, init_coef=init_coef, init_intercept=init_intercept)
             return estimator
         train_index, calibration_index = stratified_split(labels, test_size)
         y_train = labels[train_index]
         y_calibration = labels[calibration_index]
         if len(set(y_train.tolist())) < 2 or len(set(y_calibration.tolist())) < 2:
-            estimator.fit(features, labels)
+            estimator.fit(features, labels, init_coef=init_coef, init_intercept=init_intercept)
             return estimator
-        estimator.fit(features[train_index], y_train)
+        estimator.fit(features[train_index], y_train, init_coef=init_coef, init_intercept=init_intercept)
         return PlattCalibrator(model=estimator).fit(features[calibration_index], y_calibration)
     except Exception:  # noqa: BLE001
-        estimator.fit(features, labels)
+        estimator.fit(features, labels, init_coef=init_coef, init_intercept=init_intercept)
         return estimator
 
 
-def fit(features: np.ndarray, labels: np.ndarray, max_weight: float = 0.85) -> LearningOutcome:
-    """Train from labelled feature vectors. Never raises: a failure means no learning."""
+def fit(
+    features: np.ndarray,
+    labels: np.ndarray,
+    max_weight: float = 0.85,
+    warm_start: Any | None = None,
+    reuse_c: float | None = None,
+) -> LearningOutcome:
+    """Train from labelled feature vectors. Never raises: a failure means no learning.
+
+    `warm_start` is the previously fitted model; its coefficients seed this fit, which
+    is what makes a retrain after a few new labels cheap. `reuse_c` skips the
+    regularisation sweep and takes the value the caller already settled on. Both are
+    optimisations only - omit them and this is the same cold fit it always was.
+    """
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels, dtype=np.int64)
     if features.size == 0 or labels.size == 0 or features.shape[0] != labels.shape[0]:
@@ -235,11 +280,14 @@ def fit(features: np.ndarray, labels: np.ndarray, max_weight: float = 0.85) -> L
     outcome.prototype = _fit_prototype(features, labels)
 
     if counts.min() >= 3 and labels.size >= MIN_CLASSIFIER_LABELS:
-        chosen_c, auc = _select_c(features, labels)
+        init_coef, init_intercept = warm_start_of(warm_start) if warm_start is not None else (None, None)
+        chosen_c, auc = _select_c(features, labels, only=reuse_c, init_coef=init_coef, init_intercept=init_intercept)
         outcome.chosen_c = chosen_c
         outcome.cv_auc = auc
         try:
-            outcome.classifier = _calibrate(_make_estimator(chosen_c), features, labels)
+            outcome.classifier = _calibrate(
+                _make_estimator(chosen_c), features, labels, init_coef=init_coef, init_intercept=init_intercept
+            )
         except Exception:
             LOGGER.exception("Classifier training failed; keeping the prototype model")
             outcome.classifier = None

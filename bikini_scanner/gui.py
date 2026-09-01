@@ -11,6 +11,7 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tkinter import (
     BOTH,
@@ -31,10 +32,11 @@ from tkinter import (
     Toplevel,
     filedialog,
     messagebox,
+    simpledialog,
     ttk,
 )
 from tkinter import font as tkfont
-from typing import Any, cast
+from typing import cast
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -45,18 +47,22 @@ from .backend_utils import ImageEmbeddingBackend
 from .config import HIGH_ACCURACY_MODEL, ScannerConfig, filter_folder_override
 from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
 from .global_store import GlobalLearningStore
-from .image_formats import open_oriented, oriented_size
+from .image_formats import heif_supported, open_oriented, oriented_size
 from .logging_setup import configure_logging, log_path, read_log_tail
 from .output_ops import (
     OutputOptions,
     PlannedTransfer,
+    TrashOutcome,
     build_html_report,
     build_transfer_plan,
     execute_transfer_plan,
+    format_output_name,
+    label_name,
+    organization_parts,
     trash_files,
     write_image_metadata,
 )
-from .plugins import apply_plugins
+from .plugins import apply_plugins, plugins_dir
 from .safe_io import atomic_write_json, quarantine_broken_file
 from .scorer import (
     PHASE_EMBED,
@@ -68,7 +74,7 @@ from .scorer import (
     scan_and_score_folder,
     state_disagreement,
 )
-from .store import MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES, FolderStore
+from .store import MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES, FolderStore, collect_image_paths
 from .update_checker import check_for_update
 from .user_prefs import load_user_prefs, prefs_path, save_user_prefs
 from .vlm_backend import is_local_endpoint
@@ -97,7 +103,79 @@ DETECTED_BUCKETS = ("Cleavage", "Bikini", "Midriff", "Explicit (NSFW)", "Other d
 # How many cards one page of the results grid holds. Chosen so a page renders in well
 # under a second on a slow disk; the pager below the grid walks the rest.
 DEFAULT_PAGE_SIZE = 120
+# Above this many images, confirm before starting: a folder this size is hours of work
+# and the count is already in hand by the time we could ask.
+LARGE_SCAN_WARNING = 20000
+
+# Chrome on a card below its thumbnail: the action row, the padding and a little of
+# the bucket heading above it. The grid floor is derived from this plus the thumbnail,
+# because "enough room for one whole card" is the thing that actually matters — at
+# 950x700 the preview took 45% of the height and the Accept/REJECT buttons on every
+# card sat below the fold, so labelling from the grid meant scrolling for each photo.
+CARD_CHROME_HEIGHT = 115
+# Target width for one card when the column count is left on "auto". Widening the
+# window used to make two cards bigger rather than fitting more in, so a 1500px window
+# gave each card ~720px for ~550px of content and the rest was empty.
+TARGET_CARD_WIDTH = 460
+# ...and the preview never takes more than this share of the workspace.
+MAX_PREVIEW_SHARE = 0.6
+
+# Sort order for the review buckets, with the detected-view buckets after them. Built
+# once: this used to be reconstructed inside the sort key, i.e. once per sample per
+# sort, which on a folder of a few thousand is a few thousand identical dictionaries.
+BUCKET_ORDER = {
+    "Likely match": 0,
+    "Likely false positive": 1,
+    "Likely false negative": 2,
+    "Uncertain": 3,
+}
+BUCKET_ORDER.update({name: 10 + position for position, name in enumerate(DETECTED_BUCKETS)})
+
+# Label value to the word the filters and the UI match on.
+_LABEL_WORDS: dict[int | None, str] = {1: "good", 0: "bad", 2: "skip"}
 PAGE_SIZE_CHOICES = (60, 120, 240, 500, 1000)
+
+# Labelling used to fire one full retrain per click, and a retrain refits the learned
+# model and rescores every image in the folder. Measured: ~120 ms per click on 500
+# images climbing to ~1 s as labels accumulate, and ~1.5-1.8 s per click on 5 000. A
+# reviewer working at one photo a second was queueing work faster than the machine
+# could clear it, so the queue was permanently behind.
+#
+# The decision itself is saved to disk the instant it is made — that part is not
+# deferred and cannot be lost. Only the re-rank is batched, and a re-rank is an
+# optimisation: it reorders what you have not looked at yet. Waiting out a short pause
+# in labelling costs a little freshness and saves a retrain per click.
+RETRAIN_IDLE_MS = 2500
+# ...unless the reviewer is on a roll and never pauses, in which case fold the labels
+# in every so often anyway so the ranking does not go stale over a long session.
+RETRAIN_LABEL_BURST = 25
+
+# The review-session snapshot is an atomic whole-file write of every sample, and it is
+# triggered from the render, focus and label paths alike. Batching it the same way
+# keeps a fast reviewer off the disk; labels.json is written synchronously regardless,
+# so nothing a reviewer decided depends on this landing.
+SESSION_SAVE_IDLE_MS = 1200
+
+
+@dataclass(slots=True)
+class FilterContext:
+    """The filter settings, read once and reused for a whole pass.
+
+    Every one of these is a Tk variable, and reading one is a round trip into Tcl.
+    `_sample_visible` read seven of them per sample, so filtering a few thousand
+    results meant tens of thousands of round trips to answer questions whose answers
+    could not change part-way through the pass.
+    """
+
+    labels: dict[str, int]
+    search: str
+    label_mode: str
+    match_mode: str
+    hide_decided: bool
+    threshold: float
+    score_min: float | None
+    score_max: float | None
+    browse: bool
 
 
 @dataclass(slots=True)
@@ -110,6 +188,11 @@ class ResultCard:
     details_label: ttk.Label
     image_ref: ImageTk.PhotoImage
     score: float = 0.0
+    # What was last drawn for this card. Comparing against these turns the focus pass
+    # from "two Tk calls per card on screen" into "two Tk calls, total".
+    focused: bool = False
+    style: str = ""
+
 
 
 class BikiniScannerApp:
@@ -132,10 +215,17 @@ class BikiniScannerApp:
         self.status_var = StringVar(value="Choose a folder to begin.")
         self.summary_var = StringVar(value="")
         self.threshold_var = DoubleVar(value=float(self.config.threshold))
+        # Text mirror of the slider, so the value is both readable and typeable.
+        self.threshold_text_var = StringVar(value=f"{float(self.config.threshold):.2f}")
         self.theme_var = StringVar(value=str(self.user_prefs.get("theme", "dark")))
         self.font_size_var = IntVar(value=int(self.user_prefs.get("font_size", 10)))
-        self.columns_var = IntVar(value=int(self.user_prefs.get("columns", 2)))
-        self.thumbnail_size_var = IntVar(value=int(self.user_prefs.get("thumbnail_size", 320)))
+        # 0 means "fit to the window"; a saved non-zero value is an explicit choice and
+        # is still honoured.
+        self.columns_var = IntVar(value=int(self.user_prefs.get("columns", 0)))
+        # 240, not 320: the grid is a contact sheet, and now that thumbnails fill their
+        # slot rather than letterboxing, a smaller one reads just as well and fits half
+        # again as many cards across. A saved preference still wins.
+        self.thumbnail_size_var = IntVar(value=int(self.user_prefs.get("thumbnail_size", 240)))
         self.page_size_var = IntVar(value=int(self.user_prefs.get("page_size", DEFAULT_PAGE_SIZE)))
         try:
             thumbnail_cache_size = int(self.user_prefs.get("thumbnail_cache_size", 512))
@@ -148,6 +238,10 @@ class BikiniScannerApp:
         self.label_filter_var = StringVar(value=str(self.user_prefs.get("label_filter", "all")))
         self.score_min_var = StringVar(value=str(self.user_prefs.get("score_min", "")))
         self.score_max_var = StringVar(value=str(self.user_prefs.get("score_max", "")))
+        # Deciding a photo takes it out of the grid, so Accept/REJECT visibly advances
+        # instead of re-rendering the same page. Off, every view keeps showing what you
+        # already judged, which is what made the queue look stuck.
+        self.hide_decided_var = BooleanVar(value=bool(self.user_prefs.get("hide_decided", True)))
         self.output_organization_var = StringVar(value=str(self.user_prefs.get("output_organization", "flat")))
         self.output_template_var = StringVar(value=str(self.user_prefs.get("output_template", "{stem}")))
         self.output_duplicate_var = StringVar(value=str(self.user_prefs.get("output_duplicate", "rename")))
@@ -166,6 +260,16 @@ class BikiniScannerApp:
         self.stats_var = StringVar(value="")
         self.notice_var = StringVar(value="")
         self.cards: dict[str, ResultCard] = {}
+        # Bucket headings are reused across renders alongside the cards; the layout
+        # signature says when card geometry changed and a real rebuild is unavoidable.
+        self._bucket_headings: dict[str, ttk.Label] = {}
+        # Card context menus are kept alive here; a Menu that only the card references
+        # is garbage-collected out from under Tk and posts an empty popup.
+        self._card_menus: list[Menu] = []
+        self._grid_layout: tuple[int, int, int] | None = None
+        # path -> row in current_state, rebuilt whenever the state object changes.
+        self._path_index: dict[str, int] = {}
+        self._path_index_state: ScoreState | None = None
         self.displayed_samples: list[dict[str, object]] = []
         # One page of `displayed_samples`. The grid builds a Tk frame plus a decoded
         # thumbnail per card, so rendering a few thousand detected files at once wedges
@@ -173,6 +277,10 @@ class BikiniScannerApp:
         # `displayed_samples`; only rendering and keyboard focus use the page.
         self.page_samples: list[dict[str, object]] = []
         self.page_index = 0
+        # Paths in the order they are currently shown. A retrain re-ranks everything;
+        # this pins what is already on screen so the photo about to be judged does not
+        # move under the cursor. Cleared whenever the reviewer asks for a new order.
+        self._page_order: list[str] = []
         self.review_samples: list[dict[str, object]] = []
         self.photo_refs: list[ImageTk.PhotoImage] = []
         self.thumbnail_cache: OrderedDict[tuple[str, int], ImageTk.PhotoImage] = OrderedDict()
@@ -180,6 +288,13 @@ class BikiniScannerApp:
         self.preview_cache: OrderedDict[tuple[str, int, int], ImageTk.PhotoImage] = OrderedDict()
         self._preview_render_size: tuple[int, int] = (0, 0)
         self._preview_resize_after_id: str | None = None
+        # How much of the window the active picture gets. The reviewer sets this by
+        # dragging the sash between the picture and the grid; it is remembered here so
+        # the next session opens on the split they chose rather than a fixed fraction.
+        try:
+            self._preview_share = float(self.user_prefs.get("preview_share", 0.45))
+        except (TypeError, ValueError):
+            self._preview_share = 0.45
         self._threshold_refresh_after_id: str | None = None
         # Collapsible chrome: advanced controls stay out of the way until asked for.
         self._panels: dict[str, ttk.Frame] = {}
@@ -188,14 +303,22 @@ class BikiniScannerApp:
         self.current_samples: list[dict[str, object]] = []
         self.view_mode = "review"
         self.similar_anchor_path: str | None = None
+        # Where Find similar was launched from: (view, samples, page, focused path).
+        self._view_return: tuple[str, list[dict[str, object]], int, str | None] | None = None
         self.focused_path: str | None = None
         self.undo_stack: list[dict[str, object]] = []
         self.redo_stack: list[dict[str, object]] = []
+        # Names what Ctrl+Z would reverse, so a bulk Accept is distinguishable from a
+        # single misclick before you press it.
+        self.undo_hint_var = StringVar(value="")
         self.quality_history: deque[float] = deque(maxlen=6)
         self.scan_queue: list[str] = []
         self.queue_active = False
         self.queue_index = 0
         self.watch_enabled_var = BooleanVar(value=False)
+        # Standing indicator that watch mode is on and what it last saw, so a rescan
+        # that starts on its own is attributable rather than mysterious.
+        self._watch_notice_var = StringVar(value="")
         self._watch_snapshot: dict[str, tuple[int, int]] = {}
         self._watch_after_id: str | None = None
         self._hardware_after_id: str | None = None
@@ -206,11 +329,44 @@ class BikiniScannerApp:
         self._scan_start_monotonic: float | None = None
         self._scan_cancel_event: threading.Event | None = None
         self._backend_preload_started = False
+        # Set while a model load is running for a scan that is waiting on it.
+        self._backend_loading = False
+        self._scan_after_backend: str | None = None
+        # Image count handed back from the pre-scan walk, consumed by run_scan.
+        self._pending_scan_count: int | None = None
+        # Set by Resume last scan so _scan_completed restores the saved view and page.
+        self._resuming_review = False
+        self._resume_target: tuple[str, int] = ("", 0)
         self._scan_active = False
         # Set when a retrain is asked for while one is already running, so labelling a
         # run of photos quickly produces one retrain at the end rather than a thread per
         # click, all racing each other over the same scorer and label store.
         self._retrain_pending = False
+        # Labels waiting to be folded into the model, and the timer that will do it.
+        # See RETRAIN_IDLE_MS: the decisions themselves are already on disk, this is
+        # only the re-rank catching up with them.
+        self._labels_since_retrain = 0
+        self._retrain_after_id: str | None = None
+        self._session_save_after_id: str | None = None
+        self._scroll_after_id: str | None = None
+        self._pending_scroll_path: str | None = None
+        self._reflow_after_id: str | None = None
+        self._sash_clamp_after_id: str | None = None
+        # Focus mode: one photo, full screen, keyboard only.
+        self._focus_window: Toplevel | None = None
+        self._focus_image_label: ttk.Label | None = None
+        self._focus_caption: ttk.Label | None = None
+        self._focus_photo: ImageTk.PhotoImage | None = None
+        self._focus_caption_var = StringVar(value="")
+        self._focus_status_var = StringVar(value="")
+        self._focus_resize_after_id: str | None = None
+        # Images decoded ahead of the reviewer by a background worker. Keyed by
+        # (path, kind, width, height); consumed once and then handed to Tk.
+        self._decoded_cache: OrderedDict[tuple[str, str, int, int], Image.Image] = OrderedDict()
+        self._decoding: set[tuple[str, str, int, int]] = set()
+        self._prefetch_queue: deque[tuple[str, str, int, int]] = deque()
+        self._decoded_lock = threading.Lock()
+        self._prefetch_thread: threading.Thread | None = None
         self._closing = False
         self._first_run_guide_shown = bool(self.user_prefs.get("first_run_guide_shown", False))
         try:
@@ -279,10 +435,28 @@ class BikiniScannerApp:
             dialog.geometry(geometry)
         if resizable is not None:
             dialog.resizable(*resizable)
+        # transient() alone only ties the dialog to its parent; where it opens is left
+        # to the window manager, which on a multi-monitor setup can be a different
+        # screen from the app. Centre it once it knows its own size.
+        dialog.after(0, lambda: self._centre_on_parent(dialog))
         dialog.configure(bg=self._palette()["bg"])
         outer = ttk.Frame(dialog, padding=padding)
         outer.pack(fill=BOTH, expand=True)
         return dialog, outer
+
+    def _centre_on_parent(self, dialog: Toplevel) -> None:
+        """Place a dialog over the middle of the main window, clamped to the screen."""
+        try:
+            dialog.update_idletasks()
+            width = dialog.winfo_width() or dialog.winfo_reqwidth()
+            height = dialog.winfo_height() or dialog.winfo_reqheight()
+            x = self.root.winfo_rootx() + (self.root.winfo_width() - width) // 2
+            y = self.root.winfo_rooty() + (self.root.winfo_height() - height) // 3
+            x = max(0, min(x, dialog.winfo_screenwidth() - width))
+            y = max(0, min(y, dialog.winfo_screenheight() - height))
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:  # noqa: BLE001
+            return
 
     @staticmethod
     def _modal_button_row(parent: ttk.Frame, *, pady: tuple[int, int] = (10, 0)) -> ttk.Frame:
@@ -307,13 +481,25 @@ class BikiniScannerApp:
         # Bottom first: it claims the bottom edge before the results area expands.
         self._build_status_bar()
         self._build_command_bar()
+        self._build_sidebar()
         self._build_filter_panel()
         self._build_queue_panel()
-        self._build_threshold_row()
         self._build_view_switch()
 
-        self.canvas = ttk.Frame(self.root)
-        self.canvas.pack(side=TOP, fill=BOTH, expand=True)
+        # The active picture and the results grid share the window through a sash the
+        # reviewer drags. A fixed fraction of the window was never right for everyone:
+        # judging a photo wants a big picture, scanning a folder wants a big grid.
+        self.workspace = ttk.PanedWindow(self.root, orient="vertical")
+        self.workspace.pack(side=TOP, fill=BOTH, expand=True)
+
+        # Learning readout and undo hint: one quiet strip directly under the results
+        # rather than a second row of the status bar competing with everything else.
+        self.stats_strip = ttk.Frame(self.root, padding=(12, 2, 12, 4))
+        self.stats_strip.pack(side=BOTTOM, fill="x")
+        ttk.Label(self.stats_strip, textvariable=self.stats_var, style="Muted.TLabel").pack(side=LEFT)
+        ttk.Label(self.stats_strip, textvariable=self.undo_hint_var, style="Muted.TLabel").pack(side=RIGHT)
+
+        self.canvas = ttk.Frame(self.workspace)
         self.scroll = ttk.Scrollbar(self.canvas, orient="vertical")
         self.scroll.pack(side=RIGHT, fill="y")
         self.grid_canvas = Canvas(self.canvas, yscrollcommand=self.scroll.set, highlightthickness=0)
@@ -324,37 +510,56 @@ class BikiniScannerApp:
         self.grid_inner.bind(
             "<Configure>", lambda _event: self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all"))
         )
-        self.grid_canvas.bind(
-            "<Configure>",
-            lambda event: self.grid_canvas.itemconfigure(self.grid_window, width=event.width),
-        )
+        def _on_grid_configure(event) -> None:
+            self.grid_canvas.itemconfigure(self.grid_window, width=event.width)
+            # The grid's own width is what decides how many cards fit, and it changes
+            # for reasons the root never sees — opening the left rail narrows it by
+            # 330px without resizing the window at all.
+            self._schedule_reflow()
 
-        # Active-picture preview; packed above the grid (before=self.canvas) whenever a
-        # card is focused. Everything here is packed with side=TOP and no fill so it
-        # stays horizontally centred no matter how wide the window gets.
-        self.preview_frame = ttk.Frame(self.root, padding=(10, 4, 10, 6))
-        self.preview_image_label = ttk.Label(self.preview_frame, anchor="center")
-        self.preview_image_label.pack(side=TOP)
-        ttk.Label(
-            self.preview_frame,
-            textvariable=self.preview_caption_var,
-            anchor="center",
-            justify="center",
-        ).pack(side=TOP, pady=(4, 0))
+        self.grid_canvas.bind("<Configure>", _on_grid_configure)
+
+        # Active-picture preview; inserted above the grid as the first pane whenever a
+        # card is focused. The image itself is packed with no fill so it stays
+        # horizontally centred no matter how wide the window gets, and the caption and
+        # buttons are pinned to the bottom so they stay put as the picture grows.
+        self.preview_frame = ttk.Frame(self.workspace, padding=(10, 4, 10, 6))
         preview_buttons = ttk.Frame(self.preview_frame)
-        preview_buttons.pack(side=TOP, pady=(6, 0))
+        preview_buttons.pack(side=BOTTOM, pady=(6, 0))
         ttk.Button(preview_buttons, text="Accept (A)", width=14, command=lambda: self.label_focused_card(1)).pack(
             side=LEFT, padx=(0, 8)
         )
         ttk.Button(preview_buttons, text="REJECT (D)", width=14, command=lambda: self.label_focused_card(0)).pack(
             side=LEFT
         )
+        self.preview_caption_label = ttk.Label(
+            self.preview_frame,
+            textvariable=self.preview_caption_var,
+            anchor="center",
+            justify="center",
+        )
+        self.preview_caption_label.pack(side=BOTTOM, pady=(4, 0))
+        self.preview_image_label = ttk.Label(self.preview_frame, anchor="center")
+        self.preview_image_label.pack(side=TOP, expand=True)
         self.preview_image_label.bind(
             "<Double-Button-1>",
             lambda _event: self.view_image(self.focused_path) if self.focused_path else None,
         )
-        # Resize the active picture with the window, debounced so dragging the frame
-        # does not rebuild the image on every <Configure>.
+        self.workspace.add(self.canvas, weight=1)
+        # A sash drag ends with a button release; that is when the new split is worth
+        # writing down. Tracking it during the drag would rewrite the prefs file on
+        # every pixel of motion.
+        self.workspace.bind("<ButtonRelease-1>", self._remember_preview_sash, add="+")
+        # A PanedWindow keeps its sash at a fixed pixel offset when the window shrinks,
+        # so a split that left room for a card at 1500x950 starved the grid at 950x700
+        # and the card buttons went back under the fold. Re-clamp whenever the
+        # workspace changes size.
+        self.workspace.bind("<Configure>", self._on_workspace_configure, add="+")
+        # Re-render the picture at the height the sash gives it, debounced: dragging
+        # the sash or the window frame fires a stream of these and every one of them
+        # costs a full image resize.
+        self.preview_frame.bind("<Configure>", self._on_preview_configure, add="+")
+        # Resize the active picture with the window, debounced for the same reason.
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self._build_empty_state()
         self._sync_panel_buttons()
@@ -362,27 +567,25 @@ class BikiniScannerApp:
 
     # --- chrome -------------------------------------------------------------
     def _build_command_bar(self) -> None:
-        """One row for the things you actually do: pick a folder, scan it, review."""
+        """One row for the things you actually do: pick a folder and scan it.
+
+        This row used to carry ten buttons, eight of which duplicated a menu entry
+        that was already there. What is left is the two controls with no equal in the
+        menus — the folder you are working on, and starting the scan — plus the one
+        panel and the one dialog people reach for constantly. Update rankings, the
+        scan queue, the theme and the shortcut list all live in the menu bar above.
+        """
         bar = ttk.Frame(self.root, padding=(12, 10, 12, 8), style="Toolbar.TFrame")
         bar.pack(side=TOP, fill="x")
         self.command_bar = bar
 
         # Right-hand side is packed first so it keeps its width when the path is long.
-        self.theme_button = ttk.Button(bar, text=self._theme_button_text(), command=self.cycle_theme, width=11)
-        self.theme_button.pack(side=RIGHT)
-        self._tooltip(self.theme_button, "Switch between dark, light, and following Windows")
         settings_button = ttk.Button(bar, text="Settings", command=self.open_settings_dialog)
-        settings_button.pack(side=RIGHT, padx=(0, 6))
-        help_button = ttk.Button(bar, text="?", command=self.show_shortcuts, width=3)
-        help_button.pack(side=RIGHT, padx=(0, 6))
-        self._tooltip(help_button, "Keyboard shortcuts and a quick tour")
-
-        self.queue_toggle = ttk.Button(bar, text="Queue", command=lambda: self._toggle_panel("queue"))
-        self.queue_toggle.pack(side=RIGHT, padx=(0, 6))
-        self._tooltip(self.queue_toggle, "Scan several folders in a row, or watch one for changes")
+        settings_button.pack(side=RIGHT)
+        self._tooltip(settings_button, "Sensitivity, model, prompts and everything else")
         self.filter_toggle = ttk.Button(bar, text="Filters & view", command=lambda: self._toggle_panel("filters"))
         self.filter_toggle.pack(side=RIGHT, padx=(0, 6))
-        self._tooltip(self.filter_toggle, "Search, sort, score range, thumbnail size")
+        self._tooltip(self.filter_toggle, "Search, sort, score range, thumbnail size, hide decided")
 
         ttk.Label(bar, text="Folder", style="Muted.TLabel").pack(side=LEFT, padx=(0, 8))
         folder_entry = ttk.Entry(bar, textvariable=self.folder_var)
@@ -394,88 +597,148 @@ class BikiniScannerApp:
         self.run_button = ttk.Button(bar, text="Run scan", command=self.run_scan, style="Accent.TButton")
         self.run_button.pack(side=LEFT)
         self._tooltip(self.run_button, "Scan this folder for bikini, cleavage and midriff photos")
-        self.stop_scan_button = ttk.Button(bar, text="Stop", command=self.cancel_scan, state="disabled", width=7)
-        self.stop_scan_button.pack(side=LEFT, padx=6)
-        self.update_button = ttk.Button(bar, text="Update rankings", command=self.update_algorithm)
-        self.update_button.pack(side=LEFT, padx=(0, 6))
-        self._tooltip(self.update_button, "Re-rank using everything you have accepted and rejected so far")
-        ttk.Label(bar, textvariable=self.override_var, style="Muted.TLabel").pack(side=LEFT, padx=(4, 0))
+        self.stop_scan_button = ttk.Button(
+            bar, text="Stop scan", command=self.cancel_scan, state="disabled", width=10
+        )
+        self.stop_scan_button.pack(side=LEFT, padx=(6, 12))
+        ttk.Label(bar, textvariable=self.override_var, style="Muted.TLabel").pack(side=LEFT)
+
+    def _build_sidebar(self) -> None:
+        """Left rail holding the collapsible panels. Hidden until one is opened."""
+        self.sidebar = ttk.Frame(self.root, padding=(10, 8, 10, 8), style="Toolbar.TFrame", width=330)
+        self.sidebar.pack_propagate(False)
 
     def _build_filter_panel(self) -> None:
-        panel = ttk.Frame(self.root, padding=(12, 4, 12, 10), style="Toolbar.TFrame")
+        """Filters and view controls, stacked for the left rail.
+
+        These were one long horizontal strip across the top of the window. Vertical
+        space is what the app is short of, so they run down a narrow column now and
+        each control gets its own labelled line instead of competing for width.
+        """
+        panel = ttk.Frame(self.sidebar, style="Toolbar.TFrame")
         self._panels["filters"] = panel
 
-        row_one = ttk.Frame(panel, style="Toolbar.TFrame")
-        row_one.pack(side=TOP, fill="x")
-        ttk.Label(row_one, text="Search", style="Muted.TLabel").pack(side=LEFT)
-        search_entry = ttk.Entry(row_one, textvariable=self.search_var, width=20)
-        search_entry.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_one, text="Sort", style="Muted.TLabel").pack(side=LEFT)
-        sort_combo = ttk.Combobox(
-            row_one, textvariable=self.sort_var, values=("score", "filename", "date"), state="readonly", width=10
-        )
-        sort_combo.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_one, text="Show", style="Muted.TLabel").pack(side=LEFT)
-        match_combo = ttk.Combobox(
-            row_one,
-            textvariable=self.match_filter_var,
-            values=("all", "matched", "unmatched"),
-            state="readonly",
-            width=10,
-        )
-        match_combo.pack(side=LEFT, padx=(4, 6))
-        label_combo = ttk.Combobox(
-            row_one,
-            textvariable=self.label_filter_var,
-            values=("all", "unlabeled", "labeled", "skipped"),
-            state="readonly",
-            width=10,
-        )
-        label_combo.pack(side=LEFT, padx=(0, 12))
-        ttk.Label(row_one, text="Score", style="Muted.TLabel").pack(side=LEFT)
-        ttk.Entry(row_one, textvariable=self.score_min_var, width=5).pack(side=LEFT, padx=(4, 2))
-        # An en dash is the correct typography for a numeric range separator here.
-        ttk.Label(row_one, text="–", style="Muted.TLabel").pack(side=LEFT)  # noqa: RUF001
-        ttk.Entry(row_one, textvariable=self.score_max_var, width=5).pack(side=LEFT, padx=(2, 12))
-        ttk.Checkbutton(row_one, text="Only NSFW", variable=self.nsfw_only_var, command=self._toggle_nsfw_only).pack(
-            side=LEFT
-        )
-        clear_button = ttk.Button(row_one, text="Clear filters", command=self.clear_filters)
-        clear_button.pack(side=RIGHT)
+        def section(title: str) -> None:
+            ttk.Label(panel, text=title.upper(), style="BucketHeading.TLabel").pack(
+                side=TOP, anchor="w", pady=(10, 4)
+            )
 
-        row_two = ttk.Frame(panel, style="Toolbar.TFrame")
-        row_two.pack(side=TOP, fill="x", pady=(8, 0))
-        ttk.Label(row_two, text="Columns", style="Muted.TLabel").pack(side=LEFT)
-        columns_spin = ttk.Spinbox(row_two, from_=1, to=6, textvariable=self.columns_var, width=4)
-        columns_spin.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_two, text="Text size", style="Muted.TLabel").pack(side=LEFT)
-        font_spin = ttk.Spinbox(row_two, from_=8, to=16, textvariable=self.font_size_var, width=4)
-        font_spin.pack(side=LEFT, padx=(4, 12))
-        ttk.Label(row_two, text="Thumbnail size", style="Muted.TLabel").pack(side=LEFT)
-        thumb_scale = ttk.Scale(row_two, from_=120, to=520, variable=self.thumbnail_size_var, orient="horizontal")
-        thumb_scale.pack(side=LEFT, fill="x", expand=True, padx=(4, 12))
-        ttk.Button(row_two, text="Prompt tester", command=self.open_prompt_tester_dialog).pack(side=RIGHT)
+        def field(label: str, widget_factory) -> None:
+            row = ttk.Frame(panel, style="Toolbar.TFrame")
+            row.pack(side=TOP, fill="x", pady=(0, 4))
+            ttk.Label(row, text=label, style="Muted.TLabel", width=11, anchor="w").pack(side=LEFT)
+            widget_factory(row).pack(side=LEFT, fill="x", expand=True)
+
+        section("Find")
+        field("Search", lambda parent: ttk.Entry(parent, textvariable=self.search_var))
+        field(
+            "Sort by",
+            lambda parent: ttk.Combobox(
+                parent, textvariable=self.sort_var, values=("score", "filename", "date"), state="readonly"
+            ),
+        )
+        field(
+            "Show",
+            lambda parent: ttk.Combobox(
+                parent, textvariable=self.match_filter_var,
+                values=("all", "matched", "unmatched"), state="readonly",
+            ),
+        )
+        field(
+            "Labels",
+            lambda parent: ttk.Combobox(
+                parent, textvariable=self.label_filter_var,
+                values=("all", "unlabeled", "labeled", "skipped"), state="readonly",
+            ),
+        )
+
+        score_row = ttk.Frame(panel, style="Toolbar.TFrame")
+        score_row.pack(side=TOP, fill="x", pady=(0, 4))
+        ttk.Label(score_row, text="Score", style="Muted.TLabel", width=11, anchor="w").pack(side=LEFT)
+        ttk.Entry(score_row, textvariable=self.score_min_var, width=6).pack(side=LEFT)
+        # An en dash is the correct typography for a numeric range separator here.
+        ttk.Label(score_row, text=" – ", style="Muted.TLabel").pack(side=LEFT)  # noqa: RUF001
+        ttk.Entry(score_row, textvariable=self.score_max_var, width=6).pack(side=LEFT)
+
+        hide_decided = ttk.Checkbutton(panel, text="Hide decided photos", variable=self.hide_decided_var)
+        hide_decided.pack(side=TOP, anchor="w", pady=(6, 0))
+        self._tooltip(
+            hide_decided,
+            "Take a photo out of the grid as soon as you Accept, REJECT or Skip it, so the "
+            "queue moves on. Untick to keep looking at what you have already judged.",
+        )
+        ttk.Checkbutton(
+            panel, text="Only explicit (NSFW)", variable=self.nsfw_only_var, command=self._toggle_nsfw_only
+        ).pack(side=TOP, anchor="w", pady=(2, 0))
+        ttk.Button(panel, text="Clear filters", command=self.clear_filters).pack(
+            side=TOP, fill="x", pady=(8, 0)
+        )
+
+        section("Grid")
+        columns_row = ttk.Frame(panel, style="Toolbar.TFrame")
+        columns_row.pack(side=TOP, fill="x", pady=(0, 4))
+        ttk.Label(columns_row, text="Columns", style="Muted.TLabel", width=11, anchor="w").pack(side=LEFT)
+        ttk.Spinbox(columns_row, from_=0, to=8, textvariable=self.columns_var, width=5).pack(side=LEFT)
+        ttk.Label(columns_row, text="0 = fit window", style="Muted.TLabel").pack(side=LEFT, padx=(6, 0))
+        field(
+            "Thumbnails",
+            lambda parent: ttk.Spinbox(
+                parent, from_=120, to=520, increment=20, textvariable=self.thumbnail_size_var, width=6
+            ),
+        )
+        field(
+            "Text size",
+            lambda parent: ttk.Spinbox(parent, from_=8, to=16, textvariable=self.font_size_var, width=6),
+        )
+        ttk.Button(panel, text="Prompt tester", command=self.open_prompt_tester_dialog).pack(
+            side=TOP, fill="x", pady=(10, 0)
+        )
 
     def _build_queue_panel(self) -> None:
-        panel = ttk.Frame(self.root, padding=(12, 4, 12, 10), style="Toolbar.TFrame")
+        panel = ttk.Frame(self.sidebar, style="Toolbar.TFrame")
         self._panels["queue"] = panel
-        row = ttk.Frame(panel, style="Toolbar.TFrame")
-        row.pack(side=TOP, fill="x")
-        ttk.Button(row, text="Add folder", command=self.add_folder_to_queue).pack(side=LEFT)
-        ttk.Button(row, text="Run queue", command=self.run_queue).pack(side=LEFT, padx=6)
-        ttk.Button(row, text="Stop queue", command=self.stop_queue).pack(side=LEFT)
+        ttk.Label(panel, text="SCAN QUEUE", style="BucketHeading.TLabel").pack(
+            side=TOP, anchor="w", pady=(10, 4)
+        )
+        self.queue_listbox = Listbox(panel, height=7)
+        self.queue_listbox.pack(side=TOP, fill="x")
+
+        # The queue was append-only: a mistyped folder meant clearing it and starting
+        # again, and the scan order could not be changed once set.
+        order_row = ttk.Frame(panel, style="Toolbar.TFrame")
+        order_row.pack(side=TOP, fill="x", pady=(6, 0))
+        for text, command, width in (
+            ("Up", lambda: self.move_queue_item(-1), 5),
+            ("Down", lambda: self.move_queue_item(1), 6),
+            ("Remove", self.remove_queue_item, 9),
+            ("Clear", self.clear_queue, 7),
+        ):
+            ttk.Button(order_row, text=text, width=width, command=command).pack(side=LEFT, padx=(0, 4))
+
+        ttk.Button(panel, text="Add folder\u2026", command=self.add_folder_to_queue).pack(
+            side=TOP, fill="x", pady=(8, 0)
+        )
+        run_row = ttk.Frame(panel, style="Toolbar.TFrame")
+        run_row.pack(side=TOP, fill="x", pady=(4, 0))
+        ttk.Button(run_row, text="Run queue", command=self.run_queue).pack(side=LEFT, fill="x", expand=True)
+        ttk.Button(run_row, text="Stop", width=7, command=self.stop_queue).pack(side=LEFT, padx=(4, 0))
+
+        ttk.Label(panel, text="WATCH", style="BucketHeading.TLabel").pack(side=TOP, anchor="w", pady=(14, 4))
         ttk.Checkbutton(
-            row,
-            text="Watch this folder for new photos",
+            panel,
+            text="Watch this folder for\nnew photos",
             variable=self.watch_enabled_var,
             command=self._toggle_watch_mode,
-        ).pack(side=LEFT, padx=16)
-        self.queue_listbox = Listbox(panel, height=3)
-        self.queue_listbox.pack(side=TOP, fill="x", pady=(8, 0))
+        ).pack(side=TOP, anchor="w")
 
     def _build_view_switch(self) -> None:
-        """Detected list vs review queue — the two ways to look at a scan."""
-        row = ttk.Frame(self.root, padding=(12, 0, 12, 6))
+        """Which view, how sensitive, and which page — one row instead of two.
+
+        The sensitivity slider had a row to itself above this one. Both rows were
+        about the same thing (what the grid below is showing), and between them they
+        pushed the results down by a third of a toolbar for no gain.
+        """
+        row = ttk.Frame(self.root, padding=(12, 2, 12, 8))
         row.pack(side=TOP, fill="x")
         self.view_switch_row = row
         self.detected_button = ttk.Button(
@@ -484,11 +747,30 @@ class BikiniScannerApp:
         self.detected_button.pack(side=LEFT)
         self._tooltip(self.detected_button, "Every photo found, grouped by what was detected")
         self.review_button = ttk.Button(row, text="Review queue", command=self.restore_review_view)
-        self.review_button.pack(side=LEFT, padx=6)
+        self.review_button.pack(side=LEFT, padx=(6, 16))
         self._tooltip(self.review_button, "A curated shortlist to Accept or REJECT so the scanner learns")
-        self.view_hint = ttk.Label(row, text="", style="Muted.TLabel")
-        self.view_hint.pack(side=LEFT, padx=(12, 0))
+        # Pager to the right before the slider claims the slack, so it keeps its width.
         self._build_pager(row)
+        ttk.Label(row, text="Sensitivity", style="Muted.TLabel").pack(side=LEFT)
+        slider = ttk.Scale(
+            row,
+            from_=0.0,
+            to=1.0,
+            orient="horizontal",
+            variable=self.threshold_var,
+            command=self._on_threshold_change,
+        )
+        slider.pack(side=LEFT, fill="x", expand=True, padx=(8, 6))
+        self._tooltip(slider, "Left shows more photos (and more false alarms); right shows only the surest matches")
+        # The most-used control in the app had no number attached: you could not see
+        # that it sat at 0.35, could not set it exactly, and the summary reported how
+        # many were "above threshold" without saying what the threshold was.
+        threshold_entry = ttk.Entry(row, textvariable=self.threshold_text_var, width=6, justify="center")
+        threshold_entry.pack(side=LEFT, padx=(0, 10))
+        threshold_entry.bind("<Return>", self._commit_threshold_text)
+        threshold_entry.bind("<FocusOut>", self._commit_threshold_text)
+        self._tooltip(threshold_entry, "The exact sensitivity. Type a value between 0 and 1 and press Enter.")
+        ttk.Label(row, textvariable=self.summary_var, style="Muted.TLabel").pack(side=LEFT, padx=(0, 12))
 
     def _build_pager(self, row: ttk.Frame) -> None:
         """Page controls for the results grid, right-aligned on the view-switch row."""
@@ -537,12 +819,15 @@ class BikiniScannerApp:
         if self.page_index + 1 >= self._page_count():
             return
         self.page_index += 1
+        # A page boundary is where a pending re-rank is allowed to take effect.
+        self._page_order = []
         self._refresh_displayed_results(reset_page=False, keep_focus=False)
 
     def previous_page(self) -> None:
         if self.page_index <= 0:
             return
         self.page_index -= 1
+        self._page_order = []
         self._refresh_displayed_results(reset_page=False, keep_focus=False)
 
     def _sync_pager(self) -> None:
@@ -576,29 +861,19 @@ class BikiniScannerApp:
             "detected": "Everything above the sensitivity threshold.",
             "review": "A shortlist chosen to teach the scanner fastest.",
             "similar": "Images similar to the one you picked.",
+            "browse": "Not scanned — decisions here are saved for the next scan.",
         }
+        hint = hints.get(self.view_mode, "")
+        # Say it out loud: a photo vanishing on Accept is only obvious once you know
+        # it is meant to, and the checkbox that governs it lives in a closed panel.
+        if self.hide_decided_var.get():
+            hint = f"{hint} Decided photos are hidden."
         try:
             self.detected_button.configure(style="Accent.TButton" if detected else "TButton")
             self.review_button.configure(style="TButton" if detected else "Accent.TButton")
-            self.view_hint.configure(text=hints.get(self.view_mode, ""))
+            self.view_hint.configure(text=hint.strip())
         except Exception:  # noqa: BLE001
             pass
-
-    def _build_threshold_row(self) -> None:
-        row = ttk.Frame(self.root, padding=(12, 0, 12, 8))
-        row.pack(side=TOP, fill="x")
-        ttk.Label(row, text="Sensitivity", style="Muted.TLabel").pack(side=LEFT)
-        slider = ttk.Scale(
-            row,
-            from_=0.0,
-            to=1.0,
-            orient="horizontal",
-            variable=self.threshold_var,
-            command=self._on_threshold_change,
-        )
-        slider.pack(side=LEFT, fill="x", expand=True, padx=10)
-        self._tooltip(slider, "Left shows more photos (and more false alarms); right shows only the surest matches")
-        ttk.Label(row, textvariable=self.summary_var, style="Muted.TLabel").pack(side=LEFT)
 
     def _build_status_bar(self) -> None:
         outer = ttk.Frame(self.root, padding=(12, 6, 12, 8), style="Toolbar.TFrame")
@@ -628,26 +903,34 @@ class BikiniScannerApp:
             side=LEFT, padx=(8, 0)
         )
 
+        # One line of transient status on the left, one cluster of standing indicators
+        # on the right. There were two rows and up to nine independent labels here -
+        # status, VLM, watch, loading, hardware, learning stats, undo hint, view hint,
+        # plateau notice - and at 950px wide they simply ran into each other. The
+        # learning readout moved onto the stats strip under the results, where it can
+        # be read deliberately rather than glanced past.
         status_row = ttk.Frame(outer, style="Toolbar.TFrame")
         status_row.pack(side=TOP, fill="x")
         self._status_row = status_row
-        ttk.Label(status_row, textvariable=self.status_var, style="Toolbar.TLabel").pack(
-            side=LEFT, fill="x", expand=True
-        )
+        ttk.Label(
+            status_row, textvariable=self.status_var, style="Toolbar.TLabel", anchor="w"
+        ).pack(side=LEFT, fill="x", expand=True)
+
+        indicators = ttk.Frame(status_row, style="Toolbar.TFrame")
+        indicators.pack(side=RIGHT)
+        self.hardware_label = ttk.Label(indicators, textvariable=self.hardware_var, style="Muted.TLabel")
+        if psutil is not None:
+            self.hardware_label.pack(side=RIGHT, padx=(10, 0))
+        ttk.Label(indicators, textvariable=self.notice_var, style="Muted.TLabel").pack(side=RIGHT, padx=(10, 0))
+        self.watch_badge = ttk.Label(indicators, text="WATCHING", style="Accent.TLabel", padding=(5, 0))
         # VLM badge: visible only when VLM adjudication is enabled, so the user knows
         # the scan includes a second-opinion stage.
-        self.vlm_badge = ttk.Label(status_row, text="VLM", style="Accent.TLabel", padding=(4, 0))
-        self.vlm_badge.pack(side=LEFT, padx=(6, 0))
+        self.vlm_badge = ttk.Label(indicators, text="VLM", style="Accent.TLabel", padding=(5, 0))
+        self.vlm_badge.pack(side=RIGHT, padx=(6, 0))
         self._refresh_vlm_badge()
-        ttk.Label(status_row, textvariable=self.loading_var, style="Toolbar.TLabel").pack(side=LEFT, padx=(10, 0))
-        self.hardware_label = ttk.Label(status_row, textvariable=self.hardware_var, style="Muted.TLabel")
-        if psutil is not None:
-            self.hardware_label.pack(side=RIGHT)
-
-        stats_row = ttk.Frame(outer, style="Toolbar.TFrame")
-        stats_row.pack(side=TOP, fill="x", pady=(2, 0))
-        ttk.Label(stats_row, textvariable=self.stats_var, style="Muted.TLabel").pack(side=LEFT, fill="x", expand=True)
-        ttk.Label(stats_row, textvariable=self.notice_var, style="Muted.TLabel").pack(side=RIGHT)
+        ttk.Label(indicators, textvariable=self.loading_var, style="Toolbar.TLabel").pack(side=RIGHT, padx=(10, 0))
+        self.view_hint = ttk.Label(status_row, text="", style="Muted.TLabel")
+        self.view_hint.pack(side=RIGHT, padx=(16, 16))
 
     def _build_empty_state(self) -> None:
         """Guidance in the results area instead of a bare 'no samples' line."""
@@ -677,10 +960,34 @@ class BikiniScannerApp:
             action = ("Choose folder…", self.choose_folder)
         elif self.current_state is None:
             title = "Ready to scan"
-            body = f"{folder}\n\nPress Run scan to look through this folder."
+            body = (
+                f"{folder}\n\nPress Run scan to look through this folder. To judge the photos "
+                "yourself without waiting for the model, use File > Browse folder without scanning."
+            )
             action = ("Run scan", self.run_scan)
         elif not self.page_samples:
-            if self._filters_active():
+            hidden = self._hidden_decided_count()
+            # Running out of photos because you judged them all is a result, not an
+            # empty screen, and telling that reviewer to lower the sensitivity — which
+            # is what this used to do — sends them looking for a problem that is not there.
+            # "and you decided at least one" matters: a folder where every image was
+            # filtered out by the gates also has nothing undecided left in it, and that
+            # is not the same thing at all.
+            finished = hidden > 0 or (
+                self.store is not None and bool(self.store.load_labels()) and self._undecided_remaining() == 0
+            )
+            if finished and not self._filters_active():
+                title = "Everything here has been decided"
+                body = (
+                    "Every photo this view can show carries an Accept, REJECT or Skip, so there "
+                    "is nothing left to judge.\n\nScan another folder, drag the sensitivity "
+                    "slider left to pull in the near misses, or look back over what you decided."
+                )
+                if self.hide_decided_var.get():
+                    action = ("Show decided photos", lambda: self.hide_decided_var.set(False))
+                else:
+                    action = ("Show detected files", self.show_detected_files)
+            elif self._filters_active():
                 title = "Nothing matches these filters"
                 body = "Your search, score range, or label filter is hiding every result."
                 action = ("Clear filters", self.clear_filters)
@@ -705,6 +1012,19 @@ class BikiniScannerApp:
             self.grid_canvas.pack_forget()
             self.scroll.pack_forget()
             self.empty_state.pack(fill=BOTH, expand=True)
+
+    def _refresh_watch_badge(self) -> None:
+        badge = getattr(self, "watch_badge", None)
+        if badge is None:
+            return
+        try:
+            if self.watch_enabled_var.get():
+                badge.pack(side=RIGHT, padx=(6, 0))
+                self._tooltip(badge, self._watch_notice_var.get() or "Watching this folder for new photos")
+            else:
+                badge.pack_forget()
+        except Exception:  # noqa: BLE001
+            return
 
     def _refresh_vlm_badge(self) -> None:
         """Show or hide the VLM badge in the status bar based on config."""
@@ -731,6 +1051,39 @@ class BikiniScannerApp:
         except Exception:  # noqa: BLE001
             pass
 
+    def _output_scope(self) -> tuple[list[str], str]:
+        """Every path the bulk actions operate on, and a sentence naming that set.
+
+        Copy, export, metadata and trash all said "visible", which by now depends on
+        the search box, the score range, the label filter, Hide decided AND paging.
+        One helper so they cannot drift apart, and one description so the confirmation
+        dialog states the scope instead of implying it.
+        """
+        samples = self.displayed_samples or self.current_samples
+        paths = [str(sample["path"]) for sample in samples]
+        pages = self._page_count()
+        parts = [f"{len(paths)} image{'s' if len(paths) != 1 else ''}"]
+        if pages > 1:
+            parts.append(f"across all {pages} pages, not just the page on screen")
+        conditions = []
+        if self.hide_decided_var.get():
+            conditions.append("photos you have already decided are excluded")
+        if self._filters_active():
+            conditions.append("the current search, score range and label filters are applied")
+        description = ", ".join(parts)
+        if conditions:
+            description += " (" + "; ".join(conditions) + ")"
+        return paths, description
+
+    def _hidden_decided_count(self) -> int:
+        """How many of the current results the 'Hide decided' rule is holding back."""
+        if not self.hide_decided_var.get() or self.store is None or not self.current_samples:
+            return 0
+        if self.label_filter_var.get().strip() not in ("", "all", "unlabeled"):
+            return 0
+        labels = self.store.load_labels()
+        return sum(1 for sample in self.current_samples if labels.get(str(sample["path"])) is not None)
+
     def _filters_active(self) -> bool:
         return bool(
             self.search_var.get().strip()
@@ -749,51 +1102,47 @@ class BikiniScannerApp:
         self.status_var.set("Filters cleared.")
 
     def _toggle_panel(self, name: str) -> None:
+        """Show or hide one of the side panels.
+
+        These used to open as extra rows above the results. With both open that was
+        four rows of chrome between the toolbar and the first photo, on the one axis
+        the app is short of. They live in a left rail now, where the space they take
+        is horizontal and the grid keeps the full window height.
+        """
         panel = self._panels.get(name)
         if panel is None:
             return
         # Tracked state, not winfo_ismapped(): mapping is only settled after the event
         # loop runs, so two toggles in a row would read each other's stale answer.
         wanted = not self._panel_open.get(name, False)
-        # Re-pack every open panel in a fixed order, otherwise the second one opened
-        # jumps above the first.
-        for key in ("filters", "queue"):
-            other = self._panels.get(key)
-            if other is not None:
-                other.pack_forget()
+        self._panel_open[name] = wanted
         for key in ("filters", "queue"):
             other = self._panels.get(key)
             if other is None:
                 continue
-            should_show = wanted if key == name else self._panel_open.get(key, False)
-            if should_show:
-                other.pack(side=TOP, fill="x", after=self.command_bar)
-            self._panel_open[key] = should_show
+            if self._panel_open.get(key):
+                other.pack(side=TOP, fill="x", pady=(0, 10))
+            else:
+                other.pack_forget()
+        if any(self._panel_open.values()):
+            if not self.sidebar.winfo_ismapped():
+                self.sidebar.pack(side=LEFT, fill="y", before=self.workspace)
+        else:
+            self.sidebar.pack_forget()
         self._sync_panel_buttons()
 
     def _sync_panel_buttons(self) -> None:
-        for name, button in (
-            ("filters", getattr(self, "filter_toggle", None)),
-            ("queue", getattr(self, "queue_toggle", None)),
-        ):
-            if button is None:
-                continue
-            label = "Filters & view" if name == "filters" else "Queue"
-            # Show a dot when filters are active so the user knows something is hidden.
-            if name == "filters" and self._filters_active():
-                label = f"{label} ●"
-            try:
-                button.configure(text=f"{label} ▴" if self._panel_open.get(name) else f"{label} ▾")
-            except Exception:  # noqa: BLE001
-                continue
-
-    def _theme_button_text(self) -> str:
-        return {"dark": "Theme: Dark", "light": "Theme: Light"}.get(self.theme_var.get().strip().lower(), "Theme: Auto")
-
-    def cycle_theme(self) -> None:
-        order = ["dark", "light", "system"]
-        current = self.theme_var.get().strip().lower()
-        self.theme_var.set(order[(order.index(current) + 1) % len(order)] if current in order else "dark")
+        button = getattr(self, "filter_toggle", None)
+        if button is None:
+            return
+        label = "Filters & view"
+        # Show a dot when filters are active so the user knows something is hidden.
+        if self._filters_active():
+            label = f"{label} ●"
+        try:
+            button.configure(text=f"{label} ▴" if self._panel_open.get("filters") else f"{label} ▾")
+        except Exception:  # noqa: BLE001
+            return
 
     def _tooltip(self, widget, text: str) -> None:
         """Plain hover help. Tk has none built in, and these controls need explaining."""
@@ -854,12 +1203,22 @@ class BikiniScannerApp:
             "  a or g                Accept the active photo\n"
             "  d or b                REJECT the active photo\n"
             "  s                     Skip\n"
+            "  n                     add or edit a note on the active photo\n"
+            "  w                     why did this photo score what it did\n"
+            "  f                     focus mode: one photo, full screen, no grid\n"
+            "  Backspace             back out of Find similar\n"
             "  Ctrl+Z / Ctrl+Y       undo / redo a decision\n"
             "  double-click          open the full-size viewer\n\n"
             "Tips\n"
             "  • The big picture at the top is the active one; Accept and REJECT apply to it.\n"
-            "  • Accept and REJECT skip past photos you already decided, so the queue counts down.\n"
-            "  • The status bar shows how many are decided and how many are left in the folder.\n"
+            "  • Drag the divider under it to make that picture bigger or smaller. The split\n"
+            "    is remembered between sessions.\n"
+            "  • A photo leaves the grid the moment you decide it, so the queue counts down.\n"
+            "    Untick 'Hide decided' in Filters & view to keep looking at what you judged.\n"
+            "  • The status bar shows how many are decided and how many are left in the folder,\n"
+            "    and names what Ctrl+Z would undo before you press it.\n"
+            "  • Decisions are saved the moment you make them; the ranking catches up a\n"
+            "    couple of seconds later, so a run of Accepts costs one re-rank, not twenty.\n"
             "  • Every Accept and REJECT trains the scanner, and now carries over to other folders.\n"
             "  • Watch 'learning:' in the status bar: it names the labels counted and how much\n"
             "    influence they currently have over the ranking.\n"
@@ -891,6 +1250,11 @@ class BikiniScannerApp:
                 "accent_fg": "#ffffff",
                 "accent_active": "#639bff",
                 "tooltip_bg": "#31343c",
+                # Decision colours. Chosen to stay legible on the card background and
+                # to differ in lightness as well as hue, so they survive colour-blind
+                # vision and the word beside them still carries the meaning.
+                "accepted": "#5fd08a",
+                "rejected": "#ff8f8f",
             }
         return {
             "bg": "#eef0f4",
@@ -910,6 +1274,8 @@ class BikiniScannerApp:
             "accent_fg": "#ffffff",
             "accent_active": "#255cbd",
             "tooltip_bg": "#ffffff",
+            "accepted": "#1f7a45",
+            "rejected": "#b3261e",
         }
 
     def _theme_is_dark(self) -> bool:
@@ -1151,6 +1517,49 @@ class BikiniScannerApp:
             lightcolor=[("active", palette["accent_active"]), ("pressed", palette["accent_active"])],
             darkcolor=[("active", palette["accent_active"]), ("pressed", palette["accent_active"])],
         )
+        # Tabbed dialogs. clam's default notebook draws a near-white tab strip, which
+        # is the one surface in the app that ignored the dark palette entirely.
+        style.configure("TNotebook", background=palette["panel"], bordercolor=palette["border"], tabmargins=(2, 4, 2, 0))
+        style.configure(
+            "TNotebook.Tab",
+            background=palette["button_bg"],
+            foreground=palette["fg"],
+            bordercolor=palette["border"],
+            lightcolor=palette["button_bg"],
+            darkcolor=palette["button_bg"],
+            padding=(14, 6),
+        )
+        style.map(
+            "TNotebook.Tab",
+            background=[("selected", palette["panel"]), ("active", palette["button_active"])],
+            foreground=[("selected", palette["fg"])],
+            lightcolor=[("selected", palette["panel"])],
+            expand=[("selected", (1, 1, 1, 0))],
+        )
+        # Muted.TLabel sits on toolbars; forms sit on the panel colour, so a note inside
+        # a dialog needs its own background or it draws a lighter rectangle.
+        style.configure("FormMuted.TLabel", background=palette["panel"], foreground=palette["muted"])
+        # Decision colours. These sit on cards, whose background is the panel colour in
+        # both card styles, so one background works for focused and unfocused alike.
+        base = int(self.font_size_var.get())
+        for name, colour in (
+            ("Accepted", palette["accepted"]),
+            ("Rejected", palette["rejected"]),
+            ("Skipped", palette["muted"]),
+            ("Undecided", palette["muted"]),
+        ):
+            style.configure(
+                f"{name}.TLabel",
+                background=palette["panel"],
+                foreground=colour,
+                font=("TkDefaultFont", base, "bold" if name in ("Accepted", "Rejected") else "normal"),
+            )
+        style.configure(
+            "BucketHeading.TLabel",
+            background=palette["bg"],
+            foreground=palette["accent"],
+            font=("TkDefaultFont", max(8, base - 1), "bold"),
+        )
         style.configure("MenuBar.TFrame", background=palette["bg"])
         style.configure(
             "MenuBar.TMenubutton",
@@ -1170,11 +1579,6 @@ class BikiniScannerApp:
         self._apply_classic_widget_theme(palette)
         self._apply_dark_titlebar()
         self.grid_inner.configure(style="TFrame")
-        if hasattr(self, "theme_button"):
-            try:
-                self.theme_button.configure(text=self._theme_button_text())
-            except Exception:  # noqa: BLE001
-                pass
         self._apply_ui_scale()
         self.status_var.set(self.status_var.get())
         self.summary_var.set(self.summary_var.get())
@@ -1321,6 +1725,7 @@ class BikiniScannerApp:
             self.sort_var,
             self.match_filter_var,
             self.label_filter_var,
+            self.hide_decided_var,
             self.score_min_var,
             self.score_max_var,
             self.update_url_var,
@@ -1331,6 +1736,7 @@ class BikiniScannerApp:
                 continue
 
     def _on_ui_pref_change(self) -> None:
+        self._sync_update_menu()
         self._apply_theme()
         self._trim_thumbnail_cache()
         self._save_user_prefs()
@@ -1356,6 +1762,13 @@ class BikiniScannerApp:
         self._refresh_current_results()
 
     def _restore_ui_prefs(self) -> None:
+        # Below this the command bar clips its own buttons and the grid has no room
+        # for a card. There was no floor at all, so the window could be dragged to a
+        # size at which nothing in it worked.
+        try:
+            self.root.minsize(900, 620)
+        except Exception:  # noqa: BLE001
+            pass
         geometry = self.user_prefs.get("window_geometry")
         if isinstance(geometry, str) and geometry:
             try:
@@ -1375,8 +1788,14 @@ class BikiniScannerApp:
             "sort": self.sort_var.get(),
             "match_filter": self.match_filter_var.get(),
             "label_filter": self.label_filter_var.get(),
+            "hide_decided": bool(self.hide_decided_var.get()),
             "score_min": self.score_min_var.get().strip(),
             "score_max": self.score_max_var.get().strip(),
+            "preview_share": round(self._preview_height_share(), 3),
+            "scan_images_per_second": self.user_prefs.get("scan_images_per_second", 0.0),
+            "folder_history": self._folder_history(),
+            "output_destinations": self.user_prefs.get("output_destinations", {}),
+            "trashed_files": self.user_prefs.get("trashed_files", []),
             "update_url": self.update_url_var.get().strip(),
             "output_organization": self.output_organization_var.get(),
             "output_template": self.output_template_var.get(),
@@ -1417,56 +1836,119 @@ class BikiniScannerApp:
         self.menu_bar_frame = ttk.Frame(self.root, style="MenuBar.TFrame", padding=(4, 2))
         self.menu_bar_frame.pack(side=TOP, fill="x")
         file_menu = Menu(self.menu_bar_frame, tearoff=False)
+        edit_menu = Menu(self.menu_bar_frame, tearoff=False)
         view_menu = Menu(self.menu_bar_frame, tearoff=False)
         tools_menu = Menu(self.menu_bar_frame, tearoff=False)
         help_menu = Menu(self.menu_bar_frame, tearoff=False)
         recent_menu = Menu(file_menu, tearoff=False)
 
         file_menu.add_command(label="Open folder...", command=self.choose_folder)
+        file_menu.add_command(label="Browse folder without scanning...", command=self.browse_without_scanning)
         file_menu.add_command(label="Resume last scan", command=self.resume_last_scan)
         file_menu.add_cascade(label="Recent folders", menu=recent_menu)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_close)
 
+        # Labelled dynamically by _sync_history_controls, which is why the indices are
+        # kept: entryconfigure needs them and they must not drift.
+        edit_menu.add_command(label="Undo", command=self.undo_last_label, accelerator="Ctrl+Z", state="disabled")
+        self._undo_menu_index = edit_menu.index("end")
+        edit_menu.add_command(label="Redo", command=self.redo_last_label, accelerator="Ctrl+Y", state="disabled")
+        self._redo_menu_index = edit_menu.index("end")
+        edit_menu.add_separator()
+        edit_menu.add_command(label="Accept everything shown", command=lambda: self.mark_all_shown(1))
+        edit_menu.add_command(label="Reject everything shown", command=lambda: self.mark_all_shown(0))
+        self.edit_menu = edit_menu
+
         view_menu.add_command(label="Detected files", command=self.show_detected_files)
         view_menu.add_command(label="Review queue", command=self.restore_review_view)
+        view_menu.add_command(label="Focus mode (one photo, full screen)", command=self.toggle_focus_mode, accelerator="F")
+        view_menu.add_command(label="Back", command=self.go_back, accelerator="Backspace")
         view_menu.add_separator()
-        view_menu.add_command(label="Light theme", command=lambda: self.theme_var.set("light"))
-        view_menu.add_command(label="Dark theme", command=lambda: self.theme_var.set("dark"))
-        view_menu.add_command(label="System theme", command=lambda: self.theme_var.set("system"))
+        # The panel toggles used to be buttons on the command bar. Filters kept its
+        # button because it is opened constantly; the queue panel is a once-a-session
+        # thing and did not earn permanent space next to Run scan.
+        view_menu.add_command(label="Filters & view panel", command=lambda: self._toggle_panel("filters"))
+        view_menu.add_command(label="Scan queue panel", command=lambda: self._toggle_panel("queue"))
+        view_menu.add_checkbutton(label="Hide decided photos", variable=self.hide_decided_var)
+        view_menu.add_separator()
+        # Radiobuttons rather than commands: the menu now shows which theme is active,
+        # which is what the "Theme: Dark" button on the command bar was there to say.
+        view_menu.add_radiobutton(label="Light theme", value="light", variable=self.theme_var)
+        view_menu.add_radiobutton(label="Dark theme", value="dark", variable=self.theme_var)
+        view_menu.add_radiobutton(label="Follow Windows", value="system", variable=self.theme_var)
+
+        # Grouped rather than a flat list of twenty. It had reached the point where
+        # "Trash visible files" sat two lines under "Add folder to queue", which is a
+        # long way to fall from adding a folder to deleting photographs.
+        export_menu = Menu(tools_menu, tearoff=False)
+        queue_menu = Menu(tools_menu, tearoff=False)
+        maintenance_menu = Menu(tools_menu, tearoff=False)
+        inspect_menu = Menu(tools_menu, tearoff=False)
 
         tools_menu.add_command(label="Settings", command=self.open_settings_dialog)
         tools_menu.add_command(label="Settings profiles", command=self.open_profiles_dialog)
-        tools_menu.add_command(label="Import settings", command=self.import_settings)
-        tools_menu.add_command(label="Export settings", command=self.export_settings)
         tools_menu.add_command(label="Output options", command=self.open_output_options_dialog)
-        tools_menu.add_command(label="Prompt tester", command=self.open_prompt_tester_dialog)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Copy matches to subfolder", command=self.copy_matches_to_subfolder)
-        tools_menu.add_command(label="Export matches (CSV)", command=self.export_matches)
-        tools_menu.add_command(label="Export HTML report", command=self.export_html_report)
-        tools_menu.add_command(label="Write metadata tags", command=self.write_metadata_to_visible)
-        tools_menu.add_command(label="Accept everything shown", command=lambda: self.mark_all_shown(1))
-        tools_menu.add_command(label="Reject everything shown", command=lambda: self.mark_all_shown(0))
+        tools_menu.add_command(label="Update rankings", command=self.update_algorithm)
+        tools_menu.add_cascade(label="Inspect", menu=inspect_menu)
+        tools_menu.add_cascade(label="Export", menu=export_menu)
+        tools_menu.add_cascade(label="Scan queue", menu=queue_menu)
         tools_menu.add_separator()
-        tools_menu.add_command(label="Clear cache", command=self.clear_cache)
-        tools_menu.add_command(label="Reset cross-folder learning", command=self.reset_global_learning)
-        tools_menu.add_separator()
-        tools_menu.add_command(label="Add folder to queue", command=self.add_folder_to_queue)
-        tools_menu.add_command(label="Run queue", command=self.run_queue)
-        tools_menu.add_command(label="Stop queue", command=self.stop_queue)
-        tools_menu.add_separator()
-        tools_menu.add_command(label="Trash visible files", command=self.trash_visible_files)
-        tools_menu.add_command(label="Duplicate groups", command=self.show_duplicate_groups)
+        tools_menu.add_cascade(label="Maintenance", menu=maintenance_menu)
+
+        inspect_menu.add_command(label="Why this score?", command=self.explain_score, accelerator="W")
+        inspect_menu.add_command(label="Age gate report", command=self.show_age_gate_report)
+        inspect_menu.add_command(label="Prompt tester", command=self.open_prompt_tester_dialog)
+        inspect_menu.add_separator()
+        inspect_menu.add_command(label="Duplicate groups", command=self.show_duplicate_groups)
+        inspect_menu.add_command(label="Files that could not be read", command=self.show_skipped_files)
+        inspect_menu.add_command(label="Recently trashed", command=self.show_trashed_files)
+
+        export_menu.add_command(label="Copy matches to subfolder", command=self.copy_matches_to_subfolder)
+        export_menu.add_command(label="Export matches (CSV)", command=self.export_matches)
+        export_menu.add_command(label="Export HTML report", command=self.export_html_report)
+        export_menu.add_command(label="Write metadata tags", command=self.write_metadata_to_visible)
+        export_menu.add_separator()
+        export_menu.add_command(label="Import settings", command=self.import_settings)
+        export_menu.add_command(label="Export settings", command=self.export_settings)
+
+        queue_menu.add_command(label="Add folder to queue", command=self.add_folder_to_queue)
+        queue_menu.add_command(label="Run queue", command=self.run_queue)
+        queue_menu.add_command(label="Stop the whole queue", command=self.stop_queue)
+
+        # Everything under here changes or removes files. One submenu, kept away from
+        # the things people click every few minutes.
+        maintenance_menu.add_command(label="Clear cached scan data", command=self.clear_cache)
+        maintenance_menu.add_command(label="Delete decisions for this folder", command=self.delete_decisions)
+        maintenance_menu.add_command(label="Reset cross-folder learning", command=self.reset_global_learning)
+        maintenance_menu.add_separator()
+        maintenance_menu.add_command(label="Trash visible files", command=self.trash_visible_files)
 
         help_menu.add_command(label="Guide", command=self.show_guide)
+        help_menu.add_command(label="Keyboard shortcuts", command=self.show_shortcuts)
         help_menu.add_command(label="About", command=self.show_about)
         help_menu.add_command(label="Log viewer", command=self.show_log_viewer)
         help_menu.add_command(label="Check for updates", command=self.check_for_updates)
+        self._update_menu_index = help_menu.index("end")
+        self.help_menu = help_menu
+        self._sync_update_menu()
 
-        self.menus = [file_menu, view_menu, tools_menu, help_menu, recent_menu]
+        self.menus = [
+            file_menu,
+            edit_menu,
+            view_menu,
+            tools_menu,
+            help_menu,
+            recent_menu,
+            export_menu,
+            queue_menu,
+            maintenance_menu,
+            inspect_menu,
+        ]
         for label, menu in (
             ("File", file_menu),
+            ("Edit", edit_menu),
             ("View", view_menu),
             ("Tools", tools_menu),
             ("Help", help_menu),
@@ -1543,6 +2025,56 @@ class BikiniScannerApp:
             items.append(token)
         return items
 
+    def _folder_history(self) -> dict[str, dict[str, object]]:
+        history = self.user_prefs.get("folder_history")
+        return dict(history) if isinstance(history, dict) else {}
+
+    def _record_folder_history(self, image_count: int, match_count: int) -> None:
+        """Remember what a scan of this folder found, so Recent folders means something.
+
+        Kept in the preferences file rather than read back off each folder: the recent
+        list is rendered on every menu build and half those paths may be on drives that
+        are slow or absent.
+        """
+        folder = self.folder_var.get().strip()
+        if not folder:
+            return
+        labels = self.store.load_labels() if self.store is not None else {}
+        history = self._folder_history()
+        history[folder] = {
+            "scanned": datetime.now().isoformat(timespec="seconds"),
+            "images": int(image_count),
+            "matches": int(match_count),
+            "decided": len(labels),
+        }
+        # Bounded by the recent list it decorates, plus a little slack.
+        if len(history) > 40:
+            for key in sorted(history, key=lambda name: str(history[name].get("scanned", "")))[: len(history) - 40]:
+                history.pop(key, None)
+        self.user_prefs["folder_history"] = history
+        self._save_user_prefs()
+
+    def _folder_history_text(self, folder: str) -> str:
+        record = self._folder_history().get(folder)
+        if not isinstance(record, dict):
+            return ""
+        try:
+            when = datetime.fromisoformat(str(record.get("scanned", "")))
+        except ValueError:
+            return ""
+        days = (datetime.now() - when).days
+        ago = "today" if days <= 0 else ("yesterday" if days == 1 else f"{days} days ago")
+        def count(key: str) -> int:
+            try:
+                return int(cast(int, record.get(key, 0)))
+            except (TypeError, ValueError):
+                return 0
+
+        return (
+            f"{ago}: {count('images'):,} images, "
+            f"{count('matches'):,} matches, {count('decided'):,} decided"
+        )
+
     def _rebuild_recent_menu(self) -> None:
         if not hasattr(self, "recent_menu"):
             return
@@ -1551,8 +2083,12 @@ class BikiniScannerApp:
             self.recent_menu.add_command(label="No recent folders", state="disabled")
             return
         for folder in self.recent_folders[:10]:
+            # A bare path says nothing about whether that folder is done. The summary
+            # comes from prefs, not from the folder, so an absent drive costs nothing.
+            summary = self._folder_history_text(folder)
+            label = f"{folder}    —    {summary}" if summary else folder
             self.recent_menu.add_command(
-                label=folder, command=lambda value=folder: self._open_recent_folder(value)  # type: ignore[misc]
+                label=label, command=lambda value=folder: self._open_recent_folder(value)  # type: ignore[misc]
             )
 
     def _open_recent_folder(self, folder: str) -> None:
@@ -1737,15 +2273,24 @@ class BikiniScannerApp:
             self.status_var.set(f"Ready — {folder}. Press Run scan to start.")
 
     def resume_last_scan(self) -> None:
+        """Reopen the last folder and put the reviewer back where they stopped.
+
+        This re-ran the scan and dropped you at the top of the detected list, which is
+        not what "resume" means to someone who was halfway through a review queue on
+        page 7. The scan still runs — a ScoreState has to exist — but it reads cached
+        embeddings, and the view, page and active photo come back with it.
+        """
         folder = self._load_last_folder()
         if not folder or not Path(folder).is_dir():
             messagebox.showinfo("Resume scan", "No existing last-scanned folder was found.")
             return
+        self._resuming_review = True
         self.open_folder(folder, scan=True)
 
     def _session_payload(self) -> dict[str, object]:
         return {
             "focused_path": self.focused_path,
+            "page_index": self.page_index,
             "view_mode": self.view_mode,
             "current_samples": self.current_samples,
             "review_samples": self.review_samples,
@@ -1753,6 +2298,27 @@ class BikiniScannerApp:
         }
 
     def _save_review_session(self) -> None:
+        """Queue a session snapshot; the write itself happens once things go quiet.
+
+        This serialises every sample and writes it atomically — temp file, fsync,
+        rename. It is called from the render path, the focus path and the label path,
+        so a single Accept was paying for three full-file writes with an fsync each.
+        The snapshot only exists so a crash does not lose your place; the decisions
+        themselves live in labels.json and are still written synchronously.
+        """
+        if self.store is None:
+            return
+        if self._session_save_after_id is not None:
+            try:
+                self.root.after_cancel(self._session_save_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._session_save_after_id = None
+        self._session_save_after_id = self._after(SESSION_SAVE_IDLE_MS, self._flush_review_session)
+
+    def _flush_review_session(self) -> None:
+        """Write the queued session snapshot now."""
+        self._session_save_after_id = None
         if self.store is None:
             return
         try:
@@ -1769,6 +2335,14 @@ class BikiniScannerApp:
         focused_path = payload.get("focused_path")
         if isinstance(focused_path, str) and focused_path:
             self.focused_path = focused_path
+        # Only consulted when the reviewer asked to resume; a normal scan should still
+        # land on the detected list rather than silently reopening an old view.
+        view_mode = payload.get("view_mode")
+        page_index = payload.get("page_index")
+        self._resume_target = (
+            str(view_mode) if isinstance(view_mode, str) else "",
+            int(page_index) if isinstance(page_index, int) else 0,
+        )
         quality_history = payload.get("quality_history")
         if isinstance(quality_history, list):
             self.quality_history.clear()
@@ -1834,6 +2408,59 @@ class BikiniScannerApp:
         self.scan_queue.append(folder)
         self.queue_listbox.insert(END, folder)
 
+    def _selected_queue_index(self) -> int | None:
+        try:
+            selection = self.queue_listbox.curselection()
+        except Exception:  # noqa: BLE001
+            return None
+        return int(selection[0]) if selection else None
+
+    def _reload_queue_listbox(self, select: int | None = None) -> None:
+        self.queue_listbox.delete(0, END)
+        for folder in self.scan_queue:
+            self.queue_listbox.insert(END, folder)
+        if select is not None and 0 <= select < len(self.scan_queue):
+            self.queue_listbox.selection_set(select)
+            self.queue_listbox.see(select)
+
+    def remove_queue_item(self) -> None:
+        index = self._selected_queue_index()
+        if index is None:
+            self.status_var.set("Select a folder in the queue to remove it.")
+            return
+        if self.queue_active:
+            messagebox.showinfo("Queue running", "Stop the queue before changing it.")
+            return
+        removed = self.scan_queue.pop(index)
+        self._reload_queue_listbox(select=min(index, len(self.scan_queue) - 1))
+        self.status_var.set(f"Removed {Path(removed).name} from the queue.")
+
+    def move_queue_item(self, delta: int) -> None:
+        index = self._selected_queue_index()
+        if index is None:
+            self.status_var.set("Select a folder in the queue to move it.")
+            return
+        if self.queue_active:
+            messagebox.showinfo("Queue running", "Stop the queue before changing it.")
+            return
+        target = index + delta
+        if not 0 <= target < len(self.scan_queue):
+            return
+        self.scan_queue[index], self.scan_queue[target] = self.scan_queue[target], self.scan_queue[index]
+        self._reload_queue_listbox(select=target)
+
+    def clear_queue(self) -> None:
+        if self.queue_active:
+            messagebox.showinfo("Queue running", "Stop the queue before changing it.")
+            return
+        if not self.scan_queue:
+            return
+        if not messagebox.askyesno("Clear queue", f"Remove all {len(self.scan_queue)} folders from the queue?"):
+            return
+        self.scan_queue.clear()
+        self._reload_queue_listbox()
+        self.status_var.set("Queue cleared.")
+
     def add_folder_to_queue(self) -> None:
         folder = filedialog.askdirectory(title="Add folder to scan queue")
         if folder:
@@ -1889,8 +2516,12 @@ class BikiniScannerApp:
             if self.current_state is not None:
                 self._watch_snapshot = self._collect_watch_snapshot()
             self._schedule_watch_poll()
-            self.status_var.set("Watch mode enabled.")
+            self._watch_notice_var.set(f"Watching {Path(self.folder_var.get()).name or 'this folder'}")
+            self._refresh_watch_badge()
+            self.status_var.set("Watch mode enabled — this folder is checked for new photos periodically.")
         else:
+            self._watch_notice_var.set("")
+            self._refresh_watch_badge()
             self.status_var.set("Watch mode disabled.")
             self._cancel_watch_poll()
 
@@ -1959,8 +2590,23 @@ class BikiniScannerApp:
             self._schedule_watch_poll()
             return
         if current_snapshot != self._watch_snapshot:
+            added = len(set(current_snapshot) - set(self._watch_snapshot))
+            removed = len(set(self._watch_snapshot) - set(current_snapshot))
             self._watch_snapshot = current_snapshot
-            self.status_var.set("Watch folder detected changes — rescanning...")
+            # Watch mode only helps if you are told. It used to rescan in silence, so
+            # unless you happened to be looking at the status bar at that moment, new
+            # photos simply appeared with no explanation of where they came from.
+            change = ", ".join(
+                part
+                for part in (
+                    f"{added} added" if added else "",
+                    f"{removed} removed" if removed else "",
+                )
+                if part
+            ) or "changed on disk"
+            self._watch_notice_var.set(f"Watch: {change} — rescanning")
+            self.status_var.set(f"Watch folder: {change}. Rescanning...")
+            self.root.bell()
             self.open_folder(self.folder_var.get(), scan=True)
         self._schedule_watch_poll()
 
@@ -1978,6 +2624,11 @@ class BikiniScannerApp:
             self._preview_resize_after_id,
             self._threshold_refresh_after_id,
             self._hardware_after_id,
+            self._retrain_after_id,
+            self._session_save_after_id,
+            self._scroll_after_id,
+            self._reflow_after_id,
+            self._sash_clamp_after_id,
         ):
             if after_id is not None:
                 try:
@@ -1988,9 +2639,76 @@ class BikiniScannerApp:
         self._preview_resize_after_id = None
         self._threshold_refresh_after_id = None
         self._hardware_after_id = None
-        self._save_review_session()
+        self._retrain_after_id = None
+        self._session_save_after_id = None
+        self._scroll_after_id = None
+        self._reflow_after_id = None
+        self._sash_clamp_after_id = None
+        self._focus_resize_after_id = None
+        if self._focus_window is not None:
+            try:
+                self._focus_window.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self._focus_window = None
+        # Written, not queued: there is no "later" left after destroy().
+        self._flush_review_session()
         self._save_user_prefs()
         self.root.destroy()
+
+    def browse_without_scanning(self, folder: str = "") -> None:
+        """List a folder's images and let them be judged, with no model involved.
+
+        Every route into this app previously required a full scan first, which is a
+        model download and minutes of embedding before a single photo can be looked
+        at. Sometimes the folder is small, or already sorted, or you only want to
+        record decisions to teach the scanner later — none of which needs a score.
+
+        The decisions land in the same labels.json a scan would read, so a scan run
+        afterwards starts already knowing what you decided here.
+        """
+        folder = folder or self.folder_var.get().strip()
+        if not folder:
+            folder = filedialog.askdirectory(title="Browse folder without scanning")
+            if not folder:
+                return
+        self._set_folder(folder)
+        try:
+            paths = [str(path) for path in collect_image_paths(Path(folder))]
+        except OSError as exc:
+            messagebox.showerror("Could not read the folder", str(exc))
+            return
+        if not paths:
+            messagebox.showinfo("No images", f"No supported images were found in:\n{folder}")
+            return
+        count = len(paths)
+        # A state with no embeddings and no scores. Everything downstream keys off
+        # `current_state`, so an honest empty one is what makes the rest of the app —
+        # filters, paging, focus mode, undo — work here without special cases.
+        self.current_state = ScoreState(
+            paths=paths,
+            embeddings=np.zeros((count, 0), dtype=np.float32),
+            zero_shot_scores=np.zeros(count, dtype=np.float32),
+            scores=np.zeros(count, dtype=np.float32),
+            axis_scores={},
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(count, dtype=bool),
+        )
+        self.scorer = None
+        self.view_mode = "browse"
+        self.similar_anchor_path = None
+        self._view_return = None
+        self.current_samples = [{"path": path, "score": 0.0, "bucket": "Not scanned"} for path in paths]
+        self.review_samples = list(self.current_samples)
+        self.focused_path = paths[0]
+        self._page_order = []
+        self._refresh_displayed_results()
+        self.status_var.set(
+            f"Browsing {count} images without scoring them. Accept/REJECT is recorded and will "
+            "be used the next time you run a scan here."
+        )
 
     def open_folder(self, folder: str, *, scan: bool = False) -> None:
         self._set_folder(folder)
@@ -1999,6 +2717,14 @@ class BikiniScannerApp:
 
     def _set_folder(self, folder: str, scan: bool = False) -> None:
         folder = str(Path(folder).expanduser().resolve())
+        # A retrain queued against the folder being left must not run against the one
+        # being opened: it would rescore the new folder using the old one's state.
+        self._cancel_retrain_timer()
+        self._retrain_pending = False
+        self._labels_since_retrain = 0
+        # Flush before self.store is replaced below, or the outgoing folder's snapshot
+        # gets written into the incoming folder's cache.
+        self._flush_review_session()
         self.config = ScannerConfig.from_mapping(self.global_config.to_dict())
         folder_store = FolderStore(Path(folder))
         self.store = folder_store
@@ -2072,10 +2798,15 @@ class BikiniScannerApp:
         messagebox.showinfo(
             "Bikini Scanner guide",
             "1. Choose a folder and run a scan.\n"
-            "2. Use the grid to review images with Accept, REJECT, or Skip.\n"
-            "3. Use filters, search, sorting, and the image viewer to narrow the set.\n"
-            "4. Open Tools > Settings to adjust scoring and hardware options.\n"
-            "5. Recently scanned folders appear in File > Recent folders.",
+            "2. Review with Accept, REJECT, or Skip. Each decision takes that photo out of\n"
+            "   the grid and teaches the scanner.\n"
+            "3. Drag the divider under the big picture to give it more or less room.\n"
+            "4. Filters & view holds search, sorting, thumbnail size and 'Hide decided'.\n"
+            "5. Settings covers detection, model, prompts and everything advanced.\n"
+            "6. No model yet? File > Browse folder without scanning lets you judge photos\n"
+            "   straight away; a later scan starts from those decisions.\n"
+            "7. The View, Tools and Help menus hold the rest: scan queue, exports,\n"
+            "   themes and keyboard shortcuts.",
         )
 
     def show_about(self) -> None:
@@ -2087,10 +2818,34 @@ class BikiniScannerApp:
             f"Log file: {log_path()}",
         )
 
+    def _sync_update_menu(self) -> None:
+        """Grey out the update check when no manifest URL is set.
+
+        It ships empty, so out of the box this menu item could only ever answer "no URL
+        is configured" — an action offered at full strength that cannot succeed.
+        """
+        menu = getattr(self, "help_menu", None)
+        if menu is None:
+            return
+        configured = bool(self.update_url_var.get().strip())
+        try:
+            menu.entryconfigure(
+                self._update_menu_index,
+                label="Check for updates" if configured else "Check for updates (no URL set)",
+                state="normal" if configured else "disabled",
+            )
+        except Exception:  # noqa: BLE001
+            return
+
     def check_for_updates(self) -> None:
         url = self.update_url_var.get().strip()
         if not url:
-            messagebox.showinfo("Check for updates", "No update URL is configured. Set one in Settings.")
+            messagebox.showinfo(
+                "Check for updates",
+                "No update manifest URL is configured, so there is nothing to check against.\n\n"
+                "Set one in Settings > Advanced if you host one. With it empty the app never "
+                "contacts anything.",
+            )
             return
         self.status_var.set("Checking for updates...")
 
@@ -2174,28 +2929,36 @@ class BikiniScannerApp:
             return list(samples)
         return list(processed)
 
-    def _sample_sort_key(self, sample: dict[str, object]) -> tuple[object, ...]:
+    def _sample_sort_key(self, sample: dict[str, object], sort_mode: str | None = None) -> tuple[object, ...]:
+        """Sort key for one sample.
+
+        `sort_mode` is passed in by the batch caller so the Tk variable is read once
+        per sort rather than once per sample. More importantly, the modification time
+        is only looked up when sorting by date: this used to stat() every file on
+        every sort whatever the mode, which on a few thousand images — especially on a
+        network share — was the bulk of the time a filter change took.
+        """
         path = str(sample["path"])
         score = float(cast(float, sample.get("score", 0.0)))
-        stat = None
-        try:
-            stat = Path(path).stat()
-        except Exception:  # noqa: BLE001
-            stat = None
-        sort_mode = self.sort_var.get().strip()
+        if sort_mode is None:
+            sort_mode = self.sort_var.get().strip()
+        # os.path.basename rather than Path(...).name: this runs once per sample per
+        # sort and constructing a Path just to read its last component is twice the
+        # cost of the string operation it wraps.
         if sort_mode == "filename":
-            return (Path(path).name.lower(), -score, path)
+            return (os.path.basename(path).lower(), -score, path)
         if sort_mode == "date":
-            return (-(stat.st_mtime if stat is not None else 0.0), -score, path)
-        bucket_order = {
-            "Likely match": 0,
-            "Likely false positive": 1,
-            "Likely false negative": 2,
-            "Uncertain": 3,
-        }
-        # Detected-view buckets sort after the review buckets and in their listed order.
-        bucket_order.update({name: 10 + position for position, name in enumerate(DETECTED_BUCKETS)})
-        return (bucket_order.get(str(sample.get("bucket", "Uncertain")), 20), -score, Path(path).name.lower(), path)
+            try:
+                modified = os.stat(path).st_mtime
+            except OSError:
+                modified = 0.0
+            return (-modified, -score, path)
+        return (
+            BUCKET_ORDER.get(str(sample.get("bucket", "Uncertain")), 20),
+            -score,
+            os.path.basename(path).lower(),
+            path,
+        )
 
     def _score_range(self) -> tuple[float | None, float | None]:
         def parse(value: str) -> float | None:
@@ -2209,43 +2972,77 @@ class BikiniScannerApp:
 
         return parse(self.score_min_var.get()), parse(self.score_max_var.get())
 
-    def _sample_visible(self, sample: dict[str, object]) -> bool:
+    def _filter_context(self) -> FilterContext:
+        """Read every filter setting once, for a whole pass over the samples."""
+        score_min, score_max = self._score_range()
+        return FilterContext(
+            labels=self.store.load_labels() if self.store is not None else {},
+            search=self.search_var.get().strip().lower(),
+            label_mode=self.label_filter_var.get().strip(),
+            match_mode=self.match_filter_var.get().strip(),
+            hide_decided=bool(self.hide_decided_var.get()),
+            threshold=float(self.threshold_var.get()),
+            score_min=score_min,
+            score_max=score_max,
+            browse=self.view_mode == "browse",
+        )
+
+    def _sample_visible(self, sample: dict[str, object], context: FilterContext | None = None) -> bool:
+        """Whether one sample passes the current filters.
+
+        `context` is built once by the batch caller. Without it this reached into the
+        store for the whole label map and into Tk for seven variables, per sample.
+        """
         if self.current_state is None:
             return False
+        if context is None:
+            context = self._filter_context()
         path = str(sample["path"])
-        search = self.search_var.get().strip().lower()
-        label = self._label_text(path)
-        bucket = str(sample.get("bucket", ""))
-        if search:
-            searchable = f"{path} {label} {bucket}".lower()
-            if search not in searchable:
-                return False
-        label_mode = self.label_filter_var.get().strip()
+        label = _LABEL_WORDS.get(context.labels.get(path), "unlabeled")
+        label_mode = context.label_mode
         if label_mode == "unlabeled" and label != "unlabeled":
             return False
         if label_mode == "labeled" and label == "unlabeled":
             return False
         if label_mode == "skipped" and label != "skip":
             return False
-        match_mode = self.match_filter_var.get().strip()
-        if match_mode != "all":
-            threshold = float(self.threshold_var.get())
-            matches = float(cast(float, sample.get("score", 0.0))) >= threshold
-            if match_mode == "matched" and not matches:
-                return False
-            if match_mode == "unmatched" and matches:
-                return False
+        # A photo you have decided leaves the grid. Asking for the labeled or skipped
+        # ones by name overrides this: that request is explicit, and silently answering
+        # it with an empty grid would be the same bug in the other direction.
+        if context.hide_decided and label != "unlabeled" and label_mode in ("", "all", "unlabeled"):
+            return False
+        if context.browse:
+            # Nothing here has been scored, so every score-based filter would hide the
+            # lot. Only the label and search filters mean anything.
+            return not context.search or context.search in f"{path} {label}".lower()
+        bucket = str(sample.get("bucket", ""))
+        if context.search and context.search not in f"{path} {label} {bucket}".lower():
+            return False
         score = float(cast(float, sample.get("score", 0.0)))
-        score_min, score_max = self._score_range()
-        if score_min is not None and score < score_min:
+        if context.match_mode != "all":
+            matches = score >= context.threshold
+            if context.match_mode == "matched" and not matches:
+                return False
+            if context.match_mode == "unmatched" and matches:
+                return False
+        if context.score_min is not None and score < context.score_min:
             return False
-        if score_max is not None and score > score_max:
+        if context.score_max is not None and score > context.score_max:
             return False
-        return not (score_min is not None and score_max is not None and score_min > score_max)
+        return not (
+            context.score_min is not None
+            and context.score_max is not None
+            and context.score_min > context.score_max
+        )
 
     def _apply_display_filters(self, samples: list[dict[str, object]]) -> list[dict[str, object]]:
-        filtered = [sample for sample in samples if self._sample_visible(sample)]
-        return sorted(filtered, key=self._sample_sort_key)
+        # Every filter setting and the sort mode are read once for the whole pass. All
+        # of them used to be fetched per sample, which is what made a filter change on
+        # a large folder take the better part of a second.
+        context = self._filter_context()
+        sort_mode = self.sort_var.get().strip()
+        filtered = [sample for sample in samples if self._sample_visible(sample, context)]
+        return sorted(filtered, key=lambda sample: self._sample_sort_key(sample, sort_mode))
 
     def _refresh_current_results(self) -> None:
         if self.current_state is None:
@@ -2256,16 +3053,36 @@ class BikiniScannerApp:
         self.similar_anchor_path = None
         self._refresh_displayed_results()
 
+    def _hold_page_order(self, page: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Keep photos already on this page where the reviewer last saw them.
+
+        A retrain re-ranks everything, so without this the photo you were about to
+        judge slides somewhere else the moment the model catches up — and the click
+        you were lining up lands on something else. Positions are pinned for as long
+        as you stay on the page; new arrivals fall in at the end, and turning the page
+        or changing a filter adopts the new ranking in full.
+        """
+        if not self._page_order:
+            return page
+        rank = {path: position for position, path in enumerate(self._page_order)}
+        seen = [sample for sample in page if str(sample["path"]) in rank]
+        seen.sort(key=lambda sample: rank[str(sample["path"])])
+        arrived = [sample for sample in page if str(sample["path"]) not in rank]
+        return seen + arrived
+
     def _refresh_displayed_results(self, reset_page: bool = True, keep_focus: bool = True) -> None:
         self.displayed_samples = self._apply_display_filters(self.current_samples)
         if reset_page:
-            # A new result set starts at the top; paging through one does not.
+            # A new result set starts at the top; paging through one does not. It also
+            # means the reviewer asked for a different order, so the pinned one goes.
             self.page_index = 0
+            self._page_order = []
         pages = self._page_count()
         self.page_index = max(0, min(self.page_index, pages - 1))
         size = self._page_size()
         start = self.page_index * size
-        self.page_samples = self.displayed_samples[start : start + size]
+        self.page_samples = self._hold_page_order(self.displayed_samples[start : start + size])
+        self._page_order = [str(sample["path"]) for sample in self.page_samples]
         if not keep_focus:
             # Turning a page moves the active picture onto that page, otherwise the
             # preview keeps showing a photo that is no longer in the grid.
@@ -2275,12 +3092,214 @@ class BikiniScannerApp:
         self._sync_pager()
         self._save_review_session()
 
+    def explain_score(self, path: str | None = None) -> None:
+        """Show how one photo's score was arrived at.
+
+        Everything here was already computed and kept on `ScoreState`; it was just
+        never put in front of anyone. Without it the only way to answer "why did this
+        score 0.42?" was to change a prompt and rescan to see what moved, which is a
+        slow way to learn what the scanner is doing.
+        """
+        path = path or self.focused_path
+        state = self.current_state
+        if not path or state is None:
+            messagebox.showinfo("No photo selected", "Run a scan and pick a photo first.")
+            return
+        index = self._state_index(path)
+        if index is None:
+            messagebox.showinfo("Not in this scan", "That photo is not part of the current results.")
+            return
+
+        threshold = float(self.threshold_var.get())
+        final = float(state.scores[index])
+        zero_shot = float(state.zero_shot_scores[index]) if index < len(state.zero_shot_scores) else final
+        lines: list[str] = []
+        lines.append(f"{Path(path).name}")
+        lines.append("")
+        verdict = "above" if final >= threshold else "below"
+        lines.append(f"Final score  {final:.3f}   ({verdict} the {threshold:.3f} sensitivity setting)")
+
+        stage = state.cascade_stage[index] if index < len(state.cascade_stage) else ""
+        reason = state.cascade_reason[index] if index < len(state.cascade_reason) else ""
+        excluded = bool(state.excluded[index]) if state.excluded is not None and index < len(state.excluded) else False
+        if excluded or reason:
+            lines.append(f"Gate         {reason or stage}")
+            if excluded:
+                lines.append("             This image is excluded, so its score is forced to zero.")
+        lines.append("")
+
+        # Prompt evidence versus what the labels taught, and how the two were mixed.
+        lines.append("How the score was made up")
+        lines.append(f"  prompts / cascade      {zero_shot:.3f}")
+        if state.classifier_trained and state.learning_summary:
+            lines.append(f"  learned from labels    {state.learning_summary}")
+            if abs(final - zero_shot) >= 0.0005:
+                direction = "raised" if final > zero_shot else "lowered"
+                lines.append(f"  your labels {direction} it by {abs(final - zero_shot):.3f}")
+            else:
+                lines.append("  your labels did not move this one")
+        else:
+            lines.append("  learned from labels    not trained yet (prompt score only)")
+        lines.append("")
+
+        lines.append("What each axis saw   (0.00 = nothing; these are what the gates compare)")
+        readable = {
+            "bikini": "bikini",
+            "bikini_top": "bikini top",
+            "bikini_bottom": "bikini bottom",
+            "cleavage": "cleavage",
+            "midriff": "midriff",
+            "nsfw": "explicit",
+        }
+        for axis_name, label in readable.items():
+            values = state.axis_scores.get(axis_name)
+            if values is None or index >= len(values):
+                continue
+            raw = float(values[index])
+            strength = float(cascade.evidence(np.asarray([raw]))[0])
+            bar = "#" * int(round(strength * 20))
+            lines.append(f"  {label:<16} {strength:.2f}  {bar}")
+        lines.append("")
+
+        lines.append("Subject")
+        for axis_name, label in (("evidence_female", "reads as female"), ("evidence_adult", "reads as adult")):
+            values = state.axis_scores.get(axis_name)
+            if values is not None and index < len(values):
+                lines.append(f"  {label:<16} {float(values[index]):.2f}")
+        if state.face_counts is not None and index < len(state.face_counts):
+            count = int(state.face_counts[index])
+            if count >= 0:
+                lines.append(f"  faces detected   {count}")
+        region = state.detail_regions[index] if index < len(state.detail_regions) else ""
+        lines.append(f"  best crop        {region or 'whole image only'}")
+        if state.deep_scanned:
+            lines.append("  (body-region crops were examined for this scan)")
+        else:
+            lines.append("  (whole frame only — turn Deep scan on to examine body crops)")
+
+        if state.refine is not None and index < len(state.refine.scores):
+            value = float(state.refine.scores[index])
+            if np.isfinite(value):
+                source = "vision-LLM" if state.refine.source == "vlm" else "high-accuracy model"
+                lines.append("")
+                lines.append(f"Second opinion   {source} scored this {value:.3f} and was blended in")
+
+        note = self.note_for(path)
+        if note:
+            lines.append("")
+            lines.append(f"Your note: {note}")
+
+        dialog, outer = self._create_modal(
+            "Why this score", padding=12, geometry="720x620", resizable=(True, True)
+        )
+        body = ttk.Frame(outer)
+        body.pack(fill=BOTH, expand=True)
+        text = Text(body, wrap="word", font=("TkFixedFont", 9))
+        text.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scroll.pack(side=RIGHT, fill="y")
+        text.configure(yscrollcommand=scroll.set)
+        palette = self._palette()
+        text.configure(bg=palette["entry_bg"], fg=palette["fg"], insertbackground=palette["fg"], relief="solid")
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+        row = self._modal_button_row(outer)
+        ttk.Button(row, text="Close", command=dialog._safe_close).pack(side=RIGHT)  # type: ignore[attr-defined]
+        def tune_prompts() -> None:
+            dialog._safe_close()  # type: ignore[attr-defined]
+            self.open_prompt_tester_dialog()
+
+        ttk.Button(row, text="Tune the prompts", command=tune_prompts).pack(side=RIGHT, padx=(0, 8))
+
+    def show_age_gate_report(self) -> None:
+        """Summarise what the age gate did, so it can be checked without weakening it.
+
+        The gate is on by default and deliberately errs toward excluding; flagged
+        images are forced to zero and hidden everywhere, which is the right behaviour
+        and also means the only evidence it is working is a count. This reports what it
+        did without putting any excluded image back on screen.
+        """
+        state = self.current_state
+        if state is None:
+            messagebox.showinfo("Age gate", "Run a scan first.")
+            return
+        stages = list(state.cascade_stage)
+        if not stages:
+            messagebox.showinfo("Age gate", "This scan recorded no gate decisions.")
+            return
+        counts: dict[str, int] = {}
+        for stage in stages:
+            counts[stage] = counts.get(stage, 0) + 1
+        minor_rows = [index for index, stage in enumerate(stages) if stage == cascade.STAGE_MINOR]
+        adult = state.axis_scores.get("evidence_adult")
+        child = state.axis_scores.get("evidence_child")
+        lines = [
+            f"Scanned {len(stages):,} images with the age gate "
+            f"{'ON' if self.config.exclude_minors else 'OFF'} "
+            f"(sensitivity {self.config.minor_threshold:.2f}; lower is stricter).",
+            "",
+            "Every image ended in one of these stages:",
+        ]
+        for stage, count in sorted(counts.items(), key=lambda item: -item[1]):
+            label = cascade.STAGE_REASONS.get(stage) or ("scored normally" if stage == cascade.STAGE_SCORED else stage)
+            share = 100.0 * count / len(stages)
+            lines.append(f"  {count:>6,}  {share:5.1f}%   {label}")
+        lines.append("")
+        if minor_rows:
+            lines.append(f"{len(minor_rows):,} image(s) were excluded by the age gate.")
+            if child is not None and adult is not None:
+                child_values = [float(child[i]) for i in minor_rows if i < len(child)]
+                adult_values = [float(adult[i]) for i in minor_rows if i < len(adult)]
+                if child_values:
+                    lines.append(
+                        f"  child evidence on those: min {min(child_values):.2f}, "
+                        f"median {sorted(child_values)[len(child_values) // 2]:.2f}, max {max(child_values):.2f}"
+                    )
+                if adult_values:
+                    lines.append(
+                        f"  adult evidence on those: min {min(adult_values):.2f}, "
+                        f"median {sorted(adult_values)[len(adult_values) // 2]:.2f}, max {max(adult_values):.2f}"
+                    )
+            lines.append("")
+            lines.append(
+                "Excluded images are not listed and cannot be shown: that is the point of the\n"
+                "gate. If the count looks wrong for your material, the sensitivity setting in\n"
+                "Settings > Detection is the control — lower excludes on less evidence."
+            )
+        else:
+            lines.append("The age gate excluded nothing in this folder.")
+        if not self._face_model_installed():
+            lines.append("")
+            lines.append(
+                "Note: the face model is not installed, so the age check reads whole images\n"
+                "rather than face crops. Installing it in Settings > Detection makes this\n"
+                "markedly more reliable."
+            )
+        messagebox.showinfo("Age gate report", "\n".join(lines))
+
+    def _face_model_installed(self) -> bool:
+        return "off" not in self._face_model_status().lower()
+
+    def _state_index(self, path: str) -> int | None:
+        """Row for a path in the current state, via a map built once per scan.
+
+        Both callers used a linear scan. `_axis_details_text` runs once per card, so a
+        full page against a few thousand images was hundreds of thousands of string
+        comparisons for a lookup that should be constant time.
+        """
+        state = self.current_state
+        if state is None:
+            return None
+        if self._path_index_state is not state:
+            self._path_index = {str(value): position for position, value in enumerate(state.paths)}
+            self._path_index_state = state
+        return self._path_index.get(path)
+
     def _axis_details_text(self, path: str) -> str:
         if self.current_state is None:
             return ""
-        try:
-            index = self.current_state.paths.index(path)
-        except ValueError:
+        index = self._state_index(path)
+        if index is None:
             return ""
         state = self.current_state
         parts: list[str] = []
@@ -2311,12 +3330,10 @@ class BikiniScannerApp:
         return "  ".join(parts)
 
     def _match_score_for_path(self, path: str) -> float:
-        if self.current_state is None:
+        index = self._state_index(path)
+        if index is None or self.current_state is None:
             return 0.0
-        for candidate, score in zip(self.current_state.paths, self.current_state.scores, strict=False):
-            if candidate == path:
-                return float(score)
-        return 0.0
+        return float(self.current_state.scores[index])
 
     def _detected_bucket(self, index: int | None) -> str:
         """Name the strongest thing the scanner detected in one image."""
@@ -2377,17 +3394,21 @@ class BikiniScannerApp:
         self.similar_anchor_path = None
         self.current_samples = samples
         threshold = float(self.threshold_var.get())
+        # Count what is on screen, not what was found: with decided photos hidden the
+        # two differ, and a headline number the grid contradicts is worse than none.
+        self._refresh_displayed_results(reset_page=reset_page)
         counts: dict[str, int] = {}
-        for sample in samples:
+        for sample in self.displayed_samples:
             bucket = str(sample.get("bucket", ""))
             counts[bucket] = counts.get(bucket, 0) + 1
         breakdown = ", ".join(f"{name} {count}" for name, count in counts.items() if count)
+        hidden = len(samples) - len(self.displayed_samples)
         self.status_var.set(
-            f"{len(samples)} detected files at threshold {threshold:.3f}"
+            f"{len(self.displayed_samples)} detected files at threshold {threshold:.3f}"
             + (f" — {breakdown}" if breakdown else "")
+            + (f" ({hidden} already decided or filtered out)" if hidden > 0 else "")
             + ". Switch to 'Review queue' to teach the scanner."
         )
-        self._refresh_displayed_results(reset_page=reset_page)
 
     def restore_review_view(self) -> None:
         if self.review_samples:
@@ -2409,14 +3430,36 @@ class BikiniScannerApp:
         if not ranking:
             messagebox.showinfo("No results", "No similar images found.")
             return
+        # Remember where the reviewer was. Without this, "Find similar" was a one-way
+        # door: the only ways out were the two view buttons, both of which rebuild
+        # from scratch and lose the page and the active photo.
+        self._view_return = (self.view_mode, list(self.current_samples), self.page_index, self.focused_path)
         self.view_mode = "similar"
         self.similar_anchor_path = anchor_path
         self.current_samples = [
             {"path": path, "score": similarity, "bucket": "Similar"} for path, similarity in ranking
         ]
-        self.status_var.set(f"Showing similar images to {Path(anchor_path).name}.")
+        self.status_var.set(
+            f"Showing images similar to {Path(anchor_path).name}. Press Backspace, or View > Back, to return."
+        )
         self._refresh_displayed_results()
         self._refresh_summary()
+
+    def go_back(self) -> None:
+        """Return to the view Find similar was launched from, page and photo intact."""
+        if self._view_return is None:
+            self.status_var.set("Nothing to go back to.")
+            return
+        mode, samples, page_index, focused = self._view_return
+        self._view_return = None
+        self.view_mode = mode
+        self.similar_anchor_path = None
+        self.current_samples = list(samples)
+        self.page_index = page_index
+        self.focused_path = focused
+        self._page_order = []
+        self._refresh_displayed_results(reset_page=False)
+        self.status_var.set("Back to where you were.")
 
     def _rank_similar_paths(self, anchor_path: str) -> list[tuple[str, float]]:
         if self.current_state is None:
@@ -2522,6 +3565,16 @@ class BikiniScannerApp:
         modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(stat.st_mtime))
         size_mb = stat.st_size / (1024 * 1024)
         return f"{size_text} | {size_mb:.1f} MB | {modified} | {path}"
+
+    def open_plugins_folder(self) -> None:
+        """Open (creating if needed) the folder plugins are loaded from."""
+        directory = plugins_dir()
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Plugins folder unavailable", f"{directory}\n\n{exc}")
+            return
+        self.reveal_in_file_manager(str(directory))
 
     def reveal_in_file_manager(self, path: str) -> None:
         command = self._reveal_command(Path(path))
@@ -2710,24 +3763,30 @@ class BikiniScannerApp:
         threading.Thread(target=worker, name="face-model-download", daemon=True).start()
 
     def open_settings_dialog(self) -> None:
-        # This form runs to 40-odd grid rows. In a fixed-size window the lower half,
-        # including the Save and Cancel buttons, was simply unreachable on a short
-        # screen, so it lives in the same scrollable frame the other tall modals use.
-        dialog, outer = self._create_modal("Settings", resizable=(False, True))
-        canvas, form, scroll_window = self._modal_scroll_frame(outer)
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(scroll_window, width=event.width))
-
-        def scroll_settings(event: Any) -> None:
-            # Text widgets scroll themselves. Without this the wheel over the prompt
-            # boxes would scroll the dialog out from under the pointer instead.
-            if isinstance(event.widget, Text):
-                return
-            canvas.yview_scroll(-int(event.delta / 120), "units")
-
-        canvas.bind("<MouseWheel>", scroll_settings)
-        canvas.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"))
-        canvas.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"))
+        # One 44-row form meant the window opened at whatever width the widest label
+        # happened to need, could not be widened, and buried the two or three settings
+        # anyone actually changes under thirty they never touch. Four short tabs, a
+        # resizable window, and the rarely-touched numbers gathered under Advanced.
+        dialog, outer = self._create_modal("Settings", resizable=(True, True))
         palette = self._palette()
+
+        notebook = ttk.Notebook(outer)
+        notebook.pack(side=TOP, fill=BOTH, expand=True)
+        self.settings_notebook = notebook
+
+        def add_tab(title: str) -> ttk.Frame:
+            page = ttk.Frame(notebook, padding=(14, 12))
+            notebook.add(page, text=title)
+            # Column 1 carries the controls and takes the slack when the dialog widens.
+            page.columnconfigure(1, weight=1)
+            return page
+
+        # Detection first: it holds the sensitivity and the age gate, which are the
+        # settings a reviewer actually reaches for.
+        detection_tab = add_tab("Detection")
+        model_tab = add_tab("Model")
+        prompts_tab = add_tab("Prompts")
+        advanced_tab = add_tab("Advanced")
 
         backend_var = StringVar(value=self.config.backend)
         model_var = StringVar(value=self.config.model_name)
@@ -2752,6 +3811,7 @@ class BikiniScannerApp:
         require_female_var = BooleanVar(value=self.config.require_female)
         female_threshold_var = StringVar(value=str(self.config.female_threshold))
         global_learning_var = BooleanVar(value=self.config.global_learning)
+        enable_plugins_var = BooleanVar(value=self.config.enable_plugins)
         refine_var = BooleanVar(value=bool(self.config.refine_model))
         vlm_enabled_var = BooleanVar(value=self.config.vlm_enabled)
         vlm_base_url_var = StringVar(value=self.config.vlm_base_url)
@@ -2759,12 +3819,23 @@ class BikiniScannerApp:
         vlm_concurrency_var = StringVar(value=str(self.config.vlm_concurrency))
         vlm_band_var = StringVar(value=str(self.config.vlm_band))
         vlm_max_images_var = StringVar(value=str(self.config.vlm_max_images))
+        vlm_api_key_var = StringVar(value=self.config.vlm_api_key)
+        vlm_timeout_var = StringVar(value=str(self.config.vlm_timeout))
+        vlm_weight_var = StringVar(value=str(self.config.vlm_weight))
+        refine_band_var = StringVar(value=str(self.config.refine_band))
+        refine_max_images_var = StringVar(value=str(self.config.refine_max_images))
+        refine_weight_var = StringVar(value=str(self.config.refine_weight))
+        pipeline_var = StringVar(value=self.config.pipeline)
 
-        def add_labeled_entry(row: int, label: str, variable: StringVar, width: int = 48, tip: str = "") -> ttk.Entry:
-            caption = ttk.Label(form, text=label)
-            caption.grid(row=row, column=0, sticky="w", pady=(0, 4))
-            entry = ttk.Entry(form, textvariable=variable, width=width)
-            entry.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        def add_labeled_entry(
+            parent: ttk.Frame, row: int, label: str, variable: StringVar, width: int = 40, tip: str = ""
+        ) -> ttk.Entry:
+            caption = ttk.Label(parent, text=label)
+            caption.grid(row=row, column=0, sticky="w", pady=(0, 6), padx=(0, 12))
+            entry = ttk.Entry(parent, textvariable=variable, width=width)
+            # A four-character number stretched across the whole column reads as a
+            # text field; only the wide ones take the slack when the dialog grows.
+            entry.grid(row=row, column=1, sticky="ew" if width >= 24 else "w", pady=(0, 6))
             if tip:
                 # Hover help on the caption as well: that is where the eye lands first.
                 self._tooltip(caption, tip)
@@ -2777,16 +3848,18 @@ class BikiniScannerApp:
             self._tooltip(box, tip)
             return box
 
-        def add_inline_entry(row: int, label: str, variable: StringVar, width: int = 14, tip: str = "") -> ttk.Entry:
+        def add_inline_entry(
+            parent: ttk.Frame, row: int, label: str, variable: StringVar, width: int = 10, tip: str = ""
+        ) -> ttk.Entry:
             """A caption+entry pair for a row whose column 0 is already a checkbox.
 
-            add_labeled_entry always puts its caption in column 0, so on the two rows
-            that pair a checkbox with a number the caption was gridded into the same
-            cell as the checkbox and the two were drawn on top of each other — the box
-            was invisible and unclickable. Everything here lives in column 1.
+            add_labeled_entry always puts its caption in column 0, so on the rows that
+            pair a checkbox with a number the caption would land in the same cell as
+            the checkbox and the two would be drawn on top of each other. Everything
+            here lives in column 1.
             """
-            holder = ttk.Frame(form)
-            holder.grid(row=row, column=1, sticky="ew", padx=(14, 0), pady=(0, 8))
+            holder = ttk.Frame(parent)
+            holder.grid(row=row, column=1, sticky="w", padx=(14, 0), pady=(0, 6))
             caption = ttk.Label(holder, text=label)
             caption.pack(side=LEFT, padx=(0, 8))
             entry = ttk.Entry(holder, textvariable=variable, width=width)
@@ -2796,199 +3869,122 @@ class BikiniScannerApp:
                 self._tooltip(entry, tip)
             return entry
 
-        def add_combo(row: int, label: str, variable: StringVar, values: tuple[str, ...], tip: str) -> ttk.Combobox:
-            caption = ttk.Label(form, text=label)
-            caption.grid(row=row, column=0, sticky="w", pady=(0, 4))
-            combo = ttk.Combobox(form, textvariable=variable, values=values, state="readonly")
-            combo.grid(row=row, column=1, sticky="ew", pady=(0, 8))
+        def add_combo(
+            parent: ttk.Frame, row: int, label: str, variable: StringVar, values: tuple[str, ...], tip: str
+        ) -> ttk.Combobox:
+            caption = ttk.Label(parent, text=label)
+            caption.grid(row=row, column=0, sticky="w", pady=(0, 6), padx=(0, 12))
+            combo = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly")
+            combo.grid(row=row, column=1, sticky="ew", pady=(0, 6))
             self._tooltip(caption, tip)
             self._tooltip(combo, tip)
             return combo
 
-        def add_section(row: int, title: str) -> None:
-            """A separator plus a bold header to break up the settings form."""
-            ttk.Separator(form, orient="horizontal").grid(row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4))
-            ttk.Label(form, text=title, font=("TkDefaultFont", 10, "bold")).grid(
-                row=row + 1, column=0, sticky="w", pady=(0, 4)
+        def add_section(parent: ttk.Frame, row: int, title: str, first: bool = False) -> None:
+            """A bold header, with a rule above it once a tab has more than one group."""
+            top = 0 if first else 10
+            if not first:
+                ttk.Separator(parent, orient="horizontal").grid(
+                    row=row, column=0, columnspan=2, sticky="ew", pady=(top, 6)
+                )
+            ttk.Label(parent, text=title, font=("TkDefaultFont", 10, "bold")).grid(
+                row=row + 1, column=0, columnspan=2, sticky="w", pady=(0, 8)
             )
 
-        add_section(0, "Scoring prompts")
-        prompt_caption = ttk.Label(form, text="Positive prompts")
-        prompt_caption.grid(row=2, column=0, sticky="w")
-        ttk.Label(form, text="Primary scoring uses the canonical Bikini axis defaults.", wraplength=360).grid(
-            row=2, column=1, sticky="e"
-        )
-        positive_text = Text(form, width=58, height=6, wrap="word")
-        positive_text.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        positive_text.insert("1.0", "\n".join(self.config.positive_prompts))
-        positive_tip = (
-            "One phrase per line describing what you WANT found. Each is compared against "
-            "the image and the best match wins, so several differently worded lines beat "
-            "one clever one. These feed the headline bikini axis; the cleavage, midriff, "
-            "age and sex axes have their own built-in wording."
-        )
-        self._tooltip(prompt_caption, positive_tip)
-        self._tooltip(positive_text, positive_tip)
-
-        negative_caption = ttk.Label(form, text="Negative prompts")
-        negative_caption.grid(row=4, column=0, sticky="w")
-        negative_text = Text(form, width=58, height=6, wrap="word")
-        negative_text.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        negative_text.insert("1.0", "\n".join(self.config.negative_prompts))
-        negative_tip = (
-            "One phrase per line for what you do NOT want. A score is positive evidence "
-            "minus negative evidence, so these matter as much as the positives: list the "
-            "things the scanner keeps confusing for a match, like 'a fully clothed person'."
-        )
-        self._tooltip(negative_caption, negative_tip)
-        self._tooltip(negative_text, negative_tip)
-
-        add_section(6, "Model & Hardware")
-        backend_combo = add_combo(
-            8,
-            "Backend",
-            backend_var,
-            ("clip-torch", "clip-onnx"),
-            "Which engine runs the model. clip-torch is the normal choice. clip-onnx is "
-            "experimental and needs the optional onnxruntime package installed. Changing "
-            "this requires a new scan.",
-        )
-        add_labeled_entry(
-            9,
-            "Model name",
-            model_var,
-            tip="The Hugging Face model used for scoring. openai/clip-vit-base-patch32 is the "
-            "default and is downloaded once, then cached. openai/clip-vit-large-patch14 is "
-            "noticeably more accurate but a ~1.7 GB download and several times slower per "
-            "image. Changing this invalidates cached embeddings and needs a fresh scan.",
-        )
-        add_combo(
-            10,
-            "Device",
-            device_var,
-            ("auto", "cpu", "cuda"),
-            "Where the model runs. auto picks your NVIDIA GPU when one is usable and falls "
-            "back to the CPU otherwise. Force cpu if a GPU driver misbehaves.",
-        )
-        add_combo(
-            11,
-            "Precision",
-            precision_var,
-            ("auto", "fp32", "fp16"),
-            "Numeric precision. fp16 roughly halves GPU memory and speeds scans up, but only "
-            "applies on CUDA; on the CPU everything runs fp32 regardless. auto chooses for you.",
-        )
-        add_check(
-            form,
-            12,
-            0,
-            "Quantize CPU (int8)",
-            quantize_cpu_var,
-            "Compresses the model to 8-bit for CPU scanning. Faster and lighter on memory, at "
-            "some cost in accuracy. Worth trying on a slow machine with a large folder.",
-        )
-        add_check(
-            form,
-            12,
-            1,
-            "Preload backend on startup",
-            preload_backend_var,
-            "Loads the model in the background as soon as the app opens, so your first scan "
-            "starts immediately. Turn off if you want the app to open using less memory and "
-            "do not mind waiting at the first scan instead.",
-        )
-        add_labeled_entry(
-            13,
-            "Batch size",
-            batch_var,
-            width=18,
-            tip="How many images are fed to the model at once. Larger is faster but uses more "
-            "memory. 16 suits most machines; drop to 4-8 if scanning runs out of memory.",
-        )
-        add_labeled_entry(
-            14,
-            "Zero-shot scale",
-            scale_var,
-            width=18,
-            tip="How sharply prompt scores separate. The model's raw agreement differences are "
-            "tiny, so this multiplies them: too low and everything looks like a 50/50 guess, "
-            "too high and every score slams to 0 or 1. 40 was chosen by measurement — leave it "
-            "unless you are deliberately recalibrating.",
-        )
-        add_labeled_entry(
-            15,
-            "Classifier weight",
-            classifier_weight_var,
-            width=18,
-            tip="Legacy blend control, used only when the pipeline is set to 'legacy'. The "
-            "cascade pipeline ignores it and instead decides how much to trust what it has "
-            "learned from your Accept/REJECT decisions, based on its own measured accuracy.",
-        )
-        add_labeled_entry(
-            16,
-            "Zero-shot weight",
-            zero_shot_weight_var,
-            width=18,
-            tip="The other half of the legacy blend: how much the prompt-only score counts. "
-            "Also unused by the cascade pipeline.",
-        )
-        add_section(17, "Detection")
-        add_labeled_entry(
-            19,
-            "Threshold",
+        # --- Detection ------------------------------------------------------
+        add_section(detection_tab, 0, "What counts as a match", first=True)
+        threshold_entry = add_labeled_entry(
+            detection_tab,
+            2,
+            "Sensitivity threshold",
             threshold_var,
-            width=18,
+            width=12,
             tip="The sensitivity a scan starts at, matching the slider on the main window. "
             "Lower shows more photos and more false alarms; higher shows only the surest "
             "matches. 0.35 suits the current scoring.",
         )
         nsfw_combo = add_combo(
-            20,
-            "NSFW mode",
+            detection_tab,
+            3,
+            "Explicit images",
             nsfw_mode_var,
             ("include", "exclude", "only"),
             "What to do with explicit images. include keeps them alongside everything else, "
             "exclude drops them from results, only shows nothing else.",
         )
         add_labeled_entry(
-            21,
-            "NSFW threshold",
+            detection_tab,
+            4,
+            "Explicit threshold",
             nsfw_threshold_var,
-            width=18,
+            width=12,
             tip="How sure the scanner must be before treating an image as explicit, for the "
-            "NSFW mode above. Lower catches more but misjudges more.",
+            "setting above. Lower catches more but misjudges more.",
         )
-        add_labeled_entry(
-            22,
-            "Person threshold",
-            person_threshold_var,
-            width=18,
-            tip="How sure the scanner must be that a person is present, used only when "
-            "'Require person' is ticked below.",
+
+        add_section(detection_tab, 5, "Who is in the picture")
+        add_check(
+            detection_tab,
+            7,
+            0,
+            "Exclude images that may show a minor",
+            exclude_minors_var,
+            "Drops anything that reads as showing a child. Flagged images are forced to a zero "
+            "score and hidden from every view, so no threshold or filter can bring them back. "
+            "Deliberately errs toward excluding.",
+        )
+        add_inline_entry(
+            detection_tab,
+            7,
+            "Sensitivity (lower = stricter)",
+            minor_threshold_var,
+            tip="How much child-like evidence triggers the age exclusion to the left. LOWER IS "
+            "STRICTER: 0.30 excludes on modest evidence, 0.60 waits for strong evidence and "
+            "therefore excludes less. Age estimates are rough, which is why the default sits "
+            "low. To switch the gate off entirely, untick the box rather than raising this.",
         )
         add_check(
-            form,
-            23,
+            detection_tab,
+            8,
             0,
-            "Require person",
+            "Prefer female subjects",
+            require_female_var,
+            "Ranks images with a female subject higher. On its own this only re-orders results; "
+            "it discards nothing unless you also raise the cut-off to the right.",
+        )
+        add_inline_entry(
+            detection_tab,
+            8,
+            "Cut-off (0 = rank only)",
+            female_threshold_var,
+            tip="Leave at 0 to only re-order results. Above 0 it becomes a hard filter that "
+            "discards images scoring below it. Kept at 0 by default because on real photos a "
+            "hard cut-off silently binned a genuine match whose close-up crop gave the model "
+            "nothing to judge sex from.",
+        )
+        add_check(
+            detection_tab,
+            9,
+            0,
+            "Require a person",
             require_person_var,
             "Discard images where no person is detected. Off by default for good reason: "
             "close-up body shots often score very low on 'is this a person', so this filter "
             "throws away real matches. Turn it on only if landscapes are cluttering results.",
         )
-        add_check(
-            form,
-            23,
-            1,
-            "Enable face detection",
-            enable_face_detection_var,
-            "Count faces in every image during the scan. Needs the face model installed below. "
-            "The deep pass already detects faces for candidate images, so this mainly adds a "
-            "face count to the details line.",
+        add_inline_entry(
+            detection_tab,
+            9,
+            "Confidence needed",
+            person_threshold_var,
+            tip="How sure the scanner must be that a person is present, used only when "
+            "'Require a person' is ticked to the left.",
         )
-        add_section(24, "Detection pipeline")
+
+        add_section(detection_tab, 10, "How closely images are examined")
         add_combo(
-            26,
+            detection_tab,
+            12,
             "Deep scan (body-region crops)",
             deep_scan_var,
             ("candidates", "always", "off"),
@@ -3000,115 +3996,17 @@ class BikiniScannerApp:
             "off: whole frame only — fastest, and noticeably worse.",
         )
         add_check(
-            form,
-            27,
+            detection_tab,
+            13,
             0,
-            "Exclude images that may show a minor",
-            exclude_minors_var,
-            "Drops anything that reads as showing a child. Flagged images are forced to a zero "
-            "score and hidden from every view, so no threshold or filter can bring them back. "
-            "Deliberately errs toward excluding.",
+            "Count faces in every image",
+            enable_face_detection_var,
+            "Count faces in every image during the scan. Needs the face model installed below. "
+            "The deep pass already detects faces for candidate images, so this mainly adds a "
+            "face count to the details line.",
         )
-        add_inline_entry(
-            27,
-            "Minor sensitivity (lower = stricter)",
-            minor_threshold_var,
-            tip="How much child-like evidence triggers the age exclusion to the left. LOWER IS "
-            "STRICTER: 0.30 excludes on modest evidence, 0.60 waits for strong evidence and "
-            "therefore excludes less. Age estimates are rough, which is why the default sits "
-            "low. To switch the gate off entirely, untick the box rather than raising this.",
-        )
-        add_check(
-            form,
-            28,
-            0,
-            "Prefer female subjects",
-            require_female_var,
-            "Ranks images with a female subject higher. On its own this only re-orders results; "
-            "it discards nothing unless you also raise the cut-off to the right.",
-        )
-        add_inline_entry(
-            28,
-            "Female cut-off (0 = rank only)",
-            female_threshold_var,
-            tip="Leave at 0 to only re-order results. Above 0 it becomes a hard filter that "
-            "discards images scoring below it. Kept at 0 by default because on real photos a "
-            "hard cut-off silently binned a genuine match whose close-up crop gave the model "
-            "nothing to judge sex from.",
-        )
-        add_check(
-            form,
-            29,
-            0,
-            "Learn across all folders",
-            global_learning_var,
-            "Pool your Accept/REJECT decisions so every folder benefits from all of them. Off "
-            "means each folder learns from scratch. Each folder's own labels are saved either "
-            "way; Tools > Reset cross-folder learning clears the shared pool.",
-        )
-        add_check(
-            form,
-            29,
-            1,
-            f"High-accuracy re-check of borderline images ({HIGH_ACCURACY_MODEL.split('/')[-1]}, ~1.7 GB download)",
-            refine_var,
-            "Re-scores only the images sitting closest to your sensitivity setting using a much "
-            "larger model, then blends its opinion in. Those borderline cases are where "
-            "mistakes live, so the accuracy is worth it there. Costs a one-time ~1.7 GB "
-            "download and adds minutes to a scan; the rest of the images are untouched.",
-        )
-        add_section(30, "VLM adjudication")
-        add_check(
-            form,
-            32,
-            0,
-            "Use local vision-LLM adjudication",
-            vlm_enabled_var,
-            "Optional second opinion from a local Ollama or llama.cpp server. It only checks "
-            "borderline images and uncertain age calls, in parallel, so the usual CLIP scan "
-            "stays fast. The server must already be running.",
-        )
-        add_labeled_entry(
-            33,
-            "VLM server URL",
-            vlm_base_url_var,
-            width=36,
-            tip="OpenAI-compatible local endpoint, for example http://localhost:11434/v1. "
-            "The stage is skipped if it cannot reach this address.",
-        )
-        add_labeled_entry(
-            34,
-            "VLM model",
-            vlm_model_var,
-            width=36,
-            tip="Model name served by Ollama or llama.cpp, for example qwen2.5vl:7b.",
-        )
-        add_labeled_entry(
-            35,
-            "VLM concurrency",
-            vlm_concurrency_var,
-            width=18,
-            tip="How many local requests run at once. Higher is faster only when your server "
-            "has enough CPU/GPU memory; 4 is a sensible starting point.",
-        )
-        add_labeled_entry(
-            36,
-            "VLM borderline band",
-            vlm_band_var,
-            width=18,
-            tip="Only scores within this distance of the threshold are sent to the VLM, plus "
-            "uncertain age calls. Wider is more accurate but costs more requests.",
-        )
-        add_labeled_entry(
-            37,
-            "VLM maximum images",
-            vlm_max_images_var,
-            width=18,
-            tip="Hard cap on VLM requests per scan. Skin exposure is only used to prioritize "
-            "images inside the eligible band; it never excludes an eligible image by itself.",
-        )
-        face_row = ttk.Frame(form)
-        face_row.grid(row=38, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        face_row = ttk.Frame(detection_tab)
+        face_row.grid(row=14, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         face_status = ttk.Label(face_row, text=self._face_model_status())
         face_status.pack(side=LEFT)
         face_button = ttk.Button(
@@ -3126,19 +4024,336 @@ class BikiniScannerApp:
         )
         self._tooltip(face_status, "Whether face-anchored crops are available right now.")
 
-        add_section(39, "Advanced")
+        # --- Model ----------------------------------------------------------
+        add_section(model_tab, 0, "Scoring model", first=True)
+        backend_combo = add_combo(
+            model_tab,
+            2,
+            "Engine",
+            backend_var,
+            ("clip-torch", "clip-onnx"),
+            "Which engine runs the model. clip-torch is the normal choice. clip-onnx is "
+            "experimental and needs the optional onnxruntime package installed. Changing "
+            "this requires a new scan.",
+        )
         add_labeled_entry(
-            41,
+            model_tab,
+            3,
+            "Model name",
+            model_var,
+            tip="The Hugging Face model used for scoring. openai/clip-vit-base-patch32 is the "
+            "default and is downloaded once, then cached. openai/clip-vit-large-patch14 is "
+            "noticeably more accurate but a ~1.7 GB download and several times slower per "
+            "image. Changing this invalidates cached embeddings and needs a fresh scan.",
+        )
+        refine_box = add_check(
+            model_tab,
+            4,
+            0,
+            "High-accuracy re-check of borderline images",
+            refine_var,
+            "Re-scores only the images sitting closest to your sensitivity setting using a much "
+            "larger model, then blends its opinion in. Those borderline cases are where "
+            "mistakes live, so the accuracy is worth it there. Costs a one-time ~1.7 GB "
+            "download and adds minutes to a scan; the rest of the images are untouched.",
+        )
+        refine_box.grid(columnspan=2)
+        ttk.Label(
+            model_tab,
+            text=f"Uses {HIGH_ACCURACY_MODEL.split('/')[-1]} — a one-off ~1.7 GB download.",
+            style="FormMuted.TLabel",
+        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=(22, 0), pady=(0, 6))
+        # The checkbox above decides whether the re-check runs; these decide what it
+        # costs. Exposing one without the others left no way to bound a slow scan.
+        add_labeled_entry(
+            model_tab,
+            13,
+            "Re-check band around the threshold",
+            refine_band_var,
+            width=12,
+            tip="Only images scoring within this distance of your sensitivity setting are "
+            "re-checked. Wider catches more borderline cases and costs more time.",
+        )
+        add_labeled_entry(
+            model_tab,
+            14,
+            "Re-check at most",
+            refine_max_images_var,
+            width=12,
+            tip="Hard cap on how many images the high-accuracy model re-scores in one scan.",
+        )
+        add_labeled_entry(
+            model_tab,
+            15,
+            "Re-check influence",
+            refine_weight_var,
+            width=12,
+            tip="How much the larger model's opinion counts when it disagrees with the first "
+            "pass, from 0 (ignored) to 1 (it decides). 0.65 by default.",
+        )
+
+        add_section(model_tab, 6, "Hardware")
+        add_combo(
+            model_tab,
+            8,
+            "Device",
+            device_var,
+            ("auto", "cpu", "cuda"),
+            "Where the model runs. auto picks your NVIDIA GPU when one is usable and falls "
+            "back to the CPU otherwise. Force cpu if a GPU driver misbehaves.",
+        )
+        add_combo(
+            model_tab,
+            9,
+            "Precision",
+            precision_var,
+            ("auto", "fp32", "fp16"),
+            "Numeric precision. fp16 roughly halves GPU memory and speeds scans up, but only "
+            "applies on CUDA; on the CPU everything runs fp32 regardless. auto chooses for you.",
+        )
+        add_labeled_entry(
+            model_tab,
+            10,
+            "Batch size",
+            batch_var,
+            width=12,
+            tip="How many images are fed to the model at once. Larger is faster but uses more "
+            "memory. 16 suits most machines; drop to 4-8 if scanning runs out of memory.",
+        )
+        add_check(
+            model_tab,
+            11,
+            0,
+            "Quantize CPU (int8)",
+            quantize_cpu_var,
+            "Compresses the model to 8-bit for CPU scanning. Faster and lighter on memory, at "
+            "some cost in accuracy. Worth trying on a slow machine with a large folder.",
+        )
+        add_check(
+            model_tab,
+            12,
+            0,
+            "Load the model when the app starts",
+            preload_backend_var,
+            "Loads the model in the background as soon as the app opens, so your first scan "
+            "starts immediately. Turn off if you want the app to open using less memory and "
+            "do not mind waiting at the first scan instead.",
+        )
+
+        # --- Prompts --------------------------------------------------------
+        prompts_tab.columnconfigure(0, weight=1)
+        prompts_tab.rowconfigure(2, weight=1)
+        prompts_tab.rowconfigure(5, weight=1)
+        prompt_caption = ttk.Label(prompts_tab, text="Positive prompts — what you want found")
+        prompt_caption.grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            prompts_tab,
+            text="Primary scoring uses the canonical Bikini axis defaults.",
+            style="FormMuted.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        positive_text = Text(prompts_tab, width=54, height=7, wrap="word")
+        positive_text.grid(row=2, column=0, columnspan=2, sticky="nsew", pady=(0, 10))
+        positive_text.insert("1.0", "\n".join(self.config.positive_prompts))
+        positive_tip = (
+            "One phrase per line describing what you WANT found. Each is compared against "
+            "the image and the best match wins, so several differently worded lines beat "
+            "one clever one. These feed the headline bikini axis; the cleavage, midriff, "
+            "age and sex axes have their own built-in wording."
+        )
+        self._tooltip(prompt_caption, positive_tip)
+        self._tooltip(positive_text, positive_tip)
+
+        negative_caption = ttk.Label(prompts_tab, text="Negative prompts — what you do not want")
+        negative_caption.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        negative_text = Text(prompts_tab, width=54, height=7, wrap="word")
+        negative_text.grid(row=5, column=0, columnspan=2, sticky="nsew")
+        negative_text.insert("1.0", "\n".join(self.config.negative_prompts))
+        negative_tip = (
+            "One phrase per line for what you do NOT want. A score is positive evidence "
+            "minus negative evidence, so these matter as much as the positives: list the "
+            "things the scanner keeps confusing for a match, like 'a fully clothed person'."
+        )
+        self._tooltip(negative_caption, negative_tip)
+        self._tooltip(negative_text, negative_tip)
+
+        # --- Advanced -------------------------------------------------------
+        add_section(advanced_tab, 0, "Learning", first=True)
+        add_check(
+            advanced_tab,
+            2,
+            0,
+            "Learn across all folders",
+            global_learning_var,
+            "Pool your Accept/REJECT decisions so every folder benefits from all of them. Off "
+            "means each folder learns from scratch. Each folder's own labels are saved either "
+            "way; Tools > Reset cross-folder learning clears the shared pool.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            3,
+            "Zero-shot scale",
+            scale_var,
+            width=12,
+            tip="How sharply prompt scores separate. The model's raw agreement differences are "
+            "tiny, so this multiplies them: too low and everything looks like a 50/50 guess, "
+            "too high and every score slams to 0 or 1. 40 was chosen by measurement — leave it "
+            "unless you are deliberately recalibrating.",
+        )
+        # Classifier weight and Zero-shot weight used to sit here. They only do
+        # anything when pipeline="legacy", which nothing in the UI can select, so in
+        # every configuration a user can reach they were two numbers that looked
+        # adjustable and changed nothing. They remain in ScannerConfig for the legacy
+        # pipeline and the CLI; they are simply no longer offered as settings.
+
+        add_section(advanced_tab, 6, "Vision-LLM second opinion")
+        add_check(
+            advanced_tab,
+            8,
+            0,
+            "Ask a local vision-LLM about borderline images",
+            vlm_enabled_var,
+            "Optional second opinion from a local Ollama or llama.cpp server. It only checks "
+            "borderline images and uncertain age calls, in parallel, so the usual CLIP scan "
+            "stays fast. The server must already be running.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            9,
+            "Server URL",
+            vlm_base_url_var,
+            width=32,
+            tip="OpenAI-compatible local endpoint, for example http://localhost:11434/v1. "
+            "The stage is skipped if it cannot reach this address.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            10,
+            "Model",
+            vlm_model_var,
+            width=32,
+            tip="Model name served by Ollama or llama.cpp, for example qwen2.5vl:7b.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            11,
+            "Requests at once",
+            vlm_concurrency_var,
+            width=12,
+            tip="How many local requests run at once. Higher is faster only when your server "
+            "has enough CPU/GPU memory; 4 is a sensible starting point.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            12,
+            "Borderline band",
+            vlm_band_var,
+            width=12,
+            tip="Only scores within this distance of the threshold are sent to the VLM, plus "
+            "uncertain age calls. Wider is more accurate but costs more requests.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            13,
+            "Maximum images per scan",
+            vlm_max_images_var,
+            width=12,
+            tip="Hard cap on VLM requests per scan. Skin exposure is only used to prioritize "
+            "images inside the eligible band; it never excludes an eligible image by itself.",
+        )
+        # The server URL was configurable while the credential was not, so any endpoint
+        # that needs authentication could be pointed at but never actually reached.
+        add_labeled_entry(
+            advanced_tab,
+            22,
+            "API key (optional)",
+            vlm_api_key_var,
+            width=32,
+            tip="Sent as a bearer token to the endpoint above. Local Ollama and llama.cpp "
+            "servers do not need one; leave it empty for those.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            23,
+            "Request timeout (seconds)",
+            vlm_timeout_var,
+            width=12,
+            tip="How long to wait for one adjudication before giving up on that image.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            24,
+            "Influence",
+            vlm_weight_var,
+            width=12,
+            tip="How much the vision-LLM's verdict counts against the first pass, from 0 "
+            "(ignored) to 1 (it decides).",
+        )
+        add_section(advanced_tab, 25, "Scoring pipeline")
+        add_combo(
+            advanced_tab,
+            27,
+            "Pipeline",
+            pipeline_var,
+            ("cascade", "legacy"),
+            "cascade is the current pipeline: staged gates, body-region crops, and a learned "
+            "model whose influence is earned from its measured accuracy. legacy is the "
+            "original single-pass blend, kept so old profiles still resolve. Legacy honours "
+            "the two blend weights below; cascade decides the blend for itself.\n\n"
+            "The age gate runs in both.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            28,
+            "Classifier weight (legacy only)",
+            classifier_weight_var,
+            width=12,
+            tip="Only used when the pipeline above is set to legacy.",
+        )
+        add_labeled_entry(
+            advanced_tab,
+            29,
+            "Zero-shot weight (legacy only)",
+            zero_shot_weight_var,
+            width=12,
+            tip="The other half of the legacy blend. Only used when the pipeline is legacy.",
+        )
+
+        add_section(advanced_tab, 30, "Extensions")
+        plugins_box = add_check(
+            advanced_tab,
+            32,
+            0,
+            "Run result plugins from the plugins folder",
+            enable_plugins_var,
+            "Executes every .py file in your plugins folder after each scan, with full "
+            "access to this machine. Only turn this on if you wrote the files yourself or "
+            "trust whoever did. A plugin defines process_results(state, samples) and returns "
+            "a reordered or filtered list.",
+        )
+        plugins_box.grid(columnspan=2)
+        plugins_row = ttk.Frame(advanced_tab)
+        plugins_row.grid(row=33, column=0, columnspan=2, sticky="ew", pady=(0, 6))
+        ttk.Label(
+            plugins_row,
+            text="Code in this folder runs with your account's permissions.",
+            style="FormMuted.TLabel",
+        ).pack(side=LEFT, padx=(22, 0))
+        ttk.Button(plugins_row, text="Open plugins folder", command=self.open_plugins_folder).pack(side=RIGHT)
+
+        add_section(advanced_tab, 34, "Application")
+        add_labeled_entry(
+            advanced_tab,
+            36,
             "Thumbnail cache entries",
             thumbnail_cache_var,
-            width=18,
+            width=12,
             tip="How many scaled thumbnails to keep in memory (32-2048). Higher makes scrolling "
             "and resizing smoother at the cost of RAM. Lower it if the app feels heavy.",
         )
-        url_caption = ttk.Label(form, text="Update manifest URL (optional)")
-        url_caption.grid(row=42, column=0, sticky="w", pady=(0, 4))
-        update_url_entry = ttk.Entry(form, textvariable=self.update_url_var, width=48)
-        update_url_entry.grid(row=42, column=1, sticky="ew", pady=(0, 8))
+        url_caption = ttk.Label(advanced_tab, text="Update manifest URL (optional)")
+        url_caption.grid(row=37, column=0, sticky="w", pady=(0, 6), padx=(0, 12))
+        update_url_entry = ttk.Entry(advanced_tab, textvariable=self.update_url_var, width=32)
+        update_url_entry.grid(row=37, column=1, sticky="ew", pady=(0, 6))
         url_tip = (
             "Optional address of a JSON file listing the newest version, used by Help > Check "
             "for updates. Leave empty and the app never contacts anything for updates."
@@ -3146,8 +4361,8 @@ class BikiniScannerApp:
         self._tooltip(url_caption, url_tip)
         self._tooltip(update_url_entry, url_tip)
 
-        button_row = ttk.Frame(form)
-        button_row.grid(row=43, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        button_row = ttk.Frame(outer)
+        button_row.pack(side=TOP, fill="x", pady=(12, 0))
 
         def close_dialog() -> None:
             dialog.grab_release()
@@ -3223,6 +4438,32 @@ class BikiniScannerApp:
                     "VLM maximum images must be from 0 to 1,000,000.",
                     parent=dialog,
                 )
+                return
+            try:
+                vlm_timeout = float(vlm_timeout_var.get().strip())
+                vlm_weight = float(vlm_weight_var.get().strip())
+                refine_band = float(refine_band_var.get().strip())
+                refine_max_images = int(refine_max_images_var.get().strip())
+                refine_weight = float(refine_weight_var.get().strip())
+            except Exception:  # noqa: BLE001
+                messagebox.showerror(
+                    "Invalid settings", "The re-check and VLM timeout/influence values must be numeric.", parent=dialog
+                )
+                return
+            if vlm_timeout <= 0:
+                messagebox.showerror("Invalid settings", "VLM timeout must be above zero.", parent=dialog)
+                return
+            for name, value in (("VLM influence", vlm_weight), ("re-check influence", refine_weight),
+                                ("re-check band", refine_band)):
+                if not 0.0 <= value <= 1.0:
+                    messagebox.showerror("Invalid settings", f"The {name} must be between 0 and 1.", parent=dialog)
+                    return
+            if refine_max_images < 0:
+                messagebox.showerror("Invalid settings", "Re-check at most must be zero or more.", parent=dialog)
+                return
+            pipeline = pipeline_var.get().strip()
+            if pipeline not in {"cascade", "legacy"}:
+                messagebox.showerror("Invalid settings", "Pipeline must be cascade or legacy.", parent=dialog)
                 return
             vlm_base_url = vlm_base_url_var.get().strip()
             vlm_model = vlm_model_var.get().strip()
@@ -3319,11 +4560,15 @@ class BikiniScannerApp:
                 or bool(require_female_var.get()) != self.config.require_female
                 or female_threshold != self.config.female_threshold
                 or bool(global_learning_var.get()) != self.config.global_learning
+                or bool(enable_plugins_var.get()) != self.config.enable_plugins
             )
             # A deep-scan or refine change needs a fresh scan, not just a re-filter:
             # both change what gets embedded.
             rescan_needed = (
-                deep_scan != self.config.deep_scan
+                pipeline != self.config.pipeline
+                or refine_band != self.config.refine_band
+                or refine_max_images != self.config.refine_max_images
+                or deep_scan != self.config.deep_scan
                 or (HIGH_ACCURACY_MODEL if bool(refine_var.get()) else "") != self.config.refine_model
             )
             vlm_changed = (
@@ -3359,6 +4604,7 @@ class BikiniScannerApp:
             self.config.require_female = bool(require_female_var.get())
             self.config.female_threshold = female_threshold
             self.config.global_learning = bool(global_learning_var.get())
+            self.config.enable_plugins = bool(enable_plugins_var.get())
             self.config.refine_model = HIGH_ACCURACY_MODEL if bool(refine_var.get()) else ""
             self.config.vlm_enabled = bool(vlm_enabled_var.get())
             self.config.vlm_base_url = vlm_base_url
@@ -3366,6 +4612,13 @@ class BikiniScannerApp:
             self.config.vlm_concurrency = vlm_concurrency
             self.config.vlm_band = vlm_band
             self.config.vlm_max_images = vlm_max_images
+            self.config.vlm_api_key = vlm_api_key_var.get().strip()
+            self.config.vlm_timeout = vlm_timeout
+            self.config.vlm_weight = vlm_weight
+            self.config.refine_band = refine_band
+            self.config.refine_max_images = refine_max_images
+            self.config.refine_weight = refine_weight
+            self.config.pipeline = pipeline
             self.thumbnail_cache_size_var.set(thumbnail_cache_size)
             self._trim_thumbnail_cache()
             if not self.folder_override_active:
@@ -3430,36 +4683,28 @@ class BikiniScannerApp:
             "Apply these settings everywhere. Changes to the model, prompts or deep scan need "
             "a new scan to take effect; filters and thresholds re-rank what is already on screen.",
         )
-        dialog.columnconfigure(0, weight=1)
-        form.columnconfigure(1, weight=1)
-        positive_text.configure(
-            bg=palette["entry_bg"],
-            fg=palette["fg"],
-            insertbackground=palette["fg"],
-            highlightbackground=palette["panel"],
-            relief="solid",
-        )
+        for text_widget in (positive_text, negative_text):
+            text_widget.configure(
+                bg=palette["entry_bg"],
+                fg=palette["fg"],
+                insertbackground=palette["fg"],
+                highlightbackground=palette["panel"],
+                relief="solid",
+            )
         for widget in (nsfw_combo, backend_combo):
             widget.configure(width=22)
-        negative_text.configure(
-            bg=palette["entry_bg"],
-            fg=palette["fg"],
-            insertbackground=palette["fg"],
-            highlightbackground=palette["panel"],
-            relief="solid",
-        )
-        # Size the viewport to the form, but never past the screen: that cap is what
-        # makes the scrollbar do any work.
+
+        # Open at the size the widest tab actually needs, plus slack, and never past
+        # the screen. The window stays resizable in both directions from there, which
+        # is what the fixed-width version got wrong: a long label had nowhere to go.
         dialog.update_idletasks()
-        for child in form.winfo_children():
-            child.bind("<MouseWheel>", scroll_settings, add="+")
-            child.bind("<Button-4>", lambda _event: canvas.yview_scroll(-1, "units"), add="+")
-            child.bind("<Button-5>", lambda _event: canvas.yview_scroll(1, "units"), add="+")
-        canvas.configure(
-            width=form.winfo_reqwidth(),
-            height=min(form.winfo_reqheight(), max(360, int(dialog.winfo_screenheight() * 0.8))),
-        )
-        backend_combo.focus_set()
+        wanted_width = max(600, dialog.winfo_reqwidth() + 32)
+        wanted_height = max(460, dialog.winfo_reqheight() + 12)
+        width = min(wanted_width, int(dialog.winfo_screenwidth() * 0.9))
+        height = min(wanted_height, int(dialog.winfo_screenheight() * 0.85))
+        dialog.geometry(f"{width}x{height}")
+        dialog.minsize(min(600, width), min(420, height))
+        threshold_entry.focus_set()
 
     def open_output_options_dialog(self) -> None:
         dialog, form = self._create_modal("Output options")
@@ -3497,6 +4742,46 @@ class BikiniScannerApp:
             text="Tokens: {stem} {name} {ext} {score} {score_pct} {index} {date} {timestamp} {label}",
             wraplength=440,
         ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        # Say what the template actually produces. The token list told you the parts
+        # but not the result, so the only way to find out was to run a transfer.
+        preview_var = StringVar(value="")
+        ttk.Label(form, textvariable=preview_var, style="FormMuted.TLabel", justify="left").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(0, 8)
+        )
+
+        def refresh_preview(*_args: object) -> None:
+            sample = next(iter(self.displayed_samples or self.current_samples), None)
+            source = Path(str(sample["path"])) if sample else Path("beach_photo.jpg")
+            score = float(cast(float, sample.get("score", 0.0))) if sample else 0.62
+            try:
+                low = float(low_var.get())
+                high = float(high_var.get())
+            except (TypeError, ValueError):
+                low, high = 0.35, 0.7
+            try:
+                name = format_output_name(
+                    source,
+                    score,
+                    label_name(self._label_map().get(str(source))),
+                    1,
+                    None,
+                    template_var.get(),
+                )
+                parts = organization_parts(
+                    organization_var.get(), score, label_name(self._label_map().get(str(source))), low, high
+                )
+            except Exception as exc:  # noqa: BLE001
+                preview_var.set(f"Example: template could not be applied — {exc}")
+                return
+            preview_var.set("Example: " + "/".join([*parts, name]))
+
+        for variable in (template_var, organization_var, low_var, high_var):
+            try:
+                variable.trace_add("write", refresh_preview)
+            except Exception:  # noqa: BLE001
+                continue
+        refresh_preview()
 
         button_row = ttk.Frame(form)
         button_row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(10, 0))
@@ -3600,8 +4885,33 @@ class BikiniScannerApp:
         combo.pack(side=TOP, anchor="w", pady=(0, 10))
         ttk.Label(
             outer,
-            text="Built-in profiles cannot be deleted. Apply a profile, then save it as a custom profile if desired.",
+            text=(
+                "A profile captures every setting, not just the threshold: detection gates, deep-scan\n"
+                "mode, model choice and prompts. Applying one replaces all of them.\n\n"
+                "Built-in profiles cannot be deleted. Apply one, adjust it, then Save as to keep your own."
+            ),
+            justify="left",
         ).pack(side=TOP, anchor="w", pady=(0, 10))
+        summary = ttk.Label(outer, text="", style="FormMuted.TLabel", justify="left", wraplength=420)
+        summary.pack(side=TOP, anchor="w", pady=(0, 10))
+
+        def describe(*_args: object) -> None:
+            selected = profile_config(profile_var.get())
+            if selected is None:
+                summary.configure(text="")
+                return
+            defaults = ScannerConfig().to_dict()
+            changed = [
+                f"{key} = {value}"
+                for key, value in sorted(selected.to_dict().items())
+                if defaults.get(key) != value and not isinstance(value, list)
+            ]
+            summary.configure(
+                text=("Differs from the defaults in: " + ", ".join(changed)) if changed else "Matches the defaults."
+            )
+
+        combo.bind("<<ComboboxSelected>>", describe)
+        describe()
         buttons = self._modal_button_row(outer, pady=(0, 0))
 
         def refresh() -> None:
@@ -3619,18 +4929,26 @@ class BikiniScannerApp:
             self.status_var.set(f"Applied profile {profile_var.get()}. Run a scan to apply it.")
 
         def save_as() -> None:
-            name = filedialog.asksaveasfilename(
-                title="Save profile as",
-                initialfile="profile",
+            # A profile is a name, not a file on disk. asksaveasfilename made people
+            # pick a folder and an extension for something stored in the prefs file,
+            # then quietly threw both away.
+            name = simpledialog.askstring(
+                "Save profile",
+                "Name this profile:",
                 parent=dialog,
-                filetypes=(("Profile names", "*"),),
+                initialvalue=profile_var.get() if profile_var.get() not in BUILTIN_PROFILES else "",
             )
             if not name:
                 return
+            if name in profile_names() and not messagebox.askyesno(
+                "Replace profile", f"A profile called {name} already exists. Replace it?", parent=dialog
+            ):
+                return
             try:
-                save_profile(Path(name).name, self.config)
+                save_profile(name.strip(), self.config)
                 refresh()
-                profile_var.set(Path(name).name)
+                profile_var.set(name.strip())
+                self.status_var.set(f"Saved the current settings as profile {name.strip()}.")
             except ValueError as exc:
                 messagebox.showerror("Save profile failed", str(exc), parent=dialog)
 
@@ -3668,13 +4986,14 @@ class BikiniScannerApp:
             return
         # Pre-scan check: count supported images so we don't run a full scan on an
         # empty folder or one with only unsupported files (e.g. all .txt or .pdf).
-        image_suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
-        try:
-            image_count = sum(
-                1 for entry in Path(folder).rglob("*") if entry.is_file() and entry.suffix.lower() in image_suffixes
-            )
-        except OSError:
-            image_count = 0
+        # Counting walks the whole tree, which on a network share or a deep folder is
+        # seconds of frozen window — and then the scan walks it a second time. The
+        # count is done once, off the main thread, and handed back here.
+        if self._pending_scan_count is None:
+            self._count_images_then_scan(folder)
+            return
+        image_count = self._pending_scan_count
+        self._pending_scan_count = None
         if image_count == 0:
             messagebox.showinfo(
                 "No images found",
@@ -3682,13 +5001,20 @@ class BikiniScannerApp:
                 "Supported formats: JPG, PNG, BMP, GIF, WEBP, TIFF, HEIC.",
             )
             return
+        if image_count >= LARGE_SCAN_WARNING and not self._confirm_large_scan(folder, image_count):
+            return
         # The folder box is editable and callers may set it directly, so the store
         # can lag behind the path shown. Bind it here rather than assert later.
         if self.store is None or str(self.store.folder) != str(Path(folder).expanduser().resolve()):
             self._set_folder(folder)
         self._add_recent_folder(folder)
         LOGGER.info("Starting scan requested for %s", folder)
-        if not self._ensure_backend():
+        if self.backend is None:
+            # Loading the model can mean a ~600 MB download. Doing that here, on the
+            # main thread, froze the whole window with no progress and no way out —
+            # which is exactly what a first run looked like. Hand it to a worker and
+            # come back to run_scan when it lands.
+            self._load_backend_then_scan(folder)
             return
         self._refresh_hardware_status()
         self.thumbnail_cache.clear()
@@ -3704,12 +5030,161 @@ class BikiniScannerApp:
         self._reset_progress_bar("0%", "Starting scan…")
         self._launch_background_scan(full_rescan=True)
 
+    def _count_images_then_scan(self, folder: str) -> None:
+        """Walk the folder on a worker thread, then re-enter run_scan with the count."""
+        self.run_button.configure(state="disabled")
+        self.status_var.set("Looking through the folder…")
+        suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
+        target = Path(folder)
+
+        def worker() -> None:
+            try:
+                count = sum(
+                    1 for entry in target.rglob("*") if entry.is_file() and entry.suffix.lower() in suffixes
+                )
+            except OSError:
+                count = 0
+            self._after(0, self._image_count_ready, count)
+
+        threading.Thread(target=worker, name="scan-precount", daemon=True).start()
+
+    def _image_count_ready(self, count: int) -> None:
+        self.run_button.configure(state="normal")
+        self._pending_scan_count = count
+        self.run_scan()
+
+    def _scan_rate_hint(self) -> float | None:
+        """Images per second from the last completed scan, if one is on record."""
+        rate = self.user_prefs.get("scan_images_per_second")
+        if rate is None:
+            return None
+        try:
+            value = float(rate)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0 else None
+
+    def _confirm_large_scan(self, folder: str, image_count: int) -> bool:
+        """Say how big this is before committing to it.
+
+        The count is already in hand; spending it on a warning costs nothing and a
+        folder of a quarter of a million photos is hours of work to start by accident.
+        """
+        rate = self._scan_rate_hint()
+        estimate = ""
+        if rate:
+            seconds = image_count / rate
+            if seconds >= 5400:
+                estimate = f"\n\nAt your last scan's speed this would take roughly {seconds / 3600:.1f} hours."
+            elif seconds >= 90:
+                estimate = f"\n\nAt your last scan's speed this would take roughly {seconds / 60:.0f} minutes."
+        return messagebox.askyesno(
+            "Large folder",
+            f"{folder}\n\nThis folder holds {image_count:,} images.{estimate}\n\n"
+            "Scanning can be stopped at any point and the work done so far is cached, "
+            "so a stopped scan is not wasted.\n\nStart the scan?",
+        )
+
+    def _load_backend_then_scan(self, folder: str) -> None:
+        """Load the model in the background, then start the scan it was needed for."""
+        if self._backend_loading:
+            self.status_var.set("Still loading the scanning model — the scan starts when it is ready.")
+            return
+        self._backend_loading = True
+        self._scan_after_backend = folder
+        self.run_button.configure(state="disabled")
+        # Stop is live during the load: the wait is long enough that being unable to
+        # change your mind was its own bug.
+        self.stop_scan_button.configure(state="normal")
+        self.loading_var.set("Loading model...")
+        self._show_progress(True)
+        self._start_indeterminate_progress(
+            "Loading the scanning model — the first run downloads it, which can take a few minutes…"
+        )
+
+        def worker() -> None:
+            loaded = self._ensure_backend(show_errors=False)
+            error: Exception | None = None
+            if not loaded:
+                try:
+                    from .clip_backend import get_backend
+
+                    get_backend(self.config)
+                except Exception as exc:  # noqa: BLE001
+                    error = exc
+            self._after(0, self._backend_load_finished, loaded, error)
+
+        threading.Thread(target=worker, name="backend-load", daemon=True).start()
+
+    def _backend_load_finished(self, loaded: bool, error: Exception | None) -> None:
+        self._backend_loading = False
+        self.loading_var.set("")
+        self.run_button.configure(state="normal")
+        self.stop_scan_button.configure(state="disabled")
+        self._reset_progress_bar()
+        self._show_progress(False)
+        pending = self._scan_after_backend
+        self._scan_after_backend = None
+        if not loaded:
+            self.status_var.set("The scanning model could not be loaded.")
+            if error is not None:
+                messagebox.showerror("Could not load the scanning model", self._model_error_text(error))
+            return
+        self._refresh_hardware_status()
+        if pending is None:
+            # Cancelled while it loaded. The model is in memory for next time.
+            self.status_var.set("Model loaded. Press Run scan when you are ready.")
+            return
+        self.run_scan()
+
     def cancel_scan(self) -> None:
+        if self._backend_loading:
+            # The load itself cannot be interrupted — it is inside the model library —
+            # but the scan waiting behind it can be called off, which is what the
+            # reviewer actually wants when they press Stop during a long download.
+            self._scan_after_backend = None
+            self.status_var.set("Scan cancelled. The model is still loading and will finish in the background.")
+            self.stop_scan_button.configure(state="disabled")
+            return
         if not self._scan_active or self._scan_cancel_event is None:
             return
         self._scan_cancel_event.set()
         self.status_var.set("Stopping scan after the current batch...")
         self.stop_scan_button.configure(state="disabled")
+
+    def _schedule_retrain(self, labels_added: int = 1) -> None:
+        """Fold new labels into the model once the reviewer pauses, not per click.
+
+        Called instead of `update_algorithm` after every decision. The decision is
+        already saved; this only queues the re-rank, and re-arming the timer on each
+        new label means a run of twenty Accepts costs one retrain rather than twenty.
+        """
+        self._retrain_pending = True
+        self._labels_since_retrain += max(1, int(labels_added))
+        if self._labels_since_retrain >= RETRAIN_LABEL_BURST:
+            self._flush_retrain()
+            return
+        self._cancel_retrain_timer()
+        self._retrain_after_id = self._after(RETRAIN_IDLE_MS, self._flush_retrain)
+
+    def _cancel_retrain_timer(self) -> None:
+        if self._retrain_after_id is None:
+            return
+        try:
+            self.root.after_cancel(self._retrain_after_id)
+        except Exception:  # noqa: BLE001
+            pass
+        self._retrain_after_id = None
+
+    def _flush_retrain(self) -> None:
+        """Run the queued retrain now, if one is queued and nothing else is running."""
+        self._retrain_after_id = None
+        if not self._retrain_pending:
+            return
+        if self._scan_active or self.queue_active:
+            # Leave the flag set: whatever is running now finishes by checking it.
+            return
+        self.update_algorithm()
 
     def update_algorithm(self) -> None:
         if self.store is None:
@@ -3718,6 +5193,9 @@ class BikiniScannerApp:
         if self.current_state is None:
             messagebox.showinfo("Not ready", "Run a scan first.")
             return
+        # Asked for explicitly (Tools > Update rankings) or by the timer: either way
+        # the queued labels are being folded in now, so stand the timer down.
+        self._cancel_retrain_timer()
         if self._scan_active:
             # Coalesce instead of stacking threads: labelling several photos in a row
             # used to start one rescore per click. They shared one scorer and one label
@@ -3728,6 +5206,11 @@ class BikiniScannerApp:
             return
         if not self._ensure_scorer():
             return
+        # Cleared here rather than in the caller: every route into a running retrain
+        # goes through this line, so the counters cannot be left claiming that labels
+        # are still waiting when they are being folded in right now.
+        self._retrain_pending = False
+        self._labels_since_retrain = 0
         self.status_var.set("Updating algorithm...")
         self._reset_progress_bar()
         self._launch_background_scan(full_rescan=False)
@@ -3736,7 +5219,6 @@ class BikiniScannerApp:
         """Start the retrain that was asked for while another pass was running."""
         if not self._retrain_pending or self._scan_active or self.queue_active:
             return
-        self._retrain_pending = False
         self.update_algorithm()
 
     def _launch_background_scan(self, full_rescan: bool) -> None:
@@ -3822,7 +5304,9 @@ class BikiniScannerApp:
         self._reset_progress_bar()
         self._show_progress(False)
         # Stop means stop: a retrain queued behind this pass is dropped, not run.
+        self._cancel_retrain_timer()
         self._retrain_pending = False
+        self._labels_since_retrain = 0
         self.status_var.set("Scan stopped. Cached work is available for the next scan.")
         if self.queue_active:
             self.queue_active = False
@@ -3836,7 +5320,9 @@ class BikiniScannerApp:
         self.stop_scan_button.configure(state="disabled")
         self._reset_progress_bar()
         self._show_progress(False)
+        self._cancel_retrain_timer()
         self._retrain_pending = False
+        self._labels_since_retrain = 0
         self.status_var.set("Scan failed.")
         LOGGER.error("Scan failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
         # Map common failures to user-friendly text with a suggested action.
@@ -3935,7 +5421,10 @@ class BikiniScannerApp:
                 filtered_note = f"\n{excluded} filtered out by the detection gates"
                 filtered_note += f" ({age_gated} as possible minors)." if age_gated else "."
             if skipped_count:
-                filtered_note += f"\n{skipped_count} file{'s' if skipped_count != 1 else ''} could not be read (corrupt or unsupported)."
+                filtered_note += (
+                    f"\n{skipped_count} file{'s' if skipped_count != 1 else ''} could not be read "
+                    "(Tools > Files that could not be read lists them)."
+                )
             if matches:
                 detail = (
                     "The detected files are listed below, grouped by what was detected.\n"
@@ -3956,6 +5445,23 @@ class BikiniScannerApp:
         keep_page = not full_rescan
         if keep_page:
             self.page_index = previous_page
+        if self._resuming_review:
+            # Resuming: honour the view and page the session recorded, not the default.
+            self._resuming_review = False
+            wanted_view, wanted_page = self._resume_target
+            self.page_index = max(0, wanted_page)
+            if wanted_view == "detected" and matches:
+                self.show_detected_files(reset_page=False)
+            else:
+                self._refresh_displayed_results(reset_page=False)
+            self._update_stats_panel(record_history=True)
+            self._save_last_folder(self.folder_var.get().strip())
+            self._watch_snapshot = self._collect_watch_snapshot()
+            self._refresh_hardware_status()
+            self.status_var.set(
+                f"Resumed where you left off — page {self.page_index + 1}. {self._progress_note()}".strip()
+            )
+            return
         # A fresh scan lands on the full detected-files list; retrains keep whichever view was active.
         if matches and (full_rescan or previous_view == "detected"):
             self.show_detected_files(reset_page=not keep_page)
@@ -3969,6 +5475,12 @@ class BikiniScannerApp:
         # so a folder with one corrupt image looked "changed" on every single poll and
         # rescanned itself forever.
         self._watch_snapshot = self._collect_watch_snapshot()
+        if full_rescan:
+            self._record_folder_history(len(state.paths), matches)
+        if full_rescan and self._scan_start_monotonic is not None and state.paths:
+            elapsed = max(time.monotonic() - self._scan_start_monotonic, 1e-6)
+            self.user_prefs["scan_images_per_second"] = round(len(state.paths) / elapsed, 3)
+            self._save_user_prefs()
         self._refresh_hardware_status()
         if self.queue_active and full_rescan:
             self.queue_index += 1
@@ -3997,14 +5509,29 @@ class BikiniScannerApp:
         # "images" has to match the Accepted/Rejected tally underneath it, or a reviewer
         # checking whether their decisions registered sees two different answers.
         labels = self.store.load_labels() if self.store is not None else {}
-        self.summary_var.set(
-            f"{len(self.current_state.paths)} images, {matches} above threshold, "
-            f"{len(labels)} labeled, "
-            f"{'classifier on' if self.current_state.classifier_trained else 'zero-shot only'}"
-        )
+        # Short enough to share a row with the slider. The label count and whether the
+        # classifier is running are both spelled out on the stats line at the bottom,
+        # so repeating them here only cost the slider width.
+        self.summary_var.set(f"{len(self.current_state.paths)} scanned · {matches} above threshold")
         self._update_stats_panel(record_history=False, labels=labels)
 
+    def _commit_threshold_text(self, _event: object = None) -> str:
+        """Apply a typed sensitivity, or put the real one back if it was nonsense."""
+        raw = self.threshold_text_var.get().strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            self.threshold_text_var.set(f"{float(self.threshold_var.get()):.2f}")
+            return "break"
+        value = max(0.0, min(1.0, value))
+        if abs(value - float(self.threshold_var.get())) > 1e-9:
+            self.threshold_var.set(value)
+            self._on_threshold_change(str(value))
+        self.threshold_text_var.set(f"{value:.2f}")
+        return "break"
+
     def _on_threshold_change(self, _value: str) -> None:
+        self.threshold_text_var.set(f"{float(self.threshold_var.get()):.2f}")
         self._refresh_summary()
         if self.view_mode != "detected" or self.current_state is None:
             return
@@ -4037,15 +5564,36 @@ class BikiniScannerApp:
         self.root.bind_all("<KeyPress-a>", lambda event: self._handle_label_shortcut(event, 1))
         self.root.bind_all("<KeyPress-d>", lambda event: self._handle_label_shortcut(event, 0))
         self.root.bind_all("<KeyPress-s>", lambda event: self._handle_label_shortcut(event, 2))
+        self.root.bind_all("<KeyPress-w>", self._handle_explain_shortcut)
+        self.root.bind_all("<KeyPress-n>", self._handle_note_shortcut)
+        self.root.bind_all("<BackSpace>", self._handle_back_shortcut)
+        self.root.bind_all("<KeyPress-f>", self._handle_focus_shortcut)
         self.root.bind_all("<Control-z>", self._handle_undo_shortcut)
         self.root.bind_all("<Control-y>", self._handle_redo_shortcut)
 
+    # Widgets that consume a keystroke themselves. A blacklist of text widgets missed
+    # Listbox, Spinbox and Scale, so selecting a folder in the scan queue and pressing
+    # "d" rejected the active photo — a single letter, silently mislabelling a file.
+    _KEY_CONSUMING_WIDGETS = frozenset(
+        {"Entry", "TEntry", "Text", "TCombobox", "Listbox", "Spinbox", "TSpinbox", "TScale", "Scale"}
+    )
+
     def _focus_is_text_input(self) -> bool:
+        """True when the focused widget should get the keystroke instead of the grid."""
         widget = self.root.focus_get()
         if widget is None:
             return False
-        widget_class = widget.winfo_class()
-        return widget_class in {"Entry", "Text", "TCombobox"}
+        try:
+            widget_class = widget.winfo_class()
+        except Exception:  # noqa: BLE001
+            return True
+        if widget_class in self._KEY_CONSUMING_WIDGETS:
+            return True
+        # A modal is open: its own bindings own the keyboard, whatever has focus in it.
+        try:
+            return widget.winfo_toplevel() is not self.root
+        except Exception:  # noqa: BLE001
+            return True
 
     def _handle_next_card(self, event) -> str:
         if self._focus_is_text_input():
@@ -4087,6 +5635,30 @@ class BikiniScannerApp:
         if self._focus_is_text_input():
             return ""
         self.label_focused_card(label)
+        return "break"
+
+    def _handle_explain_shortcut(self, event) -> str:
+        if self._focus_is_text_input():
+            return ""
+        self.explain_score()
+        return "break"
+
+    def _handle_note_shortcut(self, event) -> str:
+        if self._focus_is_text_input():
+            return ""
+        self.edit_note()
+        return "break"
+
+    def _handle_back_shortcut(self, event) -> str:
+        if self._focus_is_text_input():
+            return ""
+        self.go_back()
+        return "break"
+
+    def _handle_focus_shortcut(self, event) -> str:
+        if self._focus_is_text_input():
+            return ""
+        self.toggle_focus_mode()
         return "break"
 
     def _handle_undo_shortcut(self, event) -> str:
@@ -4139,27 +5711,469 @@ class BikiniScannerApp:
         for path, card in self.cards.items():
             focused = path == self.focused_path
             is_match = card.score >= threshold
+            if focused:
+                style = "FocusedMatchCard.TFrame" if is_match else "FocusedCard.TFrame"
+            else:
+                style = "MatchCard.TFrame" if is_match else "Card.TFrame"
+            # Every other card on the page is being redrawn to exactly what it already
+            # shows. Moving the focus only ever changes two cards.
+            if card.focused == focused and card.style == style:
+                continue
             try:
-                if focused:
-                    style = "FocusedMatchCard.TFrame" if is_match else "FocusedCard.TFrame"
-                else:
-                    style = "MatchCard.TFrame" if is_match else "Card.TFrame"
                 card.frame.configure(style=style)
             except Exception:  # noqa: BLE001
                 pass
             card.name_label.configure(text=f"▶ {Path(path).name}" if focused else Path(path).name)
+            card.focused = focused
+            card.style = style
         if self.focused_path and self.focused_path in self.cards:
             self._scroll_card_into_view(self.focused_path)
         self._update_preview()
         self._save_review_session()
 
+    # --- focus mode ---------------------------------------------------------
+    def toggle_focus_mode(self) -> None:
+        if self._focus_window is not None:
+            self.exit_focus_mode()
+        else:
+            self.enter_focus_mode()
+
+    def enter_focus_mode(self) -> None:
+        """One photo, full screen, keyboard only.
+
+        The grid is the right tool for surveying a folder and the wrong one for
+        working through a queue: every decision costs a card teardown, a re-flow and
+        a scroll, and the photo is a thumbnail beside its own metadata. Here the photo
+        is the window, and a decision is a single keystroke that redraws one image.
+        """
+        if self._focus_window is not None:
+            self._focus_window.lift()
+            return
+        if not self.page_samples:
+            messagebox.showinfo("Nothing to review", "Run a scan first, or clear the filters hiding everything.")
+            return
+        if self.focused_path is None:
+            self.focused_path = str(self.page_samples[0]["path"])
+        palette = self._palette()
+        window = Toplevel(self.root)
+        window.title("Review")
+        window.configure(bg=palette["bg"])
+        window.protocol("WM_DELETE_WINDOW", self.exit_focus_mode)
+        try:
+            window.state("zoomed")
+        except Exception:  # noqa: BLE001
+            window.geometry(f"{self.root.winfo_width()}x{self.root.winfo_height()}+0+0")
+        self._focus_window = window
+
+        frame = ttk.Frame(window, padding=(16, 10))
+        frame.pack(fill=BOTH, expand=True)
+        bar = ttk.Frame(frame)
+        bar.pack(side=BOTTOM, fill="x", pady=(10, 0))
+        ttk.Label(bar, textvariable=self._focus_status_var, style="SurfaceMuted.TLabel").pack(side=LEFT)
+        ttk.Label(
+            bar,
+            text="A accept   D reject   S skip   N note   W why   J/K move   Ctrl+Z undo   Esc close",
+            style="SurfaceMuted.TLabel",
+        ).pack(side=RIGHT)
+        self._focus_caption = ttk.Label(frame, textvariable=self._focus_caption_var, anchor="center")
+        self._focus_caption.pack(side=BOTTOM, pady=(8, 0))
+        self._focus_image_label = ttk.Label(frame, anchor="center")
+        self._focus_image_label.pack(side=TOP, fill=BOTH, expand=True)
+        frame.configure(style="Surface.TFrame")
+        self._focus_image_label.configure(style="SurfaceMuted.TLabel")
+
+        # Bound on the window, not bind_all: the grid's own shortcuts stay untouched
+        # and there is no ambiguity about which one is listening.
+        for sequence, handler in (
+            ("<KeyPress-a>", lambda _e: self._focus_decide(1)),
+            ("<KeyPress-g>", lambda _e: self._focus_decide(1)),
+            ("<KeyPress-d>", lambda _e: self._focus_decide(0)),
+            ("<KeyPress-b>", lambda _e: self._focus_decide(0)),
+            ("<KeyPress-s>", lambda _e: self._focus_decide(2)),
+            ("<KeyPress-w>", lambda _e: self._focus_explain()),
+            ("<KeyPress-n>", lambda _e: self._focus_note()),
+            ("<KeyPress-j>", lambda _e: self._focus_step(1)),
+            ("<KeyPress-k>", lambda _e: self._focus_step(-1)),
+            ("<Right>", lambda _e: self._focus_step(1)),
+            ("<Left>", lambda _e: self._focus_step(-1)),
+            ("<Control-z>", lambda _e: self._focus_undo()),
+            ("<Control-y>", lambda _e: self._focus_redo()),
+            # Both must swallow the event: the same keys are bound with bind_all for
+            # the grid, and without "break" closing the window would re-open it and
+            # Ctrl+Z would undo twice.
+            ("<Escape>", lambda _e: self._focus_close()),
+            ("<KeyPress-f>", lambda _e: self._focus_close()),
+        ):
+            window.bind(sequence, handler)
+        window.bind("<Configure>", self._on_focus_configure, add="+")
+        window.focus_set()
+        window.update_idletasks()
+        self._refresh_focus_view()
+
+    def exit_focus_mode(self) -> None:
+        window = self._focus_window
+        self._focus_window = None
+        self._focus_image_label = None
+        self._focus_photo = None
+        if window is None:
+            return
+        try:
+            window.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+        # The grid has been moving underneath all along; bring it to where the
+        # reviewer left off rather than back to where they started.
+        self._refresh_displayed_results(reset_page=False)
+
+    def _on_focus_configure(self, event) -> None:
+        if self._focus_window is None or getattr(event, "widget", None) is not self._focus_window:
+            return
+        if self._focus_resize_after_id is not None:
+            try:
+                self.root.after_cancel(self._focus_resize_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._focus_resize_after_id = self._after(180, self._refresh_focus_view)
+
+    def _focus_size(self) -> tuple[int, int]:
+        window = self._focus_window
+        if window is None:
+            return (960, 720)
+        try:
+            width = max(320, int(window.winfo_width()) - 48)
+            height = max(240, int(window.winfo_height()) - 110)
+        except Exception:  # noqa: BLE001
+            return (960, 720)
+        return (width, height)
+
+    def _refresh_focus_view(self) -> None:
+        self._focus_resize_after_id = None
+        window = self._focus_window
+        label = self._focus_image_label
+        if window is None or label is None:
+            return
+        path = self.focused_path
+        if not path:
+            self._focus_caption_var.set("Nothing left to review.")
+            self._focus_status_var.set(self._progress_note())
+            return
+        width, height = self._focus_size()
+        ready = self._take_decoded(path, "preview", width, height)
+        try:
+            image = ready if ready is not None else self._preview_letterbox(open_oriented(path), width, height)
+            photo = ImageTk.PhotoImage(image)
+        except Exception:  # noqa: BLE001
+            photo = ImageTk.PhotoImage(Image.new("RGB", (width // 2, height), color=self._palette()["button_bg"]))
+        self._focus_photo = photo
+        label.configure(image=photo)
+        self._focus_caption_var.set(self._preview_caption_text(path))
+        self._focus_status_var.set(self._progress_note())
+        self._prefetch_focus_neighbours(width, height)
+
+    def _prefetch_focus_neighbours(self, width: int, height: int) -> None:
+        """Decode the next few in the queue at focus-mode size, not grid size."""
+        if self.focused_path is None:
+            return
+        order = [str(sample["path"]) for sample in self.page_samples]
+        if self.focused_path not in order:
+            return
+        labels = self.store.load_labels() if self.store is not None else {}
+        start = order.index(self.focused_path) + 1
+        queued = 0
+        for candidate in order[start:]:
+            if labels.get(candidate) is not None:
+                continue
+            key = self._decoded_key(candidate, "preview", width, height)
+            with self._decoded_lock:
+                if key in self._decoded_cache or key in self._decoding:
+                    continue
+                self._decoding.add(key)
+            self._prefetch_queue.append(key)
+            queued += 1
+            if queued >= 3:
+                break
+        self._start_prefetch_worker()
+
+    def _focus_decide(self, label: int) -> str:
+        if self.focused_path is None:
+            return "break"
+        path = self.focused_path
+        successor = self._next_undecided_after(path)
+        verb = {1: "Accepted", 0: "REJECTED", 2: "Skipped"}.get(int(label), "Labelled")
+        self._apply_label_batch(
+            {path: int(label)},
+            status=f"{verb} {Path(path).name}",
+            retrain=True,
+        )
+        if successor is not None:
+            self.focused_path = successor
+        else:
+            self._advance_focus_after(path)
+        self._refresh_focus_view()
+        return "break"
+
+    def _focus_step(self, delta: int) -> str:
+        order = [str(sample["path"]) for sample in self.page_samples]
+        if not order:
+            return "break"
+        position = order.index(self.focused_path) + delta if self.focused_path in order else 0
+        self.focused_path = order[max(0, min(position, len(order) - 1))]
+        self._refresh_focus_view()
+        return "break"
+
+    def _focus_explain(self) -> str:
+        self.explain_score(self.focused_path)
+        return "break"
+
+    def _focus_note(self) -> str:
+        self.edit_note(self.focused_path)
+        self._refresh_focus_view()
+        return "break"
+
+    def _focus_close(self) -> str:
+        self.exit_focus_mode()
+        return "break"
+
+    def _focus_undo(self) -> str:
+        self.undo_last_label()
+        self._refresh_focus_view()
+        return "break"
+
+    def _focus_redo(self) -> str:
+        self.redo_last_label()
+        self._refresh_focus_view()
+        return "break"
+
+    # --- image prefetch -----------------------------------------------------
+    def _decoded_key(self, path: str, kind: str, width: int, height: int) -> tuple[str, str, int, int]:
+        return (path, kind, int(width), int(height))
+
+    def _letterbox_for(self, path: str, kind: str, width: int, height: int) -> Image.Image:
+        """Decode and scale one image the way `kind` needs it."""
+        source = open_oriented(path)
+        if kind == "preview":
+            return self._preview_letterbox(source, width, height)
+        return self._thumbnail_fill(source, width, height)
+
+    def _take_decoded(self, path: str, kind: str, width: int, height: int) -> Image.Image | None:
+        """Hand back a prefetched image if the worker got to it first."""
+        with self._decoded_lock:
+            return self._decoded_cache.pop(self._decoded_key(path, kind, width, height), None)
+
+    def _prefetch_upcoming(self, count: int = 3) -> None:
+        """Decode the next few undecided photos before the reviewer asks for them.
+
+        Deciding a photo costs two JPEG decodes of the *next* one — its card thumbnail
+        and the enlarged preview — and on a 6 MP photo that was most of the half-second
+        between pressing Accept and seeing the next picture. Doing it on a worker
+        thread while the reviewer is still looking at the current photo makes the
+        common case a cache hit. Only PIL work happens off the main thread; building
+        the Tk image stays where Tk requires it.
+        """
+        if self._closing or not self.page_samples:
+            return
+        order = [str(sample["path"]) for sample in self.page_samples]
+        start = 0
+        if self.focused_path in order:
+            start = order.index(self.focused_path) + 1
+        labels = self.store.load_labels() if self.store is not None else {}
+        preview_width, preview_height = self._preview_size()
+        thumb_size = max(120, int(self.thumbnail_size_var.get()))
+        queued = 0
+        for candidate in order[start:]:
+            if labels.get(candidate) is not None:
+                continue
+            for kind, width, height in (
+                ("preview", preview_width, preview_height),
+                ("thumb", thumb_size, thumb_size),
+            ):
+                key = self._decoded_key(candidate, kind, width, height)
+                with self._decoded_lock:
+                    if key in self._decoded_cache or key in self._decoding:
+                        continue
+                    self._decoding.add(key)
+                self._prefetch_queue.append(key)
+            queued += 1
+            if queued >= count:
+                break
+        # Every decision also pulls one card onto the page from the next one to fill
+        # the gap, and that card needs a thumbnail nobody has decoded yet. Warming the
+        # items just past the page boundary is what makes the grid refill without a
+        # visible stall.
+        page_end = (self.page_index + 1) * self._page_size()
+        for sample in self.displayed_samples[page_end : page_end + count]:
+            key = self._decoded_key(str(sample["path"]), "thumb", thumb_size, thumb_size)
+            with self._decoded_lock:
+                if key in self._decoded_cache or key in self._decoding:
+                    continue
+                self._decoding.add(key)
+            self._prefetch_queue.append(key)
+        self._start_prefetch_worker()
+
+    def _start_prefetch_worker(self) -> None:
+        if not self._prefetch_queue:
+            return
+        worker = self._prefetch_thread
+        if worker is not None and worker.is_alive():
+            return
+        self._prefetch_thread = threading.Thread(target=self._prefetch_worker, name="image-prefetch", daemon=True)
+        self._prefetch_thread.start()
+
+    def _prefetch_worker(self) -> None:
+        while not self._closing:
+            try:
+                key = self._prefetch_queue.popleft()
+            except IndexError:
+                return
+            path, kind, width, height = key
+            try:
+                image = self._letterbox_for(path, kind, width, height)
+            except Exception:  # noqa: BLE001
+                # A file that cannot be read is not a prefetch problem; the synchronous
+                # path will hit the same error and draw its placeholder.
+                image = None
+            with self._decoded_lock:
+                self._decoding.discard(key)
+                if image is not None:
+                    self._decoded_cache[key] = image
+                    while len(self._decoded_cache) > 12:
+                        self._decoded_cache.popitem(last=False)
+
     def _preview_caption_text(self, path: str) -> str:
-        return (
+        caption = (
             f"{Path(path).name}  —  score {self._match_score_for_path(path):.3f}  —  {self._label_display_text(path)}"
         )
+        note = self.note_for(path)
+        return f"{caption}\n{note}" if note else caption
+
+    def _preview_chrome_height(self) -> int:
+        """Vertical space inside the preview pane that is not the picture."""
+        total = 20  # the frame's own top and bottom padding
+        for name in ("preview_caption_label",):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                try:
+                    total += max(int(widget.winfo_reqheight()), 0) + 4
+                except Exception:  # noqa: BLE001
+                    continue
+        # The Accept/REJECT row, which is a button plus its padding.
+        total += 40
+        return total
+
+    def _preview_height_share(self) -> float:
+        """Fraction of the window the preview pane takes, as last left by the sash."""
+        return max(0.2, min(self._preview_share, 0.8))
+
+    def _min_grid_height(self) -> int:
+        """Enough of the grid to show one whole card, buttons included."""
+        return max(120, int(self.thumbnail_size_var.get())) + CARD_CHROME_HEIGHT
+
+    def _preview_pane_shown(self) -> bool:
+        try:
+            return str(self.preview_frame) in self.workspace.panes()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _show_preview_pane(self) -> None:
+        if self._preview_pane_shown():
+            return
+        try:
+            # weight 0: the grid absorbs the slack when the window is resized, so the
+            # height the reviewer chose for the picture stays the height they chose.
+            self.workspace.insert(0, self.preview_frame, weight=0)
+        except Exception:  # noqa: BLE001
+            return
+        self._after(0, self._apply_preview_sash)
+
+    def _hide_preview_pane(self) -> None:
+        if not self._preview_pane_shown():
+            return
+        try:
+            self.workspace.forget(self.preview_frame)
+        except Exception:  # noqa: BLE001
+            return
+
+    def _apply_preview_sash(self) -> None:
+        """Put the sash back where the reviewer last left it, within reason.
+
+        The remembered share is honoured until it would leave the grid too short to
+        act in. On a small window that is exactly what used to happen: the picture got
+        its 45% and the buttons on every card fell off the bottom.
+        """
+        if not self._preview_pane_shown():
+            return
+        try:
+            total = int(self.workspace.winfo_height())
+            if total <= 1:
+                return
+            wanted = int(total * self._preview_height_share())
+            ceiling = min(int(total * MAX_PREVIEW_SHARE), total - self._min_grid_height())
+            # On a genuinely tiny window even the floor cannot be met; split evenly
+            # rather than collapsing one side to nothing.
+            ceiling = max(ceiling, int(total * 0.35))
+            self.workspace.sashpos(0, max(180, min(wanted, max(180, ceiling))))
+        except Exception:  # noqa: BLE001
+            return
+
+    def _on_workspace_configure(self, event) -> None:
+        if getattr(event, "widget", None) is not self.workspace:
+            return
+        if self._sash_clamp_after_id is not None:
+            try:
+                self.root.after_cancel(self._sash_clamp_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._sash_clamp_after_id = self._after(120, self._clamp_preview_sash)
+
+    def _clamp_preview_sash(self) -> None:
+        """Keep the split proportional as the window resizes, within the limits.
+
+        A PanedWindow holds its sash at a fixed pixel offset, so shrinking the window
+        starved the grid and re-growing it left the picture stuck small. What the
+        reviewer chose by dragging is a *share*, so that is what is preserved; the
+        floor that guarantees room for a whole card still wins over it.
+        """
+        self._sash_clamp_after_id = None
+        if not self._preview_pane_shown():
+            return
+        try:
+            total = int(self.workspace.winfo_height())
+            if total <= 1:
+                return
+            position = int(self.workspace.sashpos(0))
+            ceiling = min(int(total * MAX_PREVIEW_SHARE), total - self._min_grid_height())
+            ceiling = max(ceiling, int(total * 0.35))
+            wanted = max(150, min(int(total * self._preview_height_share()), max(150, ceiling)))
+            if abs(wanted - position) > 2:
+                self.workspace.sashpos(0, wanted)
+                self._schedule_preview_resize()
+        except Exception:  # noqa: BLE001
+            return
+
+    def _remember_preview_sash(self, _event: object = None) -> None:
+        """Persist the split after a drag, so the next session opens the same way."""
+        if not self._preview_pane_shown():
+            return
+        try:
+            total = int(self.workspace.winfo_height())
+            position = int(self.workspace.sashpos(0))
+        except Exception:  # noqa: BLE001
+            return
+        if total <= 1 or position <= 0:
+            return
+        share = max(0.2, min(position / total, 0.8))
+        if abs(share - self._preview_share) < 0.01:
+            return
+        self._preview_share = share
+        self._save_user_prefs()
 
     def _preview_size(self) -> tuple[int, int]:
-        """Size of the enlarged active picture, scaled to the current window."""
+        """Size of the enlarged active picture.
+
+        Once the pane is on screen its height is whatever the reviewer dragged the
+        sash to, and the picture fills it. Before that — and whenever the pane has no
+        usable height yet — it falls back to a share of the window.
+        """
         try:
             root_width = int(self.root.winfo_width())
             root_height = int(self.root.winfo_height())
@@ -4167,21 +6181,70 @@ class BikiniScannerApp:
             root_width, root_height = 0, 0
         if root_width <= 1 or root_height <= 1:
             root_width, root_height = 992, 1041
-        # A third of the window: big enough to judge a picture, small enough to leave
-        # the result grid usable underneath.
-        height = max(260, min(int(root_height * 0.34), 560))
-        width = max(420, min(root_width - 60, int(height * 1.9)))
+        height = 0
+        try:
+            if self.preview_frame.winfo_ismapped():
+                height = int(self.preview_frame.winfo_height()) - self._preview_chrome_height()
+        except Exception:  # noqa: BLE001
+            height = 0
+        if height > 60:
+            # The pane's own height is the authority once it is on screen. Imposing a
+            # floor above it rendered the picture taller than the space it had and the
+            # bottom of the photo was simply clipped off.
+            height = min(height, max(120, root_height - self._min_grid_height() - 60))
+        else:
+            # Not laid out yet: fall back to a share of the window.
+            height = int(root_height * self._preview_height_share())
+            height = max(180, min(height, max(180, root_height - self._min_grid_height() - 120)))
+        height = max(80, height)
+        # Full window width: a landscape photo is the common case, and capping the
+        # width at 1.9x the height threw away most of the space the reviewer just
+        # made by dragging the sash down.
+        width = max(420, root_width - 60)
         return width, height
 
     def _on_root_configure(self, event) -> None:
         if getattr(event, "widget", None) is not self.root:
             return
+        self._schedule_preview_resize()
+
+    def _schedule_reflow(self) -> None:
+        """Re-lay the grid when the window resize changes how many cards fit.
+
+        Without this the column count was worked out once, at whatever size the window
+        happened to be when the results first rendered, and never revisited — so
+        "fit to window" fitted the window it started in.
+        """
+        if self._reflow_after_id is not None:
+            try:
+                self.root.after_cancel(self._reflow_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+        self._reflow_after_id = self._after(220, self._reflow_if_columns_changed)
+
+    def _reflow_if_columns_changed(self) -> None:
+        self._reflow_after_id = None
+        if not self.page_samples:
+            return
+        columns = self._grid_columns()
+        # _card_info_width tracks the width too, so compare the whole signature: a
+        # resize that keeps the column count can still change how wide the text is.
+        layout = (columns, self._card_info_width(columns), max(120, int(self.thumbnail_size_var.get())))
+        if layout != self._grid_layout:
+            self._render_samples()
+
+    def _on_preview_configure(self, event) -> None:
+        if getattr(event, "widget", None) is not self.preview_frame:
+            return
+        self._schedule_preview_resize()
+
+    def _schedule_preview_resize(self) -> None:
         if self._preview_resize_after_id is not None:
             try:
                 self.root.after_cancel(self._preview_resize_after_id)
             except Exception:  # noqa: BLE001
                 pass
-        self._preview_resize_after_id = self._after(200, self._resize_preview_if_needed)
+        self._preview_resize_after_id = self._after(180, self._resize_preview_if_needed)
 
     def _resize_preview_if_needed(self) -> None:
         self._preview_resize_after_id = None
@@ -4198,7 +6261,7 @@ class BikiniScannerApp:
     def _update_preview(self) -> None:
         path = self.focused_path
         if not path or path not in self.cards:
-            self.preview_frame.pack_forget()
+            self._hide_preview_pane()
             return
         width, height = self._preview_size()
         self._preview_render_size = (width, height)
@@ -4206,7 +6269,10 @@ class BikiniScannerApp:
         photo = self.preview_cache.get(cache_key)
         if photo is None:
             try:
-                photo = ImageTk.PhotoImage(self._preview_letterbox(open_oriented(path), width, height))
+                ready = self._take_decoded(path, "preview", width, height)
+                photo = ImageTk.PhotoImage(
+                    ready if ready is not None else self._preview_letterbox(open_oriented(path), width, height)
+                )
             except Exception:  # noqa: BLE001
                 photo = ImageTk.PhotoImage(Image.new("RGB", (width // 2, height), color=self._palette()["button_bg"]))
             self.preview_cache[cache_key] = photo
@@ -4217,18 +6283,41 @@ class BikiniScannerApp:
         self.preview_image_label.configure(image=photo)
         self.preview_image_label.image = photo  # type: ignore[attr-defined]
         self.preview_caption_var.set(self._preview_caption_text(path))
-        if not self.preview_frame.winfo_ismapped():
-            self.preview_frame.pack(side=TOP, fill="x", before=self.canvas)
+        self._show_preview_pane()
+        # Warm the next few while the reviewer looks at this one.
+        self._prefetch_upcoming()
 
     def _scroll_card_into_view(self, path: str) -> None:
-        card = self.cards.get(path)
+        """Queue a scroll to this card, at most one per idle cycle.
+
+        This used to force a synchronous layout pass with update_idletasks and then
+        scroll the card to the top of the viewport whether or not it was already
+        visible. Profiled at ~70 ms a call and two calls per Accept, it was the single
+        most expensive thing about deciding a photo — and it yanked the grid around
+        for no reason. Deferring lets Tk lay out once, on its own schedule.
+        """
+        self._pending_scroll_path = path
+        if self._scroll_after_id is not None:
+            return
+        self._scroll_after_id = self._after(0, self._apply_pending_scroll)
+
+    def _apply_pending_scroll(self) -> None:
+        self._scroll_after_id = None
+        path = self._pending_scroll_path
+        self._pending_scroll_path = None
+        card = self.cards.get(path) if path else None
         if card is None:
             return
-        self.grid_canvas.update_idletasks()
         try:
-            y = card.frame.winfo_y()
-            height = max(self.grid_inner.winfo_height(), 1)
-            self.grid_canvas.yview_moveto(max(min(y / height, 1.0), 0.0))
+            inner_height = max(int(self.grid_inner.winfo_height()), 1)
+            view_height = max(int(self.grid_canvas.winfo_height()), 1)
+            top = int(card.frame.winfo_y())
+            bottom = top + int(card.frame.winfo_height())
+            first = float(self.grid_canvas.yview()[0]) * inner_height
+            # Already fully on screen: leave the reviewer's scroll position alone.
+            if top >= first and bottom <= first + view_height:
+                return
+            self.grid_canvas.yview_moveto(max(min(top / inner_height, 1.0), 0.0))
         except Exception:  # noqa: BLE001
             return
 
@@ -4266,6 +6355,36 @@ class BikiniScannerApp:
             child.destroy()
         self.cards.clear()
         self.photo_refs.clear()
+        self._card_menus.clear()
+        self._bucket_headings.clear()
+        self._grid_layout = None
+
+    def _grid_columns(self) -> int:
+        """How many cards fit across, honouring an explicit choice when one is set.
+
+        `columns` of 0 means auto: fit as many ~TARGET_CARD_WIDTH cards as the grid is
+        wide. That is what makes a wide window show more photos instead of larger ones.
+        """
+        try:
+            chosen = int(self.columns_var.get())
+        except Exception:  # noqa: BLE001
+            chosen = 0
+        if chosen > 0:
+            return max(1, min(chosen, 12))
+        width = 0
+        for widget in (self.grid_canvas, self.root):
+            try:
+                width = int(widget.winfo_width())
+            except Exception:  # noqa: BLE001
+                width = 0
+            if width > 1:
+                break
+        if width <= 1:
+            width = 1200
+        thumb = max(120, int(self.thumbnail_size_var.get()))
+        # A card is its thumbnail plus a readable text column plus padding.
+        needed = max(TARGET_CARD_WIDTH, thumb + 220)
+        return max(1, min(width // needed, 12))
 
     def _card_info_width(self, columns: int) -> int:
         """Width every card reserves for its text column in this render pass.
@@ -4289,16 +6408,34 @@ class BikiniScannerApp:
         return max(150, min(520, card_width - thumb_size - 36))
 
     def _render_samples(self) -> None:
-        self._clear_grid()
+        """Bring the grid in line with `page_samples`, reusing the cards already in it.
+
+        This used to destroy every widget and build the page again from scratch. A
+        card is about seventeen Tk widgets, so deciding one photo on a twenty-card
+        page tore down and rebuilt three hundred and forty of them — profiled at over
+        a second per Accept, which is most of what made the queue feel like it was
+        grinding. Cards that are staying are re-gridded in place instead; only the
+        ones that actually left are destroyed, and only the ones that actually
+        arrived are built.
+        """
         samples = self.page_samples if self.current_samples else []
         if not samples:
+            self._clear_grid()
             self._update_preview()
             self._refresh_empty_state()
             self._sync_view_switch()
             return
         self._refresh_empty_state()
         self._sync_view_switch()
-        columns = max(1, int(self.columns_var.get()))
+        columns = self._grid_columns()
+        info_width = self._card_info_width(columns)
+        thumb_size = max(120, int(self.thumbnail_size_var.get()))
+        # Card geometry is baked in at build time, so when any of it changes there is
+        # nothing to reuse and the whole page genuinely has to be rebuilt.
+        layout = (columns, info_width, thumb_size)
+        if layout != self._grid_layout:
+            self._clear_grid()
+            self._grid_layout = layout
         # Column config survives _clear_grid, so drop the settings for any column the
         # previous render used and this one does not — a stale weighted empty column
         # shifts every card sideways.
@@ -4306,7 +6443,6 @@ class BikiniScannerApp:
             self.grid_inner.columnconfigure(column, weight=0, uniform="")
         for column in range(columns):
             self.grid_inner.columnconfigure(column, weight=1, uniform="cards")
-        info_width = self._card_info_width(columns)
         buckets: list[str] = []
         grouped: dict[str, list[dict[str, object]]] = {}
         for sample in samples:
@@ -4322,31 +6458,66 @@ class BikiniScannerApp:
         for sample in self.displayed_samples:
             name = str(sample.get("bucket", ""))
             totals[name] = totals.get(name, 0) + 1
+
+        wanted = {str(sample["path"]) for sample in samples}
+        for path in [path for path in self.cards if path not in wanted]:
+            departing = self.cards.pop(path)
+            try:
+                self.photo_refs.remove(departing.image_ref)
+            except ValueError:
+                pass
+            departing.frame.destroy()
+        for name in [name for name in self._bucket_headings if name not in grouped]:
+            self._bucket_headings.pop(name).destroy()
+
+        threshold = float(self.threshold_var.get())
         row = 0
         for bucket in buckets:
             items = grouped[bucket]
             total = totals.get(bucket, len(items))
             heading = f"{bucket} ({len(items)})" if total == len(items) else f"{bucket} ({len(items)} of {total})"
-            ttk.Label(self.grid_inner, text=heading, font=("TkDefaultFont", 11, "bold")).grid(
-                row=row,
-                column=0,
-                columnspan=columns,
-                sticky="w",
-                padx=10,
-                pady=(10, 4),
-            )
+            label = self._bucket_headings.get(bucket)
+            if label is None:
+                # Bucket headings were the same weight as the card text below them, so
+                # the boundaries between groups vanished while scrolling.
+                label = ttk.Label(self.grid_inner, style="BucketHeading.TLabel")
+                self._bucket_headings[bucket] = label
+            label.configure(text=heading.upper())
+            label.grid(row=row, column=0, columnspan=columns, sticky="w", padx=10, pady=(10, 4))
             row += 1
             for index, sample in enumerate(items):
                 path = str(sample["path"])
                 score = float(cast(float, sample["score"]))
-                self._render_card(
-                    self.grid_inner,
-                    path,
-                    score,
-                    row + index // columns,
-                    column=index % columns,
-                    columnspan=1,
-                    info_width=info_width,
+                target_row = row + index // columns
+                target_column = index % columns
+                card = self.cards.get(path)
+                if card is None:
+                    self._render_card(
+                        self.grid_inner,
+                        path,
+                        score,
+                        target_row,
+                        column=target_column,
+                        columnspan=1,
+                        info_width=info_width,
+                    )
+                    continue
+                # Reused card: move it, and refresh the parts a retrain can change.
+                card.score = score
+                card.score_label.configure(text=f"Score: {score:.3f}")
+                card.label_label.configure(
+                    text=self._card_label_text(path), style=self._label_style(path)
+                )
+                card.details_label.configure(text=self._axis_details_text(path))
+                focused = path == self.focused_path
+                matched = score >= threshold
+                if focused:
+                    style = "FocusedMatchCard.TFrame" if matched else "FocusedCard.TFrame"
+                else:
+                    style = "MatchCard.TFrame" if matched else "Card.TFrame"
+                card.frame.configure(style=style)
+                card.frame.grid(
+                    row=target_row, column=target_column, columnspan=1, sticky="nsew", padx=10, pady=6
                 )
             row += (len(items) + columns - 1) // columns
         self._session_focus()
@@ -4376,7 +6547,10 @@ class BikiniScannerApp:
         try:
             photo = self.thumbnail_cache.get(cache_key)
             if photo is None:
-                photo = ImageTk.PhotoImage(self._letterbox(open_oriented(path), thumb_size, thumb_size))
+                ready = self._take_decoded(path, "thumb", thumb_size, thumb_size)
+                photo = ImageTk.PhotoImage(
+                    ready if ready is not None else self._thumbnail_fill(open_oriented(path), thumb_size, thumb_size)
+                )
                 self.thumbnail_cache[cache_key] = photo
             else:
                 self.thumbnail_cache.move_to_end(cache_key)
@@ -4404,7 +6578,15 @@ class BikiniScannerApp:
         name_label.grid(row=0, column=0, sticky="ew")
         score_label = ttk.Label(info, text=f"Score: {score:.3f}")
         score_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
-        label_label = ttk.Label(info, text=f"Label: {self._label_display_text(path)}")
+        # A decision used to be one more line of grey text among four, so a page of
+        # cards could not be read for state at a glance. It gets its own colour now.
+        label_label = ttk.Label(
+            info,
+            text=self._card_label_text(path),
+            wraplength=wrap_length,
+            justify="left",
+            style=self._label_style(path),
+        )
         label_label.grid(row=2, column=0, sticky="w", pady=(2, 0))
         details_label = ttk.Label(info, text=self._axis_details_text(path), wraplength=wrap_length, justify="left")
         details_label.grid(row=3, column=0, sticky="ew", pady=(2, 0))
@@ -4426,16 +6608,20 @@ class BikiniScannerApp:
                 side=LEFT, padx=(0, 6)
             )
             ttk.Button(primary, text="REJECT", width=12, command=lambda: self.set_label(path, 0)).pack(side=LEFT)
-            secondary = ttk.Frame(buttons)
-            secondary.grid(row=1, column=0, sticky="w")
-            actions = [
-                ("View", lambda: self.view_image(path)),
-                ("Skip", lambda: self.set_label(path, 2)),
-                ("Find similar", lambda: self.find_similar(path)),
-                ("Reveal", lambda: self.reveal_in_file_manager(path)),
-            ]
-            for text, command in actions:
-                ttk.Button(secondary, text=text, command=command).pack(side=LEFT, padx=(0, 6))
+            # Six more buttons under Accept/REJECT cost a whole row of height on every
+            # card, which is most of what was squeezing the grid. They live on the
+            # card's context menu now, and behind one "More" button for discoverability.
+            ttk.Button(primary, text="Skip", width=8, command=lambda: self.set_label(path, 2)).pack(
+                side=LEFT, padx=(6, 0)
+            )
+            more = ttk.Button(primary, text="More \u25be", width=8)
+            more.pack(side=LEFT, padx=(6, 0))
+            menu = self._card_menu(path)
+
+            def _open_more(widget: ttk.Button = more, target: Menu = menu) -> None:
+                self._post_menu(widget, target)
+
+            more.configure(command=_open_more)
         if register:
             self.cards[path] = ResultCard(
                 frame=frame,
@@ -4454,10 +6640,39 @@ class BikiniScannerApp:
         def _on_double_click(_event: object, candidate: str = path) -> None:
             self.view_image(candidate)
 
+        card_menu = menu if show_actions else self._card_menu(path)
+
+        def _on_right_click(event: object, target: Menu = card_menu) -> None:
+            self.focus_path(path)
+            try:
+                target.tk_popup(int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
+            finally:
+                target.grab_release()
+
         for widget in (frame, image_label, right, info, name_label, score_label, label_label, details_label):
             widget.bind("<Button-1>", _on_click)
             widget.bind("<Double-Button-1>", _on_double_click)
+            widget.bind("<Button-3>", _on_right_click)
         return photo
+
+    def _card_menu(self, path: str) -> Menu:
+        """The per-card actions that no longer need a button each."""
+        menu = Menu(self.root, tearoff=False)
+        menu.add_command(label="View full size", command=lambda: self.view_image(path))
+        menu.add_command(label="Why this score?", command=lambda: self.explain_score(path))
+        menu.add_command(label="Note...", command=lambda: self.edit_note(path))
+        menu.add_separator()
+        menu.add_command(label="Find similar", command=lambda: self.find_similar(path))
+        menu.add_command(label="Reveal in file manager", command=lambda: self.reveal_in_file_manager(path))
+        self._card_menus.append(menu)
+        return menu
+
+    @staticmethod
+    def _post_menu(widget, menu: Menu) -> None:
+        try:
+            menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height())
+        finally:
+            menu.grab_release()
 
     @staticmethod
     def _autowrap(label: ttk.Label) -> None:
@@ -4473,6 +6688,27 @@ class BikiniScannerApp:
                 label.configure(wraplength=wrap)
 
         label.bind("<Configure>", resize)
+
+    @staticmethod
+    def _thumbnail_fill(image: Image.Image, width: int, height: int) -> Image.Image:
+        """Scale and centre-crop to exactly fill the slot.
+
+        The grid used to letterbox, so a portrait photo in a square slot left about a
+        third of its width empty and the cards beside it looked misaligned. The full
+        frame is still shown untouched in the preview and the full-size viewer; this
+        is only the contact sheet.
+        """
+        source = image.convert("RGB")
+        width = max(1, int(width))
+        height = max(1, int(height))
+        scale = max(width / source.width, height / source.height)
+        scaled = source.resize(
+            (max(1, round(source.width * scale)), max(1, round(source.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        left = max(0, (scaled.width - width) // 2)
+        top = max(0, (scaled.height - height) // 2)
+        return scaled.crop((left, top, left + width, top + height))
 
     @staticmethod
     def _letterbox(image: Image.Image, width: int, height: int) -> Image.Image:
@@ -4496,6 +6732,74 @@ class BikiniScannerApp:
         tile.paste(thumb, (0, (height - thumb.height) // 2))
         return tile
 
+    def _card_label_text(self, path: str) -> str:
+        """Label plus note, which is what the card has room to show."""
+        text = self._label_display_text(path)
+        note = self.note_for(path)
+        return f"{text} — {note}" if note else text
+
+    def _label_style(self, path: str) -> str:
+        return {
+            "good": "Accepted.TLabel",
+            "bad": "Rejected.TLabel",
+            "skip": "Skipped.TLabel",
+        }.get(self._label_text(path), "Undecided.TLabel")
+
+    def note_for(self, path: str) -> str:
+        if self.store is None:
+            return ""
+        return self.store.load_notes().get(path, "")
+
+    def edit_note(self, path: str | None = None) -> None:
+        """Record why a photo was judged the way it was.
+
+        Accept/REJECT/Skip captures the decision and nothing else, so revisiting a
+        folder months later leaves no way to reconstruct the reasoning — or to mark
+        the one image that needs a second opinion.
+        """
+        path = path or self.focused_path
+        if not path or self.store is None:
+            messagebox.showinfo("No photo selected", "Pick a photo first.")
+            return
+        dialog, outer = self._create_modal("Note", padding=12, resizable=(True, True))
+        ttk.Label(outer, text=Path(path).name).pack(side=TOP, anchor="w", pady=(0, 6))
+        palette = self._palette()
+        entry = Text(outer, width=52, height=6, wrap="word")
+        entry.pack(side=TOP, fill=BOTH, expand=True)
+        entry.configure(
+            bg=palette["entry_bg"],
+            fg=palette["fg"],
+            insertbackground=palette["fg"],
+            highlightbackground=palette["panel"],
+            relief="solid",
+        )
+        entry.insert("1.0", self.note_for(path))
+        entry.focus_set()
+        row = self._modal_button_row(outer)
+
+        def save() -> None:
+            assert self.store is not None
+            notes = self.store.load_notes()
+            text = entry.get("1.0", "end").strip()
+            if text:
+                notes[path] = text
+            else:
+                notes.pop(path, None)
+            try:
+                self.store.save_notes(notes)
+            except OSError as exc:
+                messagebox.showerror("Could not save the note", str(exc), parent=dialog)
+                return
+            self._refresh_label_state(path)
+            self.status_var.set(("Note saved for " if text else "Note cleared for ") + Path(path).name)
+            dialog._safe_close()  # type: ignore[attr-defined]
+
+        ttk.Button(row, text="Save", command=save).pack(side=RIGHT)
+        ttk.Button(row, text="Cancel", command=dialog._safe_close).pack(  # type: ignore[attr-defined]
+            side=RIGHT, padx=(0, 8)
+        )
+        dialog.bind("<Escape>", lambda _event: dialog._safe_close())  # type: ignore[attr-defined]
+
     def _label_display_text(self, path: str) -> str:
         return {
             "good": "Accepted",
@@ -4506,31 +6810,55 @@ class BikiniScannerApp:
     def _label_text(self, path: str) -> str:
         if self.store is None:
             return "unlabeled"
-        labels = self.store.load_labels()
-        value = labels.get(path)
-        if value == 1:
-            return "good"
-        if value == 0:
-            return "bad"
-        if value == 2:
-            return "skip"
-        return "unlabeled"
+        return _LABEL_WORDS.get(self.store.load_labels().get(path), "unlabeled")
 
     def set_label(self, path: str, label: int) -> None:
         if self.store is None:
             return
         # Deciding on the active picture moves to the next one. Without this the big
         # preview sits on the image you just judged and the click looks like it did
-        # nothing. Captured before labelling, because the retrain re-renders the grid.
-        advance_from = path if path == self.focused_path else None
+        # nothing. Both facts are read before the label lands: applying it takes this
+        # photo out of the grid, and by then its position in the queue — which is the
+        # only thing that makes "the next one" mean anything — is gone.
+        was_focused = path == self.focused_path
+        successor = self._next_undecided_after(path) if was_focused else None
+        if successor is not None:
+            # Moved before the label lands, not after, so the re-render below draws the
+            # new active card once. Setting it afterwards meant every decision drew the
+            # focus twice — the old card, then a correction — and each pass rebuilt the
+            # enlarged preview image.
+            self.focused_path = successor
         verb = {1: "Accepted", 0: "REJECTED", 2: "Skipped"}.get(int(label), "Labelled")
         self._apply_label_batch(
             {path: int(label)},
             status=f"{verb} {Path(path).name} — teaching the scanner...",
             retrain=True,
         )
-        if advance_from is not None:
-            self._advance_focus_after(advance_from)
+        if not was_focused:
+            return
+        if successor is None or successor not in self.cards:
+            # The successor moved off this page, or there was none: work it out again
+            # against what is actually on screen now.
+            self._advance_focus_after(path)
+
+    def _next_undecided_after(self, path: str) -> str | None:
+        """The next photo on this page, after `path`, that carries no decision yet.
+
+        Wraps to the top of the page once, and never hands back `path` itself.
+        """
+        order = [str(sample["path"]) for sample in (self.page_samples or self.current_samples)]
+        if len(order) < 2:
+            return None
+        try:
+            index = order.index(path)
+        except ValueError:
+            index = -1
+        labels = self.store.load_labels() if self.store is not None else {}
+        # Everything after the current position, then wrap around to what came before.
+        for candidate in order[index + 1 :] + order[: max(index, 0)]:
+            if candidate != path and labels.get(candidate) is None:
+                return candidate
+        return None
 
     def _advance_focus_after(self, path: str) -> None:
         """Point the active picture at the next photo on this page you have not decided.
@@ -4543,17 +6871,11 @@ class BikiniScannerApp:
         order = [str(sample["path"]) for sample in (self.page_samples or self.current_samples)]
         if len(order) < 2:
             return
-        try:
-            index = order.index(path)
-        except ValueError:
-            index = -1
-        labels = self.store.load_labels() if self.store is not None else {}
-        # Everything after the current position, then wrap around to what came before.
-        for candidate in order[index + 1 :] + order[: max(index, 0)]:
-            if candidate != path and labels.get(candidate) is None:
-                self.focused_path = candidate
-                self._apply_focus_visuals()
-                return
+        candidate = self._next_undecided_after(path)
+        if candidate is not None:
+            self.focused_path = candidate
+            self._apply_focus_visuals()
+            return
         # Nothing undecided left in front of the reviewer. Say so rather than silently
         # handing back a photo that was already judged.
         if self.page_index + 1 < self._page_count():
@@ -4617,16 +6939,25 @@ class BikiniScannerApp:
             )
             return
         if record_undo:
-            self.undo_stack.append({"before": before, "after": dict(changes)})
+            self.undo_stack.append(
+                {"before": before, "after": dict(changes), "description": self._describe_change(changes)}
+            )
             self.redo_stack.clear()
         for path in changes:
             self._refresh_label_state(path)
+        # Re-render now rather than waiting for the retrain that follows. The re-rank
+        # runs on a background thread and can take seconds, and until it landed the
+        # grid still showed every photo the reviewer had just decided — the click
+        # looked like it had done nothing at all.
+        if self.current_state is not None:
+            self._refresh_displayed_results(reset_page=False)
         # Always say how much is actually left. Without this the queue refilling after
         # every retrain looks infinite, because nothing on screen ever counts down.
         self.status_var.set(f"{status} {self._progress_note()}".strip())
+        self._sync_history_controls()
         self._save_review_session()
         if retrain:
-            self.update_algorithm()
+            self._schedule_retrain(len(changes))
 
     def _progress_note(self) -> str:
         """Short 'how much is left' line for the status bar."""
@@ -4638,7 +6969,13 @@ class BikiniScannerApp:
         on_screen = sum(
             1 for sample in self.page_samples if labels.get(str(sample["path"])) is None
         )
-        return f"[{decided} decided | {on_screen} left on this page | {remaining} left in folder]"
+        note = f"[{decided} decided | {on_screen} left on this page | {remaining} left in folder]"
+        # Say that the model is behind rather than letting it look like the decisions
+        # went nowhere. They are saved either way; it is the ranking that is waiting.
+        if self._retrain_pending:
+            waiting = self._labels_since_retrain
+            note += f" · {waiting} to fold into the ranking"
+        return note
 
     def _retrain_report(
         self,
@@ -4676,18 +7013,14 @@ class BikiniScannerApp:
             messagebox.showinfo("No results", "Run a scan first.")
             return
         # Only what is actually displayed, so filters make this a precise tool.
-        paths = [str(sample["path"]) for sample in (self.displayed_samples or self.current_samples)]
+        paths, scope = self._output_scope()
         if not paths:
             messagebox.showinfo("Nothing shown", "There are no images on screen to label.")
             return
         verb = {1: "Accept", 0: "REJECT", 2: "Skip"}.get(int(label), "label")
-        # "Shown" is every image the current filters let through, not just the page
-        # on screen. The count below is the whole set, so name the scope explicitly.
-        pages = self._page_count()
-        scope = "in this view" if pages == 1 else f"in this view (all {pages} pages)"
         if not messagebox.askyesno(
             f"{verb} everything shown",
-            f"{verb} all {len(paths)} images {scope}?\n\nUse Ctrl+Z afterwards if that was not what you wanted.",
+            f"{verb} {scope}?\n\nUse Ctrl+Z afterwards if that was not what you wanted.",
         ):
             return
         self._apply_label_batch(
@@ -4695,6 +7028,54 @@ class BikiniScannerApp:
             status=f"{verb}ed {len(paths)} shown images.",
             retrain=True,
         )
+
+    @staticmethod
+    def _describe_change(changes: dict[str, int | None]) -> str:
+        """Name a labelling action the way the reviewer would describe it.
+
+        "Undo" on its own gives no way to tell a single misclick from a bulk Accept of
+        four hundred photos, which are very different things to reverse blind.
+        """
+        if not changes:
+            return "label change"
+        verbs = {1: "Accept", 0: "REJECT", 2: "Skip", None: "clear"}
+        values = set(changes.values())
+        verb = verbs.get(next(iter(values)), "label") if len(values) == 1 else "label"
+        if len(changes) == 1:
+            return f"{verb} {Path(next(iter(changes))).name}"
+        return f"{verb} {len(changes)} photos"
+
+    def _undo_description(self) -> str:
+        if not self.undo_stack:
+            return ""
+        return str(self.undo_stack[-1].get("description", "label change"))
+
+    def _redo_description(self) -> str:
+        if not self.redo_stack:
+            return ""
+        return str(self.redo_stack[-1].get("description", "label change"))
+
+    def _sync_history_controls(self) -> None:
+        """Keep the Edit menu and the status hint naming what Ctrl+Z would reverse."""
+        menu = getattr(self, "edit_menu", None)
+        if menu is None:
+            return
+        undo = self._undo_description()
+        redo = self._redo_description()
+        try:
+            menu.entryconfigure(
+                self._undo_menu_index,
+                label=f"Undo {undo}" if undo else "Undo",
+                state="normal" if undo else "disabled",
+            )
+            menu.entryconfigure(
+                self._redo_menu_index,
+                label=f"Redo {redo}" if redo else "Redo",
+                state="normal" if redo else "disabled",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self.undo_hint_var.set(f"Ctrl+Z undoes: {undo}" if undo else "")
 
     def undo_last_label(self) -> None:
         if self.store is None or not self.undo_stack:
@@ -4706,7 +7087,7 @@ class BikiniScannerApp:
         self.redo_stack.append(action)
         self._apply_label_batch(
             {str(path): value for path, value in before.items()},
-            status="Undo label change.",
+            status=f"Undid {action.get('description', 'label change')}.",
             retrain=True,
             record_undo=False,
         )
@@ -4721,7 +7102,7 @@ class BikiniScannerApp:
         self.undo_stack.append(action)
         self._apply_label_batch(
             {str(path): value for path, value in after.items()},
-            status="Redo label change.",
+            status=f"Redid {action.get('description', 'label change')}.",
             retrain=True,
             record_undo=False,
         )
@@ -4729,7 +7110,7 @@ class BikiniScannerApp:
     def _refresh_label_state(self, path: str) -> None:
         card = self.cards.get(path)
         if card is not None:
-            card.label_label.configure(text=f"Label: {self._label_display_text(path)}")
+            card.label_label.configure(text=self._card_label_text(path), style=self._label_style(path))
             card.details_label.configure(text=self._axis_details_text(path))
         if path == self.focused_path:
             self.preview_caption_var.set(self._preview_caption_text(path))
@@ -4742,7 +7123,7 @@ class BikiniScannerApp:
         if not matches:
             messagebox.showinfo("No matches", "No images are above the current threshold.")
             return
-        out_dir = filedialog.askdirectory(title="Choose export folder")
+        out_dir = self._ask_output_destination("Choose export folder", "export")
         if not out_dir:
             return
         out_path = Path(out_dir)
@@ -4797,18 +7178,26 @@ class BikiniScannerApp:
             }
             for idx, path in enumerate(self.current_state.paths)
         }
-        build_html_report(out_path, samples, labels, scores, axis_scores=axis_scores, title="Bikini Scanner report")
+        build_html_report(
+            out_path,
+            samples,
+            labels,
+            scores,
+            axis_scores=axis_scores,
+            title="Bikini Scanner report",
+            match_threshold=float(self.threshold_var.get()),
+        )
         messagebox.showinfo("HTML report exported", f"Report written to {out_path}")
 
     def write_metadata_to_visible(self) -> None:
         if self.current_state is None:
             messagebox.showinfo("No results", "Run a scan first.")
             return
-        paths = [str(sample["path"]) for sample in self.displayed_samples or self.current_samples]
+        paths, scope = self._output_scope()
         if not paths:
             messagebox.showinfo("No results", "Nothing selected.")
             return
-        if not messagebox.askyesno("Write metadata", f"Write tags into {len(paths)} image files?"):
+        if not messagebox.askyesno("Write metadata", f"Write bikini keyword tags into {scope}?"):
             return
         written = 0
         for path in paths:
@@ -4821,16 +7210,17 @@ class BikiniScannerApp:
         if self.current_state is None:
             messagebox.showinfo("No results", "Run a scan first.")
             return
-        paths = [str(sample["path"]) for sample in self.displayed_samples or self.current_samples]
+        paths, scope = self._output_scope()
         if not paths:
             messagebox.showinfo("No results", "Nothing selected.")
             return
-        if not messagebox.askyesno("Move to trash", f"Send {len(paths)} files to the recycle bin/trash?"):
+        if not messagebox.askyesno("Move to trash", f"Send {scope} to the recycle bin?"):
             return
         outcome = trash_files(paths)
         if not outcome.available:
             messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {outcome.reason}")
             return
+        self._record_trashed(outcome)
         # Report what actually happened, and refresh whenever anything moved: a partial
         # failure still changed the folder, so leaving the grid untouched would show
         # files that are already in the recycle bin.
@@ -4851,22 +7241,85 @@ class BikiniScannerApp:
             self._refresh_after_output_change(move=True)
 
     def show_log_viewer(self) -> None:
+        """The log, with a level filter and a search box.
+
+        It was a raw tail, and it is where several answers still only exist — scan
+        failures, plugin errors, per-file skip reasons. Scrolling a few thousand lines
+        looking for the word ERROR is not a way to find them.
+        """
         path = configure_logging()
-        dialog, outer = self._create_modal("Recent log", padding=10, geometry="900x600")
+        dialog, outer = self._create_modal(
+            "Recent log", padding=10, geometry="960x620", resizable=(True, True)
+        )
         ttk.Label(outer, text=f"Log file: {path}").pack(anchor="w", pady=(0, 6))
-        text = Text(outer, wrap="none", state="normal")
+        controls = ttk.Frame(outer)
+        controls.pack(fill="x", pady=(0, 6))
+        level_var = StringVar(value="all")
+        search_var = StringVar(value="")
+        count_var = StringVar(value="")
+        ttk.Label(controls, text="Level").pack(side=LEFT)
+        ttk.Combobox(
+            controls,
+            textvariable=level_var,
+            values=("all", "warnings and errors", "errors only"),
+            state="readonly",
+            width=20,
+        ).pack(side=LEFT, padx=(4, 12))
+        ttk.Label(controls, text="Containing").pack(side=LEFT)
+        ttk.Entry(controls, textvariable=search_var, width=32).pack(side=LEFT, padx=(4, 12))
+        ttk.Label(controls, textvariable=count_var, style="FormMuted.TLabel").pack(side=LEFT)
+
+        body = ttk.Frame(outer)
+        body.pack(fill=BOTH, expand=True)
+        text = Text(body, wrap="none", state="normal")
         text.pack(side=LEFT, fill=BOTH, expand=True)
-        scroll = ttk.Scrollbar(outer, orient="vertical", command=text.yview)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
         scroll.pack(side=RIGHT, fill="y")
         text.configure(yscrollcommand=scroll.set)
-        text.insert("1.0", read_log_tail())
-        text.configure(state="disabled")
+
+        def apply_filter(*_args: object) -> None:
+            wanted = level_var.get()
+            needle = search_var.get().strip().lower()
+            keep = []
+            total = 0
+            for line in read_log_tail().splitlines():
+                total += 1
+                if wanted == "errors only" and " ERROR" not in line and " CRITICAL" not in line:
+                    continue
+                if wanted == "warnings and errors" and not any(
+                    token in line for token in (" WARNING", " ERROR", " CRITICAL")
+                ):
+                    continue
+                if needle and needle not in line.lower():
+                    continue
+                keep.append(line)
+            text.configure(state="normal")
+            text.delete("1.0", END)
+            text.insert("1.0", "\n".join(keep))
+            text.configure(state="disabled")
+            text.see(END)
+            count_var.set(f"{len(keep)} of {total} lines")
+
+        for variable in (level_var, search_var):
+            try:
+                variable.trace_add("write", apply_filter)
+            except Exception:  # noqa: BLE001
+                continue
+        apply_filter()
+
         buttons = ttk.Frame(dialog, padding=(10, 0, 10, 10))
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Refresh", command=lambda: self._refresh_log_text(text)).pack(side=LEFT)
+        ttk.Button(buttons, text="Refresh", command=apply_filter).pack(side=LEFT)
         ttk.Button(buttons, text="Open log folder", command=lambda: self.reveal_in_file_manager(str(path))).pack(
             side=LEFT, padx=8
         )
+
+        def copy_shown() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text.get("1.0", END))
+            self.status_var.set("Copied the filtered log lines to the clipboard.")
+
+        ttk.Button(buttons, text="Copy shown", command=copy_shown).pack(side=LEFT)
         ttk.Button(
             buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
         ).pack(side=RIGHT)
@@ -4877,6 +7330,144 @@ class BikiniScannerApp:
         text.delete("1.0", END)
         text.insert("1.0", read_log_tail())
         text.configure(state="disabled")
+
+    def _record_trashed(self, outcome: TrashOutcome) -> None:
+        """Keep a note of what went to the recycle bin, and when.
+
+        The files are recoverable — that is what the recycle bin is for — but the app
+        forgot them the instant they left the grid, so "which photos did I just bin?"
+        had no answer at all. This does not undo anything; it makes the list findable.
+        """
+        moved = [str(path) for path in outcome.trashed]
+        if not moved:
+            return
+        history = self.user_prefs.get("trashed_files")
+        history = list(history) if isinstance(history, list) else []
+        stamp = datetime.now().isoformat(timespec="seconds")
+        history.extend({"path": path, "when": stamp} for path in moved)
+        self.user_prefs["trashed_files"] = history[-500:]
+        self._save_user_prefs()
+
+    def show_trashed_files(self) -> None:
+        """List what this app has sent to the recycle bin, most recent first."""
+        history = self.user_prefs.get("trashed_files")
+        history = list(history) if isinstance(history, list) else []
+        if not history:
+            messagebox.showinfo("Recently trashed", "This app has not sent any files to the recycle bin.")
+            return
+        dialog, outer = self._create_modal(
+            "Recently trashed", padding=10, geometry="820x480", resizable=(True, True)
+        )
+        ttk.Label(
+            outer,
+            text=(
+                f"{len(history)} file(s) sent to the recycle bin by this app.\n"
+                "They are still there: restore them from the recycle bin itself, which is the\n"
+                "only place that can put a file back where it came from."
+            ),
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+        body = ttk.Frame(outer)
+        body.pack(fill=BOTH, expand=True)
+        text = Text(body, wrap="none")
+        text.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scroll.pack(side=RIGHT, fill="y")
+        text.configure(yscrollcommand=scroll.set)
+        palette = self._palette()
+        text.configure(bg=palette["entry_bg"], fg=palette["fg"], insertbackground=palette["fg"], relief="solid")
+        for row in reversed(history):
+            if isinstance(row, dict):
+                text.insert("end", f"{row.get('when', '')}   {row.get('path', '')}\n")
+        text.configure(state="disabled")
+        buttons = self._modal_button_row(outer)
+
+        def copy_list() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(
+                "\n".join(str(row.get("path", "")) for row in history if isinstance(row, dict))
+            )
+            self.status_var.set(f"Copied {len(history)} trashed path(s) to the clipboard.")
+
+        def forget() -> None:
+            if not messagebox.askyesno(
+                "Clear the list",
+                "Forget this list? The files themselves stay in the recycle bin.",
+                parent=dialog,
+            ):
+                return
+            self.user_prefs["trashed_files"] = []
+            self._save_user_prefs()
+            dialog._safe_close()  # type: ignore[attr-defined]
+
+        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(side=RIGHT)  # type: ignore[attr-defined]
+        ttk.Button(buttons, text="Copy list", command=copy_list).pack(side=RIGHT, padx=(0, 8))
+        ttk.Button(buttons, text="Clear the list", command=forget).pack(side=LEFT)
+
+    def show_skipped_files(self) -> None:
+        """List the files the last scan could not read, with the reason for each.
+
+        The count was reported ("3 files could not be read") and the detail went only
+        to the log, so the one question that count raises — which ones? — could not be
+        answered from inside the app.
+        """
+        if self.store is None or not self.store.metadata_path.exists():
+            messagebox.showinfo("Skipped files", "Run a scan first.")
+            return
+        try:
+            metadata = json.loads(self.store.metadata_path.read_text(encoding="utf-8"))
+            skipped = list(metadata.get("skipped", []))
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Skipped files", f"Could not read the scan metadata:\n{exc}")
+            return
+        if not skipped:
+            messagebox.showinfo("Skipped files", "Every image in this folder was read successfully.")
+            return
+        dialog, outer = self._create_modal(
+            "Files that could not be read", padding=10, geometry="900x520", resizable=(True, True)
+        )
+        ttk.Label(
+            outer,
+            text=f"{len(skipped)} file(s) were skipped by the last scan of this folder.",
+        ).pack(anchor="w", pady=(0, 6))
+        # HEIC needs an optional package. Without it every .heic in the folder lands
+        # here looking like a corrupt file, when one install would read them all.
+        heic = [row for row in skipped if str(row.get("filename", "")).lower().endswith((".heic", ".heif"))]
+        if heic and not heif_supported():
+            ttk.Label(
+                outer,
+                text=(
+                    f"{len(heic)} of these are HEIC/HEIF photos and support for that format is not "
+                    "installed.\nInstalling the optional 'pillow-heif' package and rescanning would "
+                    "read them."
+                ),
+                style="Accent.TLabel",
+                justify="left",
+                padding=(6, 4),
+            ).pack(anchor="w", pady=(0, 8))
+        body = ttk.Frame(outer)
+        body.pack(fill=BOTH, expand=True)
+        text = Text(body, wrap="none")
+        text.pack(side=LEFT, fill=BOTH, expand=True)
+        scroll = ttk.Scrollbar(body, orient="vertical", command=text.yview)
+        scroll.pack(side=RIGHT, fill="y")
+        text.configure(yscrollcommand=scroll.set)
+        palette = self._palette()
+        text.configure(bg=palette["entry_bg"], fg=palette["fg"], insertbackground=palette["fg"], relief="solid")
+        for row in skipped:
+            text.insert("end", f"{row.get('path', row.get('filename', '?'))}\n    {row.get('error', 'unknown error')}\n")
+        text.configure(state="disabled")
+        row = self._modal_button_row(outer)
+
+        def copy_list() -> None:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(
+                "\n".join(f"{item.get('path', '')}\t{item.get('error', '')}" for item in skipped)
+            )
+            self.status_var.set(f"Copied {len(skipped)} skipped file path(s) to the clipboard.")
+
+        ttk.Button(row, text="Close", command=dialog._safe_close).pack(side=RIGHT)  # type: ignore[attr-defined]
+        ttk.Button(row, text="Copy list", command=copy_list).pack(side=RIGHT, padx=(0, 8))
 
     def show_duplicate_groups(self) -> None:
         if self.store is None:
@@ -4901,9 +7492,39 @@ class BikiniScannerApp:
         ttk.Button(
             buttons, text="Keep first, trash rest", command=lambda: self._trash_duplicate_remainders(groups, dialog)
         ).pack(side=LEFT)
+        # Copies of one photo deserve one decision, not one per copy. Trashing was the
+        # only bulk action here, which meant the obvious middle ground - "these are all
+        # the same photo, judge them together" - had to be done by hand.
+        ttk.Button(
+            buttons, text="Accept every group", command=lambda: self._label_duplicate_groups(groups, dialog, 1)
+        ).pack(side=LEFT, padx=(8, 0))
+        ttk.Button(
+            buttons, text="REJECT every group", command=lambda: self._label_duplicate_groups(groups, dialog, 0)
+        ).pack(side=LEFT, padx=(6, 0))
         ttk.Button(
             buttons, text="Close", command=dialog._safe_close  # type: ignore[attr-defined]
         ).pack(side=RIGHT)
+
+    def _label_duplicate_groups(self, groups: dict[str, list[str]], dialog: Toplevel, label: int) -> None:
+        """Apply one decision to every copy in every duplicate group."""
+        paths = [path for members in groups.values() for path in members]
+        if not paths:
+            messagebox.showinfo("Duplicate groups", "There are no duplicates to label.", parent=dialog)
+            return
+        verb = {1: "Accept", 0: "REJECT"}.get(int(label), "label")
+        if not messagebox.askyesno(
+            f"{verb} every duplicate",
+            f"{verb} all {len(paths)} files across {len(groups)} duplicate groups?\n\n"
+            "Ctrl+Z afterwards reverses the whole batch.",
+            parent=dialog,
+        ):
+            return
+        self._apply_label_batch(
+            dict.fromkeys(paths, label),
+            status=f"{verb}ed {len(paths)} duplicate files.",
+            retrain=True,
+        )
+        dialog._safe_close()  # type: ignore[attr-defined]
 
     def _trash_duplicate_remainders(self, groups: dict[str, list[str]], dialog: Toplevel) -> None:
         duplicates = [path for paths in groups.values() for path in paths[1:]]
@@ -4940,18 +7561,69 @@ class BikiniScannerApp:
             )
         dialog.destroy()
 
+    def delete_decisions(self) -> None:
+        """Remove this folder's labels and notes, on purpose and by that name."""
+        if self.store is None:
+            messagebox.showinfo("No folder", "Run or select a folder first.")
+            return
+        labels = self.store.load_labels()
+        notes = self.store.load_notes()
+        if not labels and not notes:
+            messagebox.showinfo("Nothing to delete", "There are no decisions or notes recorded for this folder.")
+            return
+        parts = []
+        if labels:
+            parts.append(f"{len(labels)} Accept/REJECT/Skip decision{'s' if len(labels) != 1 else ''}")
+        if notes:
+            parts.append(f"{len(notes)} note{'s' if len(notes) != 1 else ''}")
+        if not messagebox.askyesno(
+            "Delete decisions",
+            f"Permanently delete {' and '.join(parts)} for this folder?\n\n"
+            "This cannot be undone and cannot be rebuilt by rescanning — it is the work "
+            "you did by hand.\n\n"
+            "Cached embeddings are left alone; use Clear cached scan data for those.",
+            default="no",
+            icon="warning",
+        ):
+            return
+        self.store.delete_decisions()
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._sync_history_controls()
+        if self.current_state is not None:
+            self._refresh_active_view()
+        self._refresh_summary()
+        self.status_var.set("Deleted this folder's decisions and notes.")
+
     def clear_cache(self) -> None:
         if self.store is None:
             messagebox.showinfo("No cache", "Run or select a folder first.")
             return
         size_bytes = self.store.cache_size_bytes()
         size_mb = size_bytes / (1024 * 1024)
+        labels = self.store.load_labels()
+        notes = self.store.load_notes()
+        kept = []
+        if labels:
+            kept.append(f"{len(labels)} decision{'s' if len(labels) != 1 else ''}")
+        if notes:
+            kept.append(f"{len(notes)} note{'s' if len(notes) != 1 else ''}")
+        if self.store.config_override_path.exists():
+            kept.append("this folder's saved settings")
+        kept_text = (
+            "\n\nKept: " + ", ".join(kept) + ". Use Tools > Delete decisions for this folder to remove those."
+            if kept
+            else ""
+        )
         if not messagebox.askyesno(
-            "Clear cache",
-            f"Delete {size_mb:.1f} MB of cached data for this folder?\n\nThis removes embeddings, labels, metadata, face counts, and the saved classifier.",
+            "Clear cached scan data",
+            f"Delete {size_mb:.1f} MB of cached scan data for this folder?\n\n"
+            "This removes embeddings, region scores, face counts, scan metadata and the "
+            "trained classifier — all of which are rebuilt by the next scan."
+            f"{kept_text}",
         ):
             return
-        self.store.clear_cache()
+        self.store.clear_cache(keep_decisions=True)
         self.current_state = None
         self.current_samples = []
         self.review_samples = []
@@ -4967,6 +7639,28 @@ class BikiniScannerApp:
         self._refresh_summary()
         self._update_preview()
         self._refresh_empty_state()
+
+    def _note_map(self) -> dict[str, str]:
+        return self.store.load_notes() if self.store is not None else {}
+
+    def _ask_output_destination(self, title: str, kind: str) -> str:
+        """Ask where output goes, starting from wherever it went last time.
+
+        Every export re-asked for a destination with no memory of the previous answer,
+        so repeating yesterday's export meant navigating the same tree again.
+        """
+        remembered = self.user_prefs.get("output_destinations")
+        remembered = dict(remembered) if isinstance(remembered, dict) else {}
+        previous = str(remembered.get(kind, "") or "")
+        chosen = filedialog.askdirectory(
+            title=title, initialdir=previous if previous and Path(previous).is_dir() else None
+        )
+        if not chosen:
+            return ""
+        remembered[kind] = chosen
+        self.user_prefs["output_destinations"] = remembered
+        self._save_user_prefs()
+        return chosen
 
     def _score_map(self) -> dict[str, float]:
         if self.current_state is None:
@@ -5073,9 +7767,12 @@ class BikiniScannerApp:
     def _execute_export(self, plan: list, csv_path: Path, transfer_root: Path) -> None:
         if self.current_state is None:
             return
+        notes = self._note_map()
         with csv_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["path", "filename", "score", "label", "timestamp"])
+            # The note travels with the row: an export that records the decision but
+            # not the reason is only half of what the reviewer wrote down.
+            writer.writerow(["path", "filename", "score", "label", "note", "timestamp"])
             for item in plan:
                 writer.writerow(
                     [
@@ -5083,6 +7780,7 @@ class BikiniScannerApp:
                         item.source.name,
                         f"{item.score:.6f}",
                         item.label,
+                        notes.get(str(item.source), ""),
                         self.current_state.scan_timestamp,
                     ]
                 )

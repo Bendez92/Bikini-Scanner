@@ -111,13 +111,37 @@ class LogisticRegression:
     C: float = 1.0
     max_iter: int = 600
     tol: float = 1e-6
+    # Stop as soon as the gradient is flat, not just when the loss stops moving. The
+    # loss test alone could not tell "settled" from "crawling", which is how an
+    # under-determined fit burned all 600 iterations and still reported failure.
+    gtol: float = 1e-5
+    # How often the stopping test runs. At 25 the loss was sampled so rarely that a fit
+    # which settled at iteration 130 kept going to 600 before anyone noticed.
+    check_every: int = 10
+    # Set by callers that deliberately fit without meaningful regularisation, where
+    # running to the cap is the expected outcome rather than a problem to report.
+    expect_cap: bool = False
     scaler: StandardScaler = field(default_factory=StandardScaler)
     coef: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.float32))
     intercept: float = 0.0
     fitted: bool = False
     converged: bool = field(init=False, default=False)
+    n_iter: int = field(init=False, default=0)
 
-    def fit(self, features: np.ndarray, labels: np.ndarray) -> LogisticRegression:
+    def fit(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        init_coef: np.ndarray | None = None,
+        init_intercept: float | None = None,
+    ) -> LogisticRegression:
+        """Fit, optionally starting from a previous solution.
+
+        `init_coef`/`init_intercept` are a warm start: a retrain after a handful of new
+        labels lands very close to where the last one finished, so beginning there
+        reaches the same optimum in a fraction of the iterations. They are a starting
+        point only — a warm-started fit that runs to convergence agrees with a cold one.
+        """
         features = np.asarray(features, dtype=np.float32)
         labels = np.asarray(labels).astype(np.float64).ravel()
         if features.ndim != 2 or features.shape[0] != labels.shape[0]:
@@ -136,22 +160,44 @@ class LogisticRegression:
         weights /= weights.mean()
 
         penalty = 1.0 / max(float(self.C), 1e-6)
-        coef = np.zeros(d, dtype=np.float64)
-        intercept = 0.0
+        if init_coef is not None and np.shape(init_coef) == (d,):
+            coef = np.asarray(init_coef, dtype=np.float64).copy()
+        else:
+            coef = np.zeros(d, dtype=np.float64)
+        intercept = float(init_intercept) if init_intercept is not None else 0.0
         m_coef = np.zeros(d, dtype=np.float64)
         v_coef = np.zeros(d, dtype=np.float64)
         m_int = 0.0
         v_int = 0.0
         beta1, beta2, epsilon, step = 0.9, 0.999, 1e-8, 0.1
         previous_loss = np.inf
-        last_loss = np.nan
         converged = False
+        iteration = 0
+        check_every = max(1, int(self.check_every))
         for iteration in range(1, int(self.max_iter) + 1):
             logits = x @ coef + intercept
             probabilities: np.ndarray = sigmoid(logits).astype(np.float64)
             residual = (probabilities - labels) * weights
             grad_coef = x.T @ residual / n + penalty * coef / n
             grad_int = float(residual.sum() / n)
+
+            if iteration % check_every == 0:
+                # Flat gradient means this is the optimum, whatever the loss is doing.
+                # An under-determined fit (more features than labels, which is every
+                # fit early in a session) drifts along a near-flat valley where the
+                # loss keeps inching down; without this it never declared success.
+                gradient_norm = max(float(np.abs(grad_coef).max()), abs(grad_int))
+                clipped = np.clip(probabilities, 1e-9, 1 - 1e-9)
+                loss = float(
+                    -(weights * (labels * np.log(clipped) + (1 - labels) * np.log(1 - clipped))).mean()
+                    + 0.5 * penalty * float(coef @ coef) / n
+                )
+                # Relative, not absolute: a loss of 1e-3 and a loss of 10 do not both
+                # become uninteresting at the same absolute step size.
+                if gradient_norm < self.gtol or abs(previous_loss - loss) <= self.tol * max(1.0, abs(loss)):
+                    converged = True
+                    break
+                previous_loss = loss
 
             m_coef = beta1 * m_coef + (1 - beta1) * grad_coef
             v_coef = beta2 * v_coef + (1 - beta2) * grad_coef**2
@@ -162,27 +208,24 @@ class LogisticRegression:
             coef -= step * (m_coef / bias1) / (np.sqrt(v_coef / bias2) + epsilon)
             intercept -= step * (m_int / bias1) / (np.sqrt(v_int / bias2) + epsilon)
 
-            if iteration % 25 == 0:
-                clipped = np.clip(probabilities, 1e-9, 1 - 1e-9)
-                loss = float(
-                    -(weights * (labels * np.log(clipped) + (1 - labels) * np.log(1 - clipped))).mean()
-                    + 0.5 * penalty * float(coef @ coef) / n
-                )
-                last_loss = loss
-                if abs(previous_loss - loss) < self.tol:
-                    converged = True
-                    break
-                previous_loss = loss
-
         self.coef = coef.astype(np.float32)
         self.intercept = float(intercept)
         self.converged = converged
+        self.n_iter = iteration
         self.fitted = True
         if not converged:
-            LOGGER.warning(
-                "Logistic regression did not converge within %d iterations (final loss change %.3g)",
+            # Two cases are expected rather than wrong, and both are common here:
+            # fewer labelled rows than features (the normal state of the first dozen
+            # labels) has no unique solution to converge to, and a deliberately
+            # unregularised fit on separable data has no finite optimum at all — the
+            # coefficient simply grows. Only a genuinely over-determined, regularised
+            # fit failing to settle is worth telling anyone about.
+            report = LOGGER.debug if (n <= d or self.expect_cap) else LOGGER.warning
+            report(
+                "Logistic regression stopped at the %d-iteration cap (%d rows x %d features)",
                 self.max_iter,
-                abs(previous_loss - last_loss) if previous_loss != np.inf else np.nan,
+                n,
+                d,
             )
         return self
 
@@ -210,7 +253,11 @@ class PlattCalibrator:
         if labels.size < min_samples or len(set(labels.tolist())) < 2:
             raise ValueError("Platt calibration needs at least min_samples from both classes")
         scores: np.ndarray = self.model.decision_function(features).astype(np.float64).reshape(-1, 1)
-        calibrator = LogisticRegression(C=1e6, max_iter=400)
+        # Near-zero penalty on purpose: Platt scaling wants the maximum-likelihood
+        # slope, not a shrunken one. On separable scores that has no finite optimum,
+        # so this fit is expected to stop at the cap with a large slope, which is the
+        # correct answer to "these two classes are cleanly separated here".
+        calibrator = LogisticRegression(C=1e6, max_iter=400, expect_cap=True)
         calibrator.fit(scores.astype(np.float32), labels)
         # The 1-D calibrator standardises its input, so fold that back into slope/bias.
         scale = float(calibrator.scaler.scale[0]) or 1.0
@@ -258,7 +305,14 @@ def stratified_split(labels: np.ndarray, test_size: int, seed: int = 42) -> tupl
     return np.nonzero(mask)[0], test_index
 
 
-def cross_val_scores(features: np.ndarray, labels: np.ndarray, c_value: float, folds: int) -> np.ndarray:
+def cross_val_scores(
+    features: np.ndarray,
+    labels: np.ndarray,
+    c_value: float,
+    folds: int,
+    init_coef: np.ndarray | None = None,
+    init_intercept: float | None = None,
+) -> np.ndarray:
     """Out-of-fold probabilities (replaces cross_val_predict with predict_proba).
 
     Rows in a fold that could not be trained against come back as NaN rather than 0.0:
@@ -273,6 +327,8 @@ def cross_val_scores(features: np.ndarray, labels: np.ndarray, c_value: float, f
         mask[held_out] = False
         if len(set(labels[mask].tolist())) < 2 or held_out.size == 0:
             continue
-        model = LogisticRegression(C=c_value).fit(features[mask], labels[mask])
+        model = LogisticRegression(C=c_value).fit(
+            features[mask], labels[mask], init_coef=init_coef, init_intercept=init_intercept
+        )
         out[held_out] = model.predict_proba(features[held_out])[:, 1]
     return out
