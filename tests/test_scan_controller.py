@@ -63,6 +63,7 @@ class ScanControllerTests(unittest.TestCase):
         self.completed: list[tuple[ScoreState, list[dict[str, object]], bool]] = []
         self.failed: list[Exception] = []
         self.cancelled = 0
+        self.scan_cancel_event = None
         self.store = FakeStore()
         self.scorer = FakeScorer()
 
@@ -82,6 +83,7 @@ class ScanControllerTests(unittest.TestCase):
         )
 
     def scan(self, *args: Any, **kwargs: Any) -> tuple[ScoreState, list[dict[str, object]]]:
+        self.scan_cancel_event = kwargs["cancel_event"]
         progress_callback = kwargs["progress_callback"]
         progress_callback(ScanProgress("embed", "Reading images", 1, 1, 1.0, None, 1.0))
         return _state(), [{"kind": "scan"}]
@@ -106,6 +108,10 @@ class ScanControllerTests(unittest.TestCase):
         self.assertFalse(self.controller.start(self.request()))
         self.assertEqual(len(self.spawned), 1)
         self.spawned[0]()
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.controller.start(self.request()))
+        self.drain()
+        self.assertFalse(self.controller.active)
         self.assertTrue(self.controller.start(self.request()))
         self.assertEqual(len(self.spawned), 2)
 
@@ -114,17 +120,24 @@ class ScanControllerTests(unittest.TestCase):
         self.spawned[0]()
         self.assertEqual(self.progress, [])
         self.assertEqual(self.completed, [])
+        self.assertTrue(self.controller.active)
         self.drain()
         self.assertEqual(len(self.progress), 1)
         self.assertEqual(len(self.completed), 1)
+        self.assertFalse(self.controller.active)
 
-    def test_stale_terminal_closure_is_dropped(self) -> None:
+    def test_stale_closure_is_dropped_without_state_change(self) -> None:
         self.controller.start(self.request())
         self.spawned[0]()
-        self.assertTrue(self.controller.start(self.request()))
+        terminal = self.dispatched.pop()
+        terminal()
+        self.assertFalse(self.controller.active)
+        self.controller.start(self.request())
+        completed_before = list(self.completed)
+        active_before = self.controller.active
         self.drain()
-        self.assertEqual(self.completed, [])
-        self.assertTrue(self.controller.active)
+        self.assertEqual(self.completed, completed_before)
+        self.assertEqual(self.controller.active, active_before)
 
     def test_cancelled_and_failed_clear_pending_retrain(self) -> None:
         def cancelled_scan(*args: Any, **kwargs: Any) -> tuple[ScoreState, list[dict[str, object]]]:
@@ -144,8 +157,9 @@ class ScanControllerTests(unittest.TestCase):
         controller.queue_retrain()
         controller.start(self.request())
         self.spawned[0]()
-        self.assertFalse(controller.retrain_pending)
+        self.assertTrue(controller.retrain_pending)
         self.drain()
+        self.assertFalse(controller.retrain_pending)
         self.assertEqual(self.cancelled, 1)
 
         def failed_scan(*args: Any, **kwargs: Any) -> tuple[ScoreState, list[dict[str, object]]]:
@@ -165,14 +179,18 @@ class ScanControllerTests(unittest.TestCase):
         controller.queue_retrain()
         controller.start(self.request())
         self.spawned[1]()
-        self.assertFalse(controller.retrain_pending)
+        self.assertTrue(controller.retrain_pending)
         self.drain()
+        self.assertFalse(controller.retrain_pending)
         self.assertEqual(str(self.failed[-1]), "broken")
 
     def test_completed_leaves_pending_retrain_set(self) -> None:
         self.controller.queue_retrain()
         self.controller.start(self.request())
         self.spawned[0]()
+        self.assertTrue(self.controller.active)
+        self.assertTrue(self.controller.retrain_pending)
+        self.drain()
         self.assertTrue(self.controller.retrain_pending)
 
     def test_cancel_sets_the_scan_event_without_clearing_active(self) -> None:
@@ -184,6 +202,10 @@ class ScanControllerTests(unittest.TestCase):
         self.assertTrue(event.is_set())
         self.assertTrue(self.controller.active)
         self.spawned[0]()
+        self.assertIs(self.scan_cancel_event, event)
+        self.assertTrue(self.controller.cancel())
+        self.drain()
+        self.assertFalse(self.controller.active)
         self.assertFalse(self.controller.cancel())
 
     def test_retrain_queue_operations(self) -> None:

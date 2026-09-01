@@ -139,30 +139,20 @@ class ScanController:
                     cancel_event=cancel_event,
                 )
         except ScanCancelled:
-            if self._finish(generation, clear_retrain=True):
+            if self._is_current(generation):
                 self._dispatch(lambda: self._deliver_cancelled(generation))
             return
         except Exception as exc:  # noqa: BLE001
             error = exc
-            if self._finish(generation, clear_retrain=True):
+            if self._is_current(generation):
                 self._dispatch(lambda: self._deliver_failed(generation, error))
             return
-        if self._finish(generation, clear_retrain=False):
+        if self._is_current(generation):
             self._dispatch(lambda: self._deliver_completed(generation, state, samples, request.full_rescan))
 
     def _is_current(self, generation: int) -> bool:
         with self._lock:
             return generation == self._generation
-
-    def _finish(self, generation: int, *, clear_retrain: bool) -> bool:
-        with self._lock:
-            if generation != self._generation:
-                return False
-            self._active = False
-            self._cancel_event = None
-            if clear_retrain:
-                self._retrain_pending = False
-            return True
 
     def _deliver_progress(self, generation: int, progress: ScanProgress) -> None:
         if self._is_current(generation):
@@ -175,13 +165,27 @@ class ScanController:
         samples: list[dict[str, object]],
         full_rescan: bool,
     ) -> None:
-        if self._is_current(generation):
-            self._callbacks.completed(state, samples, full_rescan)
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._active = False
+            self._cancel_event = None
+        self._callbacks.completed(state, samples, full_rescan)
 
     def _deliver_failed(self, generation: int, exc: Exception) -> None:
-        if self._is_current(generation):
-            self._callbacks.failed(exc)
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._active = False
+            self._cancel_event = None
+            self._retrain_pending = False
+        self._callbacks.failed(exc)
 
     def _deliver_cancelled(self, generation: int) -> None:
-        if self._is_current(generation):
-            self._callbacks.cancelled()
+        with self._lock:
+            if generation != self._generation:
+                return
+            self._active = False
+            self._cancel_event = None
+            self._retrain_pending = False
+        self._callbacks.cancelled()

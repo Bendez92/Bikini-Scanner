@@ -3607,13 +3607,16 @@ class BikiniScannerApp:
 
     def _run_pending_retrain(self) -> None:
         """Start the retrain that was asked for while another pass was running."""
-        if not self.scan_controller.retrain_pending or self.scan_controller.active or self.queue_active:
+        if self.scan_controller.active or self.queue_active:
             return
         if not self.scan_controller.claim_retrain():
             return
         self.update_algorithm()
 
     def _launch_background_scan(self, full_rescan: bool) -> None:
+        if self.scan_controller.active:
+            LOGGER.warning("Ignoring scan launch while a scan is already active")
+            return
         assert self.store is not None
         assert self.backend is not None
         assert self.scorer is not None
@@ -3637,7 +3640,7 @@ class BikiniScannerApp:
         backend = self.backend
         scorer = self.scorer
         assert store is not None and backend is not None and scorer is not None
-        self.scan_controller.start(
+        started = self.scan_controller.start(
             ScanRequest(
                 store=store,
                 backend=backend,
@@ -3648,6 +3651,11 @@ class BikiniScannerApp:
                 source_state=source_state,
             )
         )
+        if not started:
+            LOGGER.warning("Scan controller refused a scan launch")
+            self.stop_scan_button.configure(state="disabled")
+            self._reset_progress_bar()
+            self._show_progress(False)
 
     def _scan_cancelled(self) -> None:
         self.stop_scan_button.configure(state="disabled")
