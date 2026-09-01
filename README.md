@@ -240,6 +240,50 @@ The suite redirects every user-state path into a temporary directory first, so
 running it never touches your real preferences, labels, or learning memory. Pass a
 class name to run one group, e.g. `python tests/test_functional.py NumericPrimitives`.
 
+## Measuring accuracy on your own images
+
+The suite proves the pipeline still behaves the same; it does not say whether the
+scores are any good, because it runs on generated images. `scripts/evaluate.py`
+answers that against images you have labelled yourself. Write a CSV manifest:
+
+```text
+path,label
+holiday/DSC_0001.jpg,match
+holiday/DSC_0002.jpg,no_match
+```
+
+Relative paths resolve against the manifest's own folder, and `1`/`0`,
+`true`/`false`, `yes`/`no` and `accept`/`reject` work as labels too. Then:
+
+```bash
+python scripts/evaluate.py --manifest labels.csv --output run.json
+```
+
+It reports ROC AUC and average precision (how well the scores rank images at all),
+precision and recall at your configured threshold, precision/recall across the
+whole threshold range, how many labelled matches each cascade gate removed, and
+the individual images it got most wrong with their axis scores.
+
+Two more things it can do:
+
+```bash
+python scripts/evaluate.py --manifest labels.csv --compare run.json
+python scripts/evaluate.py --manifest labels.csv --sweep person_threshold --sweep-values 0.3,0.4,0.5
+```
+
+`--compare` reports what a change did to the numbers and exits non-zero if
+anything moved beyond `--tolerance`. `--sweep` re-runs the corpus for each value
+of a setting and prints one row per value, so a threshold can be chosen from a
+table instead of a guess. It only accepts scoring settings (`--help` lists them);
+the backend, model, prompts, pipeline, VLM, plugins and the age gate are not
+sweepable.
+
+Active learning is off by default, so a run measures the prompts and the cascade
+themselves and repeats identically; `--use-learning` measures what a user with
+labels sees instead. The manifest and your images stay wherever you keep them —
+nothing is copied into the repository — and scanning writes the usual
+`.bikini_scanner_cache/` beside the images, so later runs reuse the embeddings.
+
 ## Optional ONNX backend
 
 The default backend is `clip-torch`. If you want to export and use the optional
