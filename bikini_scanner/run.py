@@ -121,6 +121,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         return 2
     store = FolderStore(folder)
     from .clip_backend import get_backend
+
     backend = get_backend(config)
     scorer = BikiniScorer(backend, config)
     cancel_event = threading.Event()
@@ -170,7 +171,9 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
             {
                 "path": path,
                 "filename": Path(path).name,
-                "score": float(cast(float, sample.get("score", state.scores[state_index] if state_index >= 0 else 0.0))),
+                "score": float(
+                    cast(float, sample.get("score", state.scores[state_index] if state_index >= 0 else 0.0))
+                ),
                 "zero_shot_score": float(state.zero_shot_scores[state_index] if state_index >= 0 else 0.0),
                 "axis_scores": axes,
                 "label": labels.get(path),

@@ -47,6 +47,7 @@ class RestrictedUnpickler(pickle.Unpickler):
             raise pickle.UnpicklingError(f"Refusing to unpickle {module}.{name}")
         return super().find_class(module, name)
 
+
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".heic", ".heif"}
 MATCHES_DIR_NAME = "bikini_matches"
 SCAN_METADATA_FILENAME = "scan_metadata.json"
@@ -232,6 +233,9 @@ class FolderStore:
                     discarded.append(path.name)
             except OSError as exc:
                 LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
+        if self.sqlite_cache is not None:
+            # Recreate the schema after Unix permits unlinking the open database.
+            self.sqlite_cache = SQLiteCache(self.cache_db_path)
         self._embedding_cache = None
         self._path_index_cache = None
         self._face_count_cache = None
@@ -434,9 +438,7 @@ class FolderStore:
         dropped = 0
         for path, record in records.items():
             embedding = record.get("embedding")
-            if isinstance(embedding, np.ndarray) and (
-                embedding.ndim != 1 or embedding.shape[0] != int(embedding_dim)
-            ):
+            if isinstance(embedding, np.ndarray) and (embedding.ndim != 1 or embedding.shape[0] != int(embedding_dim)):
                 dropped += 1
                 continue
             kept[path] = record
@@ -450,9 +452,7 @@ class FolderStore:
             )
         return kept
 
-    def get_cached_embeddings(
-        self, paths: Iterable[Path], embedding_dim: int | None = None
-    ) -> dict[Path, np.ndarray]:
+    def get_cached_embeddings(self, paths: Iterable[Path], embedding_dim: int | None = None) -> dict[Path, np.ndarray]:
         return {
             path: cast(np.ndarray, record["embedding"])
             for path, record in self.get_cached_image_records(paths, embedding_dim).items()

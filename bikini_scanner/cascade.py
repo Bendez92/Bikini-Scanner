@@ -114,9 +114,7 @@ class RegionScoreTable:
     axis_scores: dict[str, np.ndarray]
     image_count: int
     full_row: np.ndarray = field(default_factory=lambda: np.empty((0,), dtype=np.int64))
-    _axis_masks: dict[str, tuple[np.ndarray, np.ndarray]] | None = field(
-        init=False, default=None, repr=False
-    )
+    _axis_masks: dict[str, tuple[np.ndarray, np.ndarray]] | None = field(init=False, default=None, repr=False)
 
     def _ensure_masks(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
         if self._axis_masks is None:

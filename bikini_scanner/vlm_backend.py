@@ -128,9 +128,7 @@ class VLMClient:
         self.concurrency = max(1, min(int(concurrency), VLM_MAX_CONCURRENCY))
         self._cancel_event: Event | None = None
         if not self._is_loopback(parsed.netloc):
-            LOGGER.warning(
-                "VLM endpoint %s is not on localhost; images will leave this machine", base_url
-            )
+            LOGGER.warning("VLM endpoint %s is not on localhost; images will leave this machine", base_url)
 
     @staticmethod
     def _is_loopback(netloc: str) -> bool:

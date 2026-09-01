@@ -10,18 +10,24 @@ performance work done on it.
 2. **Embed** — `clip_backend.ClipBackend` runs each image through CLIP
    (`openai/clip-vit-base-patch32`) to get a 512-dim L2-normalized vector. Text
    prompts (positive/negative) are embedded once per session.
-3. **Cache** — embeddings are persisted per-folder in
-   `.bikini_scanner_cache/embeddings.npz`, keyed by a hash of
-   `path + mtime + size`, so re-scans skip re-embedding unchanged files.
-4. **Score** — `scorer.BikiniScorer`:
-   - *Zero-shot*: cosine sim to positive vs negative prompts → sigmoid.
-   - *Active learning*: once ≥6 labels exist with both classes, a
-     `LogisticRegression` is trained on the CLIP vectors; final score =
-     `0.7*classifier + 0.3*zero_shot`.
-5. **Sample** — `bucketed_sampling` shows only the borderline images:
+3. **Cache** — embeddings are persisted in
+   `.bikini_scanner_cache/cache.db`, keyed by content hash. SQLite stores
+   `embeddings`, `image_records`, `face_counts`, and `region_embeddings`;
+   legacy NPZ/JSON caches are migrated once.
+4. **Deep pass** — Candidate images are re-scored on face-anchored or fallback
+   body-region crops, with crop geometry and face counts cached alongside the
+   embeddings.
+5. **Score** — `scorer.BikiniScorer` combines zero-shot similarity with active
+   learning. `linear_model.py` provides the logistic regression, and the
+   learned model's share of the final score is its measured cross-validated AUC
+   rather than a fixed weight.
+6. **Cascade and adjudication** — `cascade.py` applies people, female-subject,
+   and age-exclusion gates before combining detail axes. Optional VLM
+   adjudication provides a second opinion for eligible borderline images.
+7. **Sample** — `bucketed_sampling` shows only the borderline images:
    *Uncertain* (closest to threshold), *Likely false positive*, *Likely false
    negative*.
-6. **GUI** — Tkinter renders cards; labeling triggers an automatic retrain.
+8. **GUI** — Tkinter renders cards; labeling triggers an automatic retrain.
 
 ## How it uses the hardware
 
@@ -31,8 +37,8 @@ performance work done on it.
 - **Threads.** PyTorch uses intra-op threads for the matmuls; PIL releases the
   GIL during decode, so image decoding can run on worker threads in parallel
   with inference.
-- **Disk.** The embedding cache is the only significant disk I/O; labels are a
-  small JSON file.
+- **Disk.** The SQLite embedding cache is the significant persistent scan I/O;
+  labels and scan metadata are stored as small per-folder records.
 - **Memory.** Embeddings are tiny (200 images ≈ 0.4 MB of float32), so the
   working set is dominated by the model weights (~600 MB) and decoded image
   batches.
@@ -53,7 +59,7 @@ performance work done on it.
 
 ### Active-learning loop (the per-click hot path)
 - **Fast in-memory rescore**: labeling used to re-glob the folder, re-read the
-  cache, and rewrite the whole embedding archive on *every* Good/Bad click. Now,
+  cache, and rewrite cached embeddings on *every* Good/Bad click. Now,
   when the image set is unchanged, it reuses the in-memory embeddings and only
   reloads labels, retrains the classifier, and re-samples — no folder walk, no
   image decode, no embedding disk I/O.
@@ -63,9 +69,11 @@ performance work done on it.
 ### Caching subsystem
 - **In-memory label cache** in `FolderStore` (labels were re-read from disk once
   per card on every render).
-- **Write-only-when-changed** embeddings, and **uncompressed `np.savez`**
-  instead of `savez_compressed` (compression cost dominated for these tiny
-  arrays). Old compressed caches still load.
+- **SQLite cache** in `.bikini_scanner_cache/cache.db`, with
+  `embeddings`, `image_records`, `face_counts`, and `region_embeddings` tables
+  keyed by content hash.
+- **One-shot legacy migration** imports the former NPZ/JSON cache files into
+  SQLite; the old cache format is retained only for migration.
 
 ### GUI
 - **Thumbnail cache**: decoded 400×400 `PhotoImage`s are cached by path and
@@ -73,6 +81,14 @@ performance work done on it.
   of re-decoding from disk each time. Cleared when the folder changes.
 
 ### Numerical
+
+- Zero-shot sigmoid uses `linear_model.sigmoid`, a branch-on-sign implementation that
+  cannot overflow. scikit-learn and scipy were dropped entirely (~96 MB of binaries in
+  the packaged build) in favour of `linear_model.py`, which implements the logistic
+  regression, standardisation, Platt calibration, stratified folds, and ROC AUC this
+  app actually used — verified against the originals before the swap
+  (values unchanged).
+
 ## Packaged build size
 
 Measured on the v1.2.0 build (`dist/BikiniScannerApp`, then the Inno Setup output):
@@ -103,14 +119,7 @@ stayed fine:
 Still large and not reducible without losing features: torch (364 MB) and OpenCV
 (82 MB, one monolithic `.pyd`; removing it would remove face-anchored regions).
 
-- Zero-shot sigmoid uses `linear_model.sigmoid`, a branch-on-sign implementation that
-  cannot overflow. scikit-learn and scipy were dropped entirely (~96 MB of binaries in
-  the packaged build) in favour of `linear_model.py`, which implements the logistic
-  regression, standardisation, Platt calibration, stratified folds, and ROC AUC this
-  app actually used — verified against the originals before the swap
-  (values unchanged).
-
-## Benchmark (200 synthetic images, CPU)
+## Benchmark (200 synthetic images, CPU; measured on the pre-SQLite build)
 
 | Path | Before | After | Improvement |
 |------|--------|-------|-------------|

@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # The pip manifest is requirements.txt at the repository root.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

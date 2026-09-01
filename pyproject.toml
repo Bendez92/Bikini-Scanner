@@ -37,6 +37,7 @@ dev = [
     "ruff>=0.6,<1",
     "mypy>=1.11,<2",
     "pytest>=8.0,<9",
+    "coverage>=7,<8",
 ]
 
 [project.scripts]
@@ -94,5 +95,6 @@ exclude = "^(dist|build)/"
 
 [[tool.mypy.overrides]]
 module = "numpy.*"
-# NumPy 2.x stubs use Python 3.12+ `type` syntax that mypy --python-version 3.10 cannot parse.
+# Mypy checks the Python 3.12 CI leg because NumPy 2.x stubs use Python 3.12+
+# `type` syntax that prevents parsing under the 3.10 support-floor setting.
 follow_imports = "skip"
