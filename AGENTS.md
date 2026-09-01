@@ -5,8 +5,8 @@ Bikini Scanner Tkinter desktop app.
 
 ## Repository
 
-- **Path**: `C:\Users\Ben\Desktop\bikini-scanner`
-- **Python**: 3.12 (virtual environment at `.venv`)
+- **Path**: repository root / clone location
+- **Python**: 3.10 and 3.12 (virtual environment at `.venv`)
 - **Shell**: PowerShell 7 (`C:\Program Files\PowerShell\7\pwsh.exe`)
 
 ## Verification
@@ -14,18 +14,25 @@ Bikini Scanner Tkinter desktop app.
 Run these before committing to `main`:
 
 ```powershell
+.venv\Scripts\python.exe -m ruff check bikini_scanner scripts tests
+.venv\Scripts\python.exe -m ruff format --check bikini_scanner scripts tests
+.venv\Scripts\python.exe -m mypy bikini_scanner
+.venv\Scripts\python.exe -m coverage run --source=bikini_scanner -m pytest
+.venv\Scripts\python.exe -m coverage report -m --fail-under=40
 .venv\Scripts\python.exe tests\test_functional.py
-.venv\Scripts\python.exe -m ruff check bikini_scanner tests scripts
-.venv\Scripts\mypy bikini_scanner
 .venv\Scripts\python.exe scripts\score_baseline.py --compare tests\baseline_scores.json
+.venv\Scripts\python.exe scripts\check_lockfile.py
 ```
 
 Expected outcomes:
 
-- 89 functional tests pass.
+- The suite passes with no failures or errors.
 - Ruff reports `All checks passed!`.
+- Ruff's format check passes.
 - Mypy reports `Success: no issues found in ... source files`.
+- Coverage reports at least 40%.
 - Baseline reports `Baseline matches ...`.
+- The lockfile check reports that the lockfile satisfies the requirements.
 
 Tests default to `tests.fake_backend.FakeBackend` unless
 `BIKINI_SCANNER_REAL_BACKEND=1` is set. The fake backend is deterministic and

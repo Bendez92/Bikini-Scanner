@@ -228,9 +228,10 @@ installed automatically.
 
 ```bash
 PYTHONPATH=. python tests/test_functional.py
+PYTHONPATH=. python -m pytest
 ```
 
-35 end-to-end checks covering the scan pipeline and caching, the cascade gates
+The end-to-end suite covers the scan pipeline and caching, the cascade gates
 (including that age-excluded images are forced to zero and stay invisible), the
 learning loop and its cross-folder store, the numpy learning primitives, review
 sampling, export/report/metadata output, configuration round-tripping, and
