@@ -74,6 +74,7 @@ ignore = [
 # that reads them, so its imports cannot come first.
 "tests/*" = ["E402"]
 "scripts/score_baseline.py" = ["E402"]
+"scripts/evaluate.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
