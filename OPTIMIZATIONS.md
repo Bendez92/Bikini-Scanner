@@ -10,7 +10,7 @@ performance work done on it.
 2. **Embed** — `clip_backend.ClipBackend` runs each image through CLIP
    (`openai/clip-vit-base-patch32`) to get a 512-dim L2-normalized vector. Text
    prompts (positive/negative) are embedded once per session.
-3. **Cache** - embeddings are persisted in
+3. **Cache** — embeddings are persisted in
    `.bikini_scanner_cache/cache.db`, keyed by content hash. SQLite stores
    `embeddings`, `image_records`, `face_counts`, and `region_embeddings`;
    legacy NPZ/JSON caches are migrated once.
@@ -82,9 +82,12 @@ performance work done on it.
 
 ### Numerical
 
-- Zero-shot sigmoid uses `linear_model.sigmoid`, a branch-on-sign implementation
-  that cannot overflow. The project also uses `linear_model.py` for logistic
-  regression, standardisation, Platt calibration, stratified folds, and ROC AUC.
+- Zero-shot sigmoid uses `linear_model.sigmoid`, a branch-on-sign implementation that
+  cannot overflow. scikit-learn and scipy were dropped entirely (~96 MB of binaries in
+  the packaged build) in favour of `linear_model.py`, which implements the logistic
+  regression, standardisation, Platt calibration, stratified folds, and ROC AUC this
+  app actually used — verified against the originals before the swap
+  (values unchanged).
 
 ## Packaged build size
 

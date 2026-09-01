@@ -5,8 +5,8 @@ Bikini Scanner Tkinter desktop app.
 
 ## Repository
 
-- **Path**: repository root / clone location
-- **Python**: 3.10 and 3.12 (virtual environment at `.venv`)
+- **Python**: 3.10 and 3.12 are supported and both are tested in CI (virtual
+  environment at `.venv` in the clone root)
 - **Shell**: PowerShell 7 (`C:\Program Files\PowerShell\7\pwsh.exe`)
 
 ## Verification
