@@ -7,31 +7,24 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-LOGGER = logging.getLogger(__name__)
+from .prompts import (
+    DEFAULT_PROMPT_SET,
+    AxisConfig,
+    PromptSpec,
+    available_prompt_sets,
+    load_prompt_set,
+)
 
-PromptSpec = str | tuple[str, float]
+LOGGER = logging.getLogger(__name__)
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 DEFAULT_BACKEND = "clip-torch"
 DEFAULT_MODEL_NAME = "openai/clip-vit-base-patch32"
 DEFAULT_DEVICE = "auto"
 DEFAULT_PRECISION = "auto"
-DEFAULT_BIKINI_POSITIVE_PROMPTS = [
-    "a person wearing a bikini",
-    "a woman in a bikini top and bikini bottom",
-    "a person with a bare midriff and exposed stomach",
-    "a person in swimwear at the beach or pool",
-]
-DEFAULT_BIKINI_NEGATIVE_PROMPTS = [
-    "a fully clothed person",
-    "a landscape photo",
-    "a photo of food",
-    "an indoor scene with no people",
-    "a close-up of an object",
-    "lingerie and intimate apparel",
-    "underwear and bra and panties",
-    "a sports bra and athletic wear",
-    "a man in swim trunks",
-]
+_DEFAULT_PROMPT_SET = load_prompt_set()
+DEFAULT_BIKINI_POSITIVE_PROMPTS = list(_DEFAULT_PROMPT_SET.positive)
+DEFAULT_BIKINI_NEGATIVE_PROMPTS = list(_DEFAULT_PROMPT_SET.negative)
 # Compatibility aliases for callers that imported the original names.
 DEFAULT_POSITIVE_PROMPTS = DEFAULT_BIKINI_POSITIVE_PROMPTS
 DEFAULT_NEGATIVE_PROMPTS = DEFAULT_BIKINI_NEGATIVE_PROMPTS
@@ -117,15 +110,6 @@ DEFAULT_DETAIL_WEIGHTS = {
     "bikini_bottom": 0.7,
 }
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-@dataclass(slots=True)
-class AxisConfig:
-    positive: list[PromptSpec]
-    negative: list[PromptSpec]
-    aggregation: str = "weighted_mean"
-
 
 @dataclass(slots=True)
 class ScannerConfig:
@@ -135,11 +119,15 @@ class ScannerConfig:
     precision: str = DEFAULT_PRECISION
     quantize_cpu: bool = DEFAULT_QUANTIZE_CPU
     preload_backend: bool = DEFAULT_PRELOAD_BACKEND
+    # No cache invalidation is needed: _embedding_namespace/_region_namespace identify
+    # image embeddings by model, text embeddings are computed per run, and VLM prompts
+    # have their own VLM_PROMPT_VERSION.
+    prompt_set: str = DEFAULT_PROMPT_SET
     # These top-level fields remain for settings/import compatibility. Primary
     # scoring uses the canonical "bikini" axis below.
     positive_prompts: list[str] = field(default_factory=lambda: list(DEFAULT_BIKINI_POSITIVE_PROMPTS))
     negative_prompts: list[str] = field(default_factory=lambda: list(DEFAULT_BIKINI_NEGATIVE_PROMPTS))
-    axis_prompts: dict[str, AxisConfig] = field(default_factory=lambda: _default_axis_prompts())
+    axis_prompts: dict[str, AxisConfig] = field(default_factory=lambda: load_prompt_set().axes)
     batch_size: int = DEFAULT_BATCH_SIZE
     threshold: float = DEFAULT_THRESHOLD
     zero_shot_scale: float = DEFAULT_ZERO_SHOT_SCALE
@@ -199,6 +187,20 @@ class ScannerConfig:
         config.precision = _coerce_choice(mapping.get("precision"), config.precision, {"auto", "fp32", "fp16"})
         config.quantize_cpu = _coerce_bool(mapping.get("quantize_cpu"), config.quantize_cpu)
         config.preload_backend = _coerce_bool(mapping.get("preload_backend"), config.preload_backend)
+        raw_prompt_set = mapping.get("prompt_set")
+        current_prompt_set = config.prompt_set
+        config.prompt_set = _coerce_choice(raw_prompt_set, config.prompt_set, set(available_prompt_sets()))
+        if config.prompt_set != current_prompt_set:
+            prompt_set = load_prompt_set(config.prompt_set)
+            config.positive_prompts = list(prompt_set.positive)
+            config.negative_prompts = list(prompt_set.negative)
+            config.axis_prompts = prompt_set.axes
+        if (
+            raw_prompt_set is not None
+            and config.prompt_set == DEFAULT_PROMPT_SET
+            and (not isinstance(raw_prompt_set, str) or raw_prompt_set.strip() != DEFAULT_PROMPT_SET)
+        ):
+            LOGGER.warning("Ignoring invalid prompt set %r; using %r", raw_prompt_set, config.prompt_set)
         config.positive_prompts = _coerce_list(mapping.get("positive_prompts"), config.positive_prompts)
         config.negative_prompts = _coerce_list(mapping.get("negative_prompts"), config.negative_prompts)
         axis_mapping = mapping.get("axis_prompts")
@@ -286,174 +288,6 @@ class ScannerConfig:
         )
         config.detail_weights = _coerce_weights(mapping.get("detail_weights"), config.detail_weights)
         return config
-
-
-def _default_axis_prompts() -> dict[str, AxisConfig]:
-    """Prompt ensembles for every cascade axis.
-
-    Each axis is scored as (positive evidence - negative evidence), so the negatives
-    matter as much as the positives: they are the confusions this axis must not make.
-    More prompts per axis is generally better — CLIP zero-shot accuracy improves
-    measurably with ensembling, and the cost is one text embedding computed at startup.
-    """
-    return {
-        "bikini": AxisConfig(
-            positive=list(DEFAULT_BIKINI_POSITIVE_PROMPTS),
-            negative=list(DEFAULT_BIKINI_NEGATIVE_PROMPTS),
-            aggregation="max",
-        ),
-        "bikini_top": AxisConfig(
-            positive=[
-                "a woman wearing a bikini top",
-                "a photo of a swimsuit top",
-                "a close-up of a bikini top",
-                "a woman in a string bikini top",
-                "a bandeau swim top",
-            ],
-            negative=[
-                "a fully clothed person",
-                "a t-shirt",
-                "a blouse or dress",
-                "a bra under clothing",
-                "a photo with no people",
-                "a sports bra and athletic tank top",
-                "a compression shirt and workout top",
-                "lingerie and intimate apparel",
-                "underwear and a bra",
-            ],
-        ),
-        "bikini_bottom": AxisConfig(
-            positive=[
-                "a woman wearing bikini bottoms",
-                "a photo of a swimsuit bottom",
-                "a close-up of bikini bottoms",
-                "a woman in a two-piece swimsuit",
-            ],
-            negative=[
-                "a fully clothed person",
-                "pants or jeans",
-                "shorts",
-                "a long skirt or dress",
-                "a photo with no people",
-                "a man in swim trunks",
-                "a man in board shorts",
-                "lingerie and intimate apparel",
-                "underwear and panties",
-            ],
-        ),
-        "midriff": AxisConfig(
-            positive=[
-                "a woman with a bare midriff",
-                "an exposed stomach and navel",
-                "a crop top showing the stomach",
-                "a close-up of a bare waist",
-                "a woman showing her bare belly",
-            ],
-            negative=[
-                "a fully clothed person",
-                "a covered stomach",
-                "a shirt tucked into trousers",
-                "a landscape photo",
-                "a photo with no people",
-                "a sports bra and athletic wear",
-                "yoga clothing and workout clothes",
-                "a gym outfit and exercise top",
-            ],
-        ),
-        "cleavage": AxisConfig(
-            positive=[
-                "a woman showing cleavage",
-                "a low-cut top revealing cleavage",
-                "a close-up of a woman's chest in a bikini top",
-                "a woman in a revealing neckline",
-                "visible cleavage between the breasts",
-            ],
-            negative=[
-                "a fully covered chest",
-                "a person in a turtleneck or crew neck",
-                "a man's bare chest",
-                "a photo with no people",
-                "a landscape photo",
-            ],
-        ),
-        "nsfw": AxisConfig(
-            positive=[
-                "a nude person",
-                "explicit nudity",
-                "sexually explicit content",
-                "a topless woman",
-            ],
-            negative=[
-                "a person in swimwear",
-                "a fully clothed person",
-                "a casual outdoor photo",
-                "a person in underwear",
-            ],
-        ),
-        "person": AxisConfig(
-            positive=[
-                "a photo of a person",
-                "a person in the scene",
-                "a human subject",
-                "a group of people",
-                "a portrait photograph",
-            ],
-            negative=[
-                "a photo with no people",
-                "an empty scene",
-                "a landscape photo",
-                "a photo of food",
-                "a screenshot of text",
-            ],
-            aggregation="max",
-        ),
-        "female": AxisConfig(
-            positive=[
-                "a photo of a woman",
-                "a female person",
-                "a woman's face",
-                "a lady posing for a photo",
-            ],
-            negative=[
-                "a photo of a man",
-                "a male person",
-                "a man's face",
-                "a photo with no people",
-            ],
-        ),
-        # The age gate reads these two together: high "child" or low "adult" both exclude.
-        "child": AxisConfig(
-            positive=[
-                "a photo of a young child",
-                "a photo of a little kid",
-                "a photo of a toddler",
-                "a photo of a baby",
-                "a photo of a preteen child",
-                "a primary school child",
-            ],
-            negative=[
-                "a photo of an adult",
-                "a photo of a grown woman",
-                "a photo of a middle-aged person",
-                "a photo with no people",
-            ],
-            aggregation="max",
-        ),
-        "adult": AxisConfig(
-            positive=[
-                "a photo of an adult woman",
-                "a grown adult person",
-                "a woman in her twenties",
-                "a mature adult face",
-            ],
-            negative=[
-                "a photo of a child",
-                "a photo of a young kid",
-                "a photo of a baby",
-                "a photo with no people",
-            ],
-        ),
-    }
 
 
 def _coerce_str(value: Any, default: str) -> str:
@@ -574,6 +408,7 @@ def _coerce_bool(value: Any, default: bool) -> bool:
 #   strongly_minor_threshold,
 #   face_anchored_margin,
 #   weak_adult_detail - the age gate itself
+#   prompt_set       - swaps the age gate's prompts wholesale
 #   axis_prompts     - can redefine the "child"/"adult" axes and hollow out the age gate
 #   global_learning,
 #   max_learning_weight - writes to cross-folder state shared with every other folder

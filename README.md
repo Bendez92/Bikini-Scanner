@@ -34,6 +34,19 @@ excluding: it fires on absolute child evidence, on a child reading that outweigh
 adult reading, and on missing adult evidence for anything that would otherwise be a
 match. It can be tuned or switched off in Settings.
 
+### Prompt sets
+
+The scanner's accuracy model is recorded as versioned prompt sets under
+`bikini_scanner/data/prompts/`. The built-in `default` set contains positive and
+negative prompts for every required axis: `bikini`, `bikini_top`, `bikini_bottom`,
+`midriff`, `cleavage`, `nsfw`, `person`, `female`, `child`, and `adult`.
+
+To add a set, copy `default.json`, give it a new `name`, bump its `version`, and
+keep non-empty positive and negative lists plus all required axes. Only prompt sets
+packaged with the application can be selected. This prevents a downloaded or shared
+folder from replacing the age-gate prompts with untrusted data. This unit exposes
+selection through configuration files; there is no GUI prompt-set picker yet.
+
 ## Requirements
 
 - Python 3.10 or newer (developed and packaged on 3.12)

@@ -69,6 +69,7 @@ hiddenimports = sorted(
 
 datas = [
     (str(ROOT / "assets"), "assets"),
+    (str(ROOT / "bikini_scanner" / "data"), "bikini_scanner/data"),
     *pillow_datas,
     *pillow_heif_datas,
     *psutil_datas,
