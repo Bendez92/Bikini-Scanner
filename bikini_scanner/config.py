@@ -189,18 +189,17 @@ class ScannerConfig:
         config.preload_backend = _coerce_bool(mapping.get("preload_backend"), config.preload_backend)
         raw_prompt_set = mapping.get("prompt_set")
         current_prompt_set = config.prompt_set
-        config.prompt_set = _coerce_choice(raw_prompt_set, config.prompt_set, set(available_prompt_sets()))
+        prompt_set_names = set(available_prompt_sets())
+        config.prompt_set = _coerce_choice(raw_prompt_set, config.prompt_set, prompt_set_names)
+        if raw_prompt_set is not None and not (
+            isinstance(raw_prompt_set, str) and raw_prompt_set.strip() in prompt_set_names
+        ):
+            LOGGER.warning("Ignoring invalid prompt set %r; using %r", raw_prompt_set, config.prompt_set)
         if config.prompt_set != current_prompt_set:
             prompt_set = load_prompt_set(config.prompt_set)
             config.positive_prompts = list(prompt_set.positive)
             config.negative_prompts = list(prompt_set.negative)
             config.axis_prompts = prompt_set.axes
-        if (
-            raw_prompt_set is not None
-            and config.prompt_set == DEFAULT_PROMPT_SET
-            and (not isinstance(raw_prompt_set, str) or raw_prompt_set.strip() != DEFAULT_PROMPT_SET)
-        ):
-            LOGGER.warning("Ignoring invalid prompt set %r; using %r", raw_prompt_set, config.prompt_set)
         config.positive_prompts = _coerce_list(mapping.get("positive_prompts"), config.positive_prompts)
         config.negative_prompts = _coerce_list(mapping.get("negative_prompts"), config.negative_prompts)
         axis_mapping = mapping.get("axis_prompts")
