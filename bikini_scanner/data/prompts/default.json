@@ -1,0 +1,193 @@
+{
+  "name": "default",
+  "version": 1,
+  "positive_prompts": [
+    "a person wearing a bikini",
+    "a woman in a bikini top and bikini bottom",
+    "a person with a bare midriff and exposed stomach",
+    "a person in swimwear at the beach or pool"
+  ],
+  "negative_prompts": [
+    "a fully clothed person",
+    "a landscape photo",
+    "a photo of food",
+    "an indoor scene with no people",
+    "a close-up of an object",
+    "lingerie and intimate apparel",
+    "underwear and bra and panties",
+    "a sports bra and athletic wear",
+    "a man in swim trunks"
+  ],
+  "axes": {
+    "bikini": {
+      "positive": [
+        "a person wearing a bikini",
+        "a woman in a bikini top and bikini bottom",
+        "a person with a bare midriff and exposed stomach",
+        "a person in swimwear at the beach or pool"
+      ],
+      "negative": [
+        "a fully clothed person",
+        "a landscape photo",
+        "a photo of food",
+        "an indoor scene with no people",
+        "a close-up of an object",
+        "lingerie and intimate apparel",
+        "underwear and bra and panties",
+        "a sports bra and athletic wear",
+        "a man in swim trunks"
+      ],
+      "aggregation": "max"
+    },
+    "bikini_top": {
+      "positive": [
+        "a woman wearing a bikini top",
+        "a photo of a swimsuit top",
+        "a close-up of a bikini top",
+        "a woman in a string bikini top",
+        "a bandeau swim top"
+      ],
+      "negative": [
+        "a fully clothed person",
+        "a t-shirt",
+        "a blouse or dress",
+        "a bra under clothing",
+        "a photo with no people",
+        "a sports bra and athletic tank top",
+        "a compression shirt and workout top",
+        "lingerie and intimate apparel",
+        "underwear and a bra"
+      ]
+    },
+    "bikini_bottom": {
+      "positive": [
+        "a woman wearing bikini bottoms",
+        "a photo of a swimsuit bottom",
+        "a close-up of bikini bottoms",
+        "a woman in a two-piece swimsuit"
+      ],
+      "negative": [
+        "a fully clothed person",
+        "pants or jeans",
+        "shorts",
+        "a long skirt or dress",
+        "a photo with no people",
+        "a man in swim trunks",
+        "a man in board shorts",
+        "lingerie and intimate apparel",
+        "underwear and panties"
+      ]
+    },
+    "midriff": {
+      "positive": [
+        "a woman with a bare midriff",
+        "an exposed stomach and navel",
+        "a crop top showing the stomach",
+        "a close-up of a bare waist",
+        "a woman showing her bare belly"
+      ],
+      "negative": [
+        "a fully clothed person",
+        "a covered stomach",
+        "a shirt tucked into trousers",
+        "a landscape photo",
+        "a photo with no people",
+        "a sports bra and athletic wear",
+        "yoga clothing and workout clothes",
+        "a gym outfit and exercise top"
+      ]
+    },
+    "cleavage": {
+      "positive": [
+        "a woman showing cleavage",
+        "a low-cut top revealing cleavage",
+        "a close-up of a woman's chest in a bikini top",
+        "a woman in a revealing neckline",
+        "visible cleavage between the breasts"
+      ],
+      "negative": [
+        "a fully covered chest",
+        "a person in a turtleneck or crew neck",
+        "a man's bare chest",
+        "a photo with no people",
+        "a landscape photo"
+      ]
+    },
+    "nsfw": {
+      "positive": [
+        "a nude person",
+        "explicit nudity",
+        "sexually explicit content",
+        "a topless woman"
+      ],
+      "negative": [
+        "a person in swimwear",
+        "a fully clothed person",
+        "a casual outdoor photo",
+        "a person in underwear"
+      ]
+    },
+    "person": {
+      "positive": [
+        "a photo of a person",
+        "a person in the scene",
+        "a human subject",
+        "a group of people",
+        "a portrait photograph"
+      ],
+      "negative": [
+        "a photo with no people",
+        "an empty scene",
+        "a landscape photo",
+        "a photo of food",
+        "a screenshot of text"
+      ],
+      "aggregation": "max"
+    },
+    "female": {
+      "positive": [
+        "a photo of a woman",
+        "a female person",
+        "a woman's face",
+        "a lady posing for a photo"
+      ],
+      "negative": [
+        "a photo of a man",
+        "a male person",
+        "a man's face",
+        "a photo with no people"
+      ]
+    },
+    "child": {
+      "positive": [
+        "a photo of a young child",
+        "a photo of a little kid",
+        "a photo of a toddler",
+        "a photo of a baby",
+        "a photo of a preteen child",
+        "a primary school child"
+      ],
+      "negative": [
+        "a photo of an adult",
+        "a photo of a grown woman",
+        "a photo of a middle-aged person",
+        "a photo with no people"
+      ],
+      "aggregation": "max"
+    },
+    "adult": {
+      "positive": [
+        "a photo of an adult woman",
+        "a grown adult person",
+        "a woman in her twenties",
+        "a mature adult face"
+      ],
+      "negative": [
+        "a photo of a child",
+        "a photo of a young kid",
+        "a photo of a baby",
+        "a photo with no people"
+      ]
+    }
+  }
+}

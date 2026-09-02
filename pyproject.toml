@@ -45,6 +45,9 @@ bikini-scanner = "bikini_scanner.run:main"
 [tool.setuptools]
 packages = ["bikini_scanner"]
 
+[tool.setuptools.package-data]
+bikini_scanner = ["data/prompts/*.json"]
+
 [tool.setuptools.dynamic]
 version = { attr = "bikini_scanner.__version__.__version__" }
 
