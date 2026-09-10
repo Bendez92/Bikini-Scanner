@@ -180,7 +180,11 @@ def _cross_validated_auc(
                 return None
             return float(roc_auc(labels[scored], predictions[scored]))
         return float(roc_auc(labels, predictions))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # An unmeasurable AUC is normal early on (too few labels of one class), but it
+        # also decides how much influence the learned model earns, so a fit that fails
+        # for some *other* reason quietly caps the model at the unmeasured default.
+        LOGGER.debug("Cross-validated AUC unavailable at C=%s: %s", c_value, exc)
         return None
 
 
@@ -239,7 +243,10 @@ def _calibrate(
             return estimator
         estimator.fit(features[train_index], y_train, init_coef=init_coef, init_intercept=init_intercept)
         return PlattCalibrator(model=estimator).fit(features[calibration_index], y_calibration)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # Falling back to the uncalibrated model is the right behaviour, but it changes
+        # what the scores mean, so it should not happen invisibly.
+        LOGGER.info("Probability calibration failed; using the uncalibrated model: %s", exc)
         estimator.fit(features, labels, init_coef=init_coef, init_intercept=init_intercept)
         return estimator
 

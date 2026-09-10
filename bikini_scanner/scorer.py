@@ -98,6 +98,52 @@ class ScoreState:
     detail_regions: list[str] = field(default_factory=list)
     refine: RefineResult | None = None
 
+    def __post_init__(self) -> None:
+        """Every field here is indexed by image position, so they must agree in length.
+
+        Nothing used to check that. A mismatch is not a crash, it is silently wrong
+        output: the consumers zip these together, so a short array quietly truncates the
+        results, drops images from the grid, or pairs a path with another image's score.
+        This turns "impossible state" back into an exception at the point it is created,
+        which is the only place the cause is still visible.
+
+        Optional fields are allowed to be None (not computed for this pipeline) and the
+        list fields to be empty (the legacy pipeline fills none of them), but anything
+        actually populated has to be the right length.
+        """
+        count = len(self.paths)
+        problems: list[str] = []
+
+        def row_count(value: object) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, np.ndarray):
+                return int(value.shape[0]) if value.ndim else None
+            if isinstance(value, list):
+                return len(value)
+            return None
+
+        # Always populated, so an empty one is itself a mismatch.
+        for name in ("embeddings", "zero_shot_scores", "scores"):
+            found = row_count(getattr(self, name))
+            if found is not None and found != count:
+                problems.append(f"{name} has {found} rows, expected {count}")
+        # Optional: absent is fine, wrong-length is not.
+        for name in ("face_counts", "detail_embeddings", "excluded", "features"):
+            found = row_count(getattr(self, name))
+            if found is not None and found and found != count:
+                problems.append(f"{name} has {found} rows, expected {count}")
+        for name in ("cascade_stage", "cascade_reason", "detail_regions"):
+            found = len(getattr(self, name))
+            if found and found != count:
+                problems.append(f"{name} has {found} entries, expected {count}")
+        for axis, values in self.axis_scores.items():
+            found = row_count(values)
+            if found is not None and found != count:
+                problems.append(f"axis_scores[{axis!r}] has {found} rows, expected {count}")
+        if problems:
+            raise ValueError(f"ScoreState is inconsistent for {count} image(s): " + "; ".join(problems))
+
 
 class ScanCancelled(Exception):
     """Raised when a cooperative scan cancellation was requested."""
@@ -595,7 +641,7 @@ class BikiniScorer:
         owner_array: np.ndarray = np.asarray(owner, dtype=np.int64)
         kinds = np.array([region_kind(key) for key in region_keys], dtype=object)
         full_row: np.ndarray = np.zeros((image_count,), dtype=np.int64)
-        for row, (image_index, key) in enumerate(zip(owner_array, region_keys, strict=False)):
+        for row, (image_index, key) in enumerate(zip(owner_array, region_keys, strict=True)):
             if key == FULL_REGION:
                 full_row[int(image_index)] = row
         return RegionScoreTable(
@@ -671,12 +717,12 @@ class BikiniScorer:
         store = self._global_store()
         if store is not None:
             signature = hashlib.sha1(
-                json.dumps(sorted(zip(local_paths, local_labels, strict=False)), separators=(",", ":")).encode("utf-8")
+                json.dumps(sorted(zip(local_paths, local_labels, strict=True)), separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             if signature != self._global_signature:
                 try:
                     store.record(
-                        zip(local_paths, local_labels, local_rows, strict=False),
+                        zip(local_paths, local_labels, local_rows, strict=True),
                         sequence=int(datetime.now(timezone.utc).timestamp()),
                     )
                     # A cleared label must stop teaching the model.
@@ -690,7 +736,7 @@ class BikiniScorer:
         if store is not None:
             known = set(local_paths)
             pooled = store.training_set(expected_dim=int(features.shape[1]))
-            for row, label, path in zip(pooled.features, pooled.labels, pooled.paths, strict=False):
+            for row, label, path in zip(pooled.features, pooled.labels, pooled.paths, strict=True):
                 if str(path) in known:
                     continue
                 train_rows.append(np.asarray(row, dtype=np.float32))
@@ -782,7 +828,7 @@ class BikiniScorer:
         count = len(list(paths))
 
         if self.config.pipeline == "legacy":
-            embeddings_by_path = dict(zip(paths, embeddings, strict=False))
+            embeddings_by_path = dict(zip(paths, embeddings, strict=True))
             label_count = self.train_classifier(embeddings_by_path, labels, store=store)
             axis_scores = self.axis_zero_shot_scores(embeddings)
             scores = np.asarray(self.final_scores(embeddings, axis_scores=axis_scores), dtype=np.float32)
@@ -908,11 +954,11 @@ class BikiniScorer:
             raise ScanCancelled
         visible_mask = self.state_visibility(new_state)
         samples = bucketed_sampling(
-            [path for path, include in zip(new_state.paths, visible_mask, strict=False) if include],
-            [score for score, include in zip(new_state.scores, visible_mask, strict=False) if include],
+            [path for path, include in zip(new_state.paths, visible_mask, strict=True) if include],
+            [score for score, include in zip(new_state.scores, visible_mask, strict=True) if include],
             labels.keys(),
             embeddings=[
-                embedding for embedding, include in zip(new_state.embeddings, visible_mask, strict=False) if include
+                embedding for embedding, include in zip(new_state.embeddings, visible_mask, strict=True) if include
             ],
             threshold=threshold,
             disagreement=state_disagreement(new_state, visible_mask),
@@ -931,7 +977,7 @@ def state_disagreement(state: ScoreState, visible_mask: np.ndarray) -> list[floa
     if scores.shape != zero_shot.shape:
         return []
     gaps = np.abs(scores - zero_shot)
-    return [float(gap) for gap, include in zip(gaps, visible_mask, strict=False) if include]
+    return [float(gap) for gap, include in zip(gaps, visible_mask, strict=True) if include]
 
 
 @dataclass(slots=True)
@@ -1103,7 +1149,7 @@ def run_deep_pass(
     if pending_crops:
         crop_images = [crop for _, _, crop in pending_crops]
         vectors = backend.embed_pil_images(crop_images)
-        for (index, key, _), vector in zip(pending_crops, vectors, strict=False):
+        for (index, key, _), vector in zip(pending_crops, vectors, strict=True):
             vector = np.asarray(vector, dtype=np.float32)
             owner.append(index)
             region_keys.append(key)
@@ -1115,7 +1161,7 @@ def run_deep_pass(
             # same order; images with no content hash are skipped here rather than being
             # left out of one of the three lists.
             for (index, key, _crop), content_hash, vector in zip(
-                pending_crops, pending_meta, vectors, strict=False
+                pending_crops, pending_meta, vectors, strict=True
             ):
                 if not content_hash:
                     continue
@@ -1286,7 +1332,7 @@ def compute_vlm_scores(
         except VLMCancelled:
             # A cancellation is the user's own signal, not an error worth chaining.
             raise ScanCancelled from None
-        for position, response in zip(uncached_positions, responses, strict=False):
+        for position, response in zip(uncached_positions, responses, strict=True):
             if not response:
                 continue
             cached[position] = response
@@ -1440,7 +1486,7 @@ def bucketed_sampling(
     )
     scored = [
         {"path": str(path), "score": float(score), "index": index}
-        for index, (path, score) in enumerate(zip(paths, scores, strict=False))
+        for index, (path, score) in enumerate(zip(paths, scores, strict=True))
         if str(path) not in labeled_set
     ]
 
@@ -1700,7 +1746,11 @@ def _scan_and_score_folder_impl(
             elif scorer.config.enable_face_detection:
                 try:
                     face_count = detect_face_count(open_oriented(path))
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    # None means "unknown", which the age gate handles - but a detector
+                    # failing on every image would silently downgrade the gate to
+                    # whole-frame reasoning with nothing said about it.
+                    LOGGER.warning("Face detection failed for %s: %s", path, exc)
                     face_count = None
                 if face_count is not None:
                     content_face_counts[content_hash] = face_count
@@ -1760,7 +1810,7 @@ def _scan_and_score_folder_impl(
         if hash_to_image:
             _check_cancelled()
             batch_embeddings = backend.embed_pil_images(list(hash_to_image.values()))
-            for content_hash, embedding in zip(hash_to_image.keys(), batch_embeddings, strict=False):
+            for content_hash, embedding in zip(hash_to_image.keys(), batch_embeddings, strict=True):
                 content_embeddings[content_hash] = embedding
                 if scorer.config.enable_face_detection and content_hash not in content_face_counts:
                     source_image = hash_to_image.get(content_hash)
@@ -1768,7 +1818,8 @@ def _scan_and_score_folder_impl(
                     if source_image is not None:
                         try:
                             face_count = detect_face_count(source_image)
-                        except Exception:  # noqa: BLE001
+                        except Exception as exc:  # noqa: BLE001
+                            LOGGER.warning("Face detection failed for %s: %s", content_hash, exc)
                             face_count = None
                     if face_count is not None:
                         content_face_counts[content_hash] = face_count
@@ -1938,18 +1989,18 @@ def _scan_and_score_folder_impl(
             refine=refine,
         )
     visible_mask = scorer.state_visibility(state)
-    visible_paths = [path for path, include in zip(state.paths, visible_mask, strict=False) if include]
-    visible_scores = [score for score, include in zip(state.scores, visible_mask, strict=False) if include]
+    visible_paths = [path for path, include in zip(state.paths, visible_mask, strict=True) if include]
+    visible_scores = [score for score, include in zip(state.scores, visible_mask, strict=True) if include]
     samples = bucketed_sampling(
         visible_paths,
         visible_scores,
         labels.keys(),
-        embeddings=[embedding for embedding, include in zip(state.embeddings, visible_mask, strict=False) if include],
+        embeddings=[embedding for embedding, include in zip(state.embeddings, visible_mask, strict=True) if include],
         threshold=threshold,
         disagreement=state_disagreement(state, visible_mask),
     )
     for idx, (image_record, score, zero_shot_score, image_path) in enumerate(
-        zip(image_records, state.scores, state.zero_shot_scores, state.paths, strict=False)
+        zip(image_records, state.scores, state.zero_shot_scores, state.paths, strict=True)
     ):
         image_record.update(
             {

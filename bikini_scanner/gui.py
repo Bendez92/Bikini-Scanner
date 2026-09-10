@@ -1836,8 +1836,12 @@ class BikiniScannerApp:
         self.user_prefs = payload
         try:
             save_user_prefs(payload)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception:
+            # This carries the scanner settings now, not just window state, so a failure
+            # here loses everything the user configured. Not worth interrupting them
+            # mid-session over, but it must not vanish without trace: "my settings keep
+            # resetting" is unanswerable when the write failed in silence.
+            LOGGER.exception("Could not save preferences to %s", prefs_path())
 
     def _thumbnail_cache_limit(self) -> int:
         try:
@@ -2286,8 +2290,8 @@ class BikiniScannerApp:
     def _save_last_folder(self, folder: str) -> None:
         try:
             atomic_write_json(LAST_FOLDER_STATE_PATH, {"folder": folder})
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Could not record the last folder in %s: %s", LAST_FOLDER_STATE_PATH, exc)
 
     def _resume_last_folder_if_any(self) -> None:
         if self.folder_var.get().strip():
@@ -2350,8 +2354,10 @@ class BikiniScannerApp:
             return
         try:
             self.store.save_review_session(self._session_payload())
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # Losing this only costs your place in the queue, so it stays non-fatal —
+            # but a read-only folder failing every write should be findable in the log.
+            LOGGER.warning("Could not save the review session for %s: %s", self.store.folder, exc)
 
     def _restore_review_session(self) -> None:
         if self.store is None:
@@ -2399,7 +2405,7 @@ class BikiniScannerApp:
         counts["unlabeled"] = unlabeled
         quality = None
         if self.scorer is not None:
-            embeddings_by_path = dict(zip(self.current_state.paths, self.current_state.embeddings, strict=False))
+            embeddings_by_path = dict(zip(self.current_state.paths, self.current_state.embeddings, strict=True))
             quality = self.scorer.estimate_quality(embeddings_by_path, labels)
         if record_history and quality is not None:
             self.quality_history.append(quality)
@@ -2929,7 +2935,7 @@ class BikiniScannerApp:
         mask = self._result_visibility_mask()
         return [
             path
-            for path, score, include in zip(self.current_state.paths, self.current_state.scores, mask, strict=False)
+            for path, score, include in zip(self.current_state.paths, self.current_state.scores, mask, strict=True)
             if include and score >= threshold
         ]
 
@@ -2939,10 +2945,10 @@ class BikiniScannerApp:
         if self.scorer is None:
             return self.current_samples
         mask = self._result_visibility_mask()
-        paths = [path for path, include in zip(self.current_state.paths, mask, strict=False) if include]
-        scores = [score for score, include in zip(self.current_state.scores, mask, strict=False) if include]
+        paths = [path for path, include in zip(self.current_state.paths, mask, strict=True) if include]
+        scores = [score for score, include in zip(self.current_state.scores, mask, strict=True) if include]
         embeddings = [
-            embedding for embedding, include in zip(self.current_state.embeddings, mask, strict=False) if include
+            embedding for embedding, include in zip(self.current_state.embeddings, mask, strict=True) if include
         ]
         labels = self.store.load_labels().keys() if self.store is not None else []
         return bucketed_sampling(
@@ -3515,7 +3521,7 @@ class BikiniScannerApp:
             return []
         ranked: list[tuple[str, float]] = []
         for _index, (path, embedding, include) in enumerate(
-            zip(self.current_state.paths, self.current_state.embeddings, visibility, strict=False)
+            zip(self.current_state.paths, self.current_state.embeddings, visibility, strict=True)
         ):
             if not include or path == anchor_path:
                 continue
@@ -3738,7 +3744,7 @@ class BikiniScannerApp:
             visible_mask = self._result_visibility_mask()
             ranked = [
                 (path, float(score))
-                for path, score, include in zip(self.current_state.paths, scores, visible_mask, strict=False)
+                for path, score, include in zip(self.current_state.paths, scores, visible_mask, strict=True)
                 if include
             ]
             ranked.sort(key=lambda item: item[1], reverse=True)
@@ -5563,7 +5569,7 @@ class BikiniScannerApp:
         # 14 photos across the threshold" is the only honest proof that Accept/REJECT
         # reached the model; a bare "Scan complete" is not.
         previous_scores = (
-            dict(zip(self.current_state.paths, self.current_state.scores, strict=False))
+            dict(zip(self.current_state.paths, self.current_state.scores, strict=True))
             if self.current_state is not None
             else {}
         )
@@ -5581,7 +5587,7 @@ class BikiniScannerApp:
         threshold = float(self.threshold_var.get())
         visible_mask = self._result_visibility_mask()
         matches = sum(
-            1 for score, include in zip(state.scores, visible_mask, strict=False) if include and score >= threshold
+            1 for score, include in zip(state.scores, visible_mask, strict=True) if include and score >= threshold
         )
         if full_rescan:
             LOGGER.info(
@@ -5690,7 +5696,7 @@ class BikiniScannerApp:
         visible_mask = self._result_visibility_mask()
         matches = sum(
             1
-            for score, include in zip(self.current_state.scores, visible_mask, strict=False)
+            for score, include in zip(self.current_state.scores, visible_mask, strict=True)
             if include and score >= threshold
         )
         # This folder's own labels, not the pooled cross-folder total: the count beside
@@ -7098,7 +7104,7 @@ class BikiniScannerApp:
         mask = self._result_visibility_mask()
         return sum(
             1
-            for path, include in zip(self.current_state.paths, mask, strict=False)
+            for path, include in zip(self.current_state.paths, mask, strict=True)
             if include and labels.get(str(path)) is None
         )
 
@@ -7179,7 +7185,7 @@ class BikiniScannerApp:
         learning_text = state.learning_summary or "no model yet"
         moved = 0
         if previous_scores:
-            for path, score in zip(state.paths, state.scores, strict=False):
+            for path, score in zip(state.paths, state.scores, strict=True):
                 before = previous_scores.get(str(path))
                 if before is None:
                     continue
@@ -7858,7 +7864,7 @@ class BikiniScannerApp:
         if self.current_state is None:
             return {}
         return {
-            path: float(score) for path, score in zip(self.current_state.paths, self.current_state.scores, strict=False)
+            path: float(score) for path, score in zip(self.current_state.paths, self.current_state.scores, strict=True)
         }
 
     def _label_map(self) -> dict[str, int]:

@@ -380,7 +380,7 @@ class SQLiteCache:
                 by_path[row[0]] = (row[1], row[2], row[3], self._blob_to_array(row[4]))
         cached: dict[Path, dict[str, object]] = {}
         # Zipped against the strings computed above rather than resolving a second time.
-        for path, resolved in zip(paths, path_strings, strict=False):
+        for path, resolved in zip(paths, path_strings, strict=True):
             entry = by_path.get(resolved)
             if entry is None:
                 continue

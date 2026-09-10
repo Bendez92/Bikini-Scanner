@@ -16,6 +16,7 @@ to check that a change behaves the same way against real embeddings.
 
 from __future__ import annotations
 
+import ast
 import io
 import json
 import logging
@@ -3436,6 +3437,118 @@ class SourcesAreCleanUtf8(unittest.TestCase):
                 if replacement in raw.decode("utf-8", errors="replace"):
                     damaged.append(f"{path.name}: mojibake")
         self.assertEqual(damaged, [])
+
+
+class ParallelSequencesFailLoudly(unittest.TestCase):
+    """The structural fix: a length mismatch must raise, not truncate.
+
+    The core types are bundles of positionally-coupled sequences. Every consumer zips
+    them together, so a short one used to quietly drop images, pair a path with another
+    image's score, or - as happened in the region cache - write one image's embedding
+    under another's key and persist it.
+    """
+
+    def test_every_zip_in_the_package_is_strict(self) -> None:
+        package = Path(__file__).resolve().parents[1] / "bikini_scanner"
+        lax: list[str] = []
+        for path in sorted(package.rglob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                    continue
+                if node.func.id != "zip":
+                    continue
+                strict = next((k for k in node.keywords if k.arg == "strict"), None)
+                ok = (
+                    strict is not None
+                    and isinstance(strict.value, ast.Constant)
+                    and strict.value.value is True
+                )
+                if not ok:
+                    lax.append(f"{path.name}:{node.lineno}")
+        self.assertEqual(lax, [], "zip() without strict=True silently truncates on mismatch")
+
+    def test_score_state_rejects_a_short_array(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            ScoreState(
+                paths=["a", "b", "c"],
+                embeddings=np.zeros((3, 4), dtype=np.float32),
+                zero_shot_scores=np.zeros(3, dtype=np.float32),
+                scores=np.zeros(2, dtype=np.float32),  # one short
+                axis_scores={},
+                face_counts=None,
+                classifier_trained=False,
+                classifier_label_count=0,
+            )
+        self.assertIn("scores", str(caught.exception))
+
+    def test_score_state_rejects_a_mismatched_axis(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            ScoreState(
+                paths=["a", "b"],
+                embeddings=np.zeros((2, 4), dtype=np.float32),
+                zero_shot_scores=np.zeros(2, dtype=np.float32),
+                scores=np.zeros(2, dtype=np.float32),
+                axis_scores={"bikini": np.zeros(5, dtype=np.float32)},
+                face_counts=None,
+                classifier_trained=False,
+                classifier_label_count=0,
+            )
+        self.assertIn("bikini", str(caught.exception))
+
+    def test_score_state_still_allows_the_legitimate_shapes(self) -> None:
+        """Optional fields absent, list fields empty, and the browse-mode zero-width case."""
+        ScoreState(
+            paths=["a", "b"],
+            embeddings=np.zeros((2, 0), dtype=np.float32),  # browse mode: no embeddings
+            zero_shot_scores=np.zeros(2, dtype=np.float32),
+            scores=np.zeros(2, dtype=np.float32),
+            axis_scores={},
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(2, dtype=bool),
+        )
+        ScoreState(
+            paths=[],
+            embeddings=np.zeros((0, 512), dtype=np.float32),
+            zero_shot_scores=np.zeros(0, dtype=np.float32),
+            scores=np.zeros(0, dtype=np.float32),
+            axis_scores={},
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+        )
+
+    def test_region_table_rejects_mismatched_rows(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            cascade.RegionScoreTable(
+                owner=np.zeros(3, dtype=np.int64),
+                kinds=np.array(["full", "full"], dtype=object),  # one short
+                axis_scores={"bikini": np.zeros(3, dtype=np.float32)},
+                image_count=1,
+            )
+        self.assertIn("kinds", str(caught.exception))
+
+    def test_region_table_rejects_a_mismatched_axis(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            cascade.RegionScoreTable(
+                owner=np.zeros(2, dtype=np.int64),
+                kinds=np.array(["full", "full"], dtype=object),
+                axis_scores={"bikini": np.zeros(7, dtype=np.float32)},
+                image_count=1,
+            )
+        self.assertIn("bikini", str(caught.exception))
+
+    def test_region_table_allows_a_table_with_no_subject_attribution(self) -> None:
+        """Tables built before per-person attribution leave `subject` empty."""
+        cascade.RegionScoreTable(
+            owner=np.zeros(2, dtype=np.int64),
+            kinds=np.array(["full", "face"], dtype=object),
+            axis_scores={"bikini": np.zeros(2, dtype=np.float32)},
+            image_count=1,
+            full_row=np.zeros(1, dtype=np.int64),
+        )
 
 
 def _cleanup() -> None:

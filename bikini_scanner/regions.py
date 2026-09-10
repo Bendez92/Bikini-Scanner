@@ -11,11 +11,14 @@ for the body below it. With no faces, it falls back to fixed bands of the frame.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .vision_analysis import FaceBox
+
+LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from PIL import Image
@@ -149,7 +152,11 @@ def crop_regions(image: Image.Image, regions: Sequence[ImageRegion]) -> list[tup
             continue
         try:
             crops.append((region.key, image.crop(region.box)))
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            # A dropped crop is a quiet loss of evidence for that image - and for the
+            # age gate, a dropped face crop is the difference between a readable
+            # subject and an unaged one. Worth a line even though it is not fatal.
+            LOGGER.warning("Could not crop region %s at %s: %s", region.key, region.box, exc)
             continue
     return crops
 

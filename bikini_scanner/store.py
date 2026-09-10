@@ -628,7 +628,20 @@ class FolderStore:
         try:
             with self.classifier_path.open("rb") as handle:
                 payload = RestrictedUnpickler(handle).load()
-        except Exception:  # noqa: BLE001
+        except pickle.UnpicklingError as exc:
+            # RestrictedUnpickler refusing a class is a trust-boundary event: this file
+            # lives inside the scanned folder, so a refusal means something in there
+            # tried to have us import it. It was being discarded in complete silence,
+            # which is the one case that should leave a trace.
+            LOGGER.warning(
+                "Refused to load the classifier cache in %s: %s. The folder is scanned "
+                "normally; the model is retrained from your labels instead.",
+                self.cache_dir,
+                exc,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.info("Ignoring an unreadable classifier cache in %s: %s", self.cache_dir, exc)
             return None
         if not isinstance(payload, dict):
             return None

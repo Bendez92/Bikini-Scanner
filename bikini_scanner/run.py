@@ -253,7 +253,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
     visible_mask = scorer.state_visibility(state)
     visible_matches = [
         path
-        for path, score, include in zip(state.paths, state.scores, visible_mask, strict=False)
+        for path, score, include in zip(state.paths, state.scores, visible_mask, strict=True)
         if include and float(score) >= threshold
     ]
     visible_match_set = set(visible_matches)
@@ -302,7 +302,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
             writer.writeheader()
             for record in records:
                 writer.writerow({key: record[key] for key in writer.fieldnames})
-    scores = {path: float(score) for path, score in zip(state.paths, state.scores, strict=False)}
+    scores = {path: float(score) for path, score in zip(state.paths, state.scores, strict=True)}
     if args.html_report:
         axis_scores = {
             path: {

@@ -126,6 +126,33 @@ class RegionScoreTable:
         init=False, default=None, repr=False
     )
 
+    def __post_init__(self) -> None:
+        """`owner`, `kinds`, `subject` and every axis are indexed by row, together.
+
+        `aggregate` scatters scores through `owner` and masks them through `kinds`, so a
+        length mismatch does not raise - it reads the wrong rows, or silently ignores
+        the tail. Checking at construction is what makes that a reportable error rather
+        than a quietly wrong score.
+        """
+        rows = int(self.owner.shape[0]) if self.owner.ndim else 0
+        problems: list[str] = []
+        if len(self.kinds) != rows:
+            problems.append(f"kinds has {len(self.kinds)} entries, expected {rows}")
+        # subject is empty for tables built before per-person attribution existed.
+        if self.subject.size and int(self.subject.shape[0]) != rows:
+            problems.append(f"subject has {int(self.subject.shape[0])} entries, expected {rows}")
+        if self.full_row.size and int(self.full_row.shape[0]) != int(self.image_count):
+            problems.append(
+                f"full_row has {int(self.full_row.shape[0])} entries, expected one per image "
+                f"({int(self.image_count)})"
+            )
+        for axis, values in self.axis_scores.items():
+            found = int(np.asarray(values).shape[0]) if np.asarray(values).ndim else 0
+            if found != rows:
+                problems.append(f"axis_scores[{axis!r}] has {found} rows, expected {rows}")
+        if problems:
+            raise ValueError(f"RegionScoreTable is inconsistent for {rows} row(s): " + "; ".join(problems))
+
     def subject_ids(self) -> np.ndarray:
         """Per-row subject index, or all -1 when this table has no attribution."""
         if self.subject.size == self.owner.size:
