@@ -95,6 +95,47 @@ Vertical space is the scarce resource; several things exist only to defend it.
   for judging a photo.
 
 
+## Deciding More Than One Photo At Once
+
+80 000 photos cannot be reviewed one at a time, so there are three widths of decision
+and they must stay distinguishable:
+
+- **One card.** `set_label`.
+- **A selection.** `selected_paths`, built by `click_card` with the file-manager rules:
+  plain click collapses, Ctrl-click toggles, Shift-click takes the range from
+  `_selection_anchor` in *page order*. `_decision_targets` is the single place that
+  turns "what was clicked" into "what gets decided", and it follows the same rule a
+  file manager does: a decision aimed inside the selection takes the selection, aimed
+  outside it takes only that card. No confirmation — the set is on screen and outlined.
+  `_prune_selection` runs on every page rebuild, because a selection that outlived its
+  page would decide photos the reviewer can no longer see.
+- **Everything shown.** `mark_all_shown`, which reaches across pages and therefore *does*
+  confirm, and the band actions in `_band_actions`.
+
+Selection is drawn as a **border**, never a background: each card line paints its own
+background, so a third card colour would need a third copy of every label style.
+`_frame_style` is still the one rule, and selection outranks focus and fading in it.
+
+## Bursts
+
+`FolderStore.duplicate_groups` is byte-identical files. `duplicates.near_duplicate_groups`
+is the same *shot* — eight frames of one pose, no two files alike, all wanting one
+verdict. Exact comparison is 3.2 billion pairs at 80 000 photos, so it is random-projection
+LSH over the embeddings: `BANDS` signatures of `BITS` bits each, only same-signature
+vectors compared properly, survivors merged with a union-find (so a long burst joins up
+even when its first and last frames never pair directly). `MAX_BUCKET` caps a degenerate
+bucket rather than letting it reintroduce the quadratic blow-up.
+
+`DEFAULT_THRESHOLD` is deliberately strict (0.97): a false group applies a verdict to a
+photo nobody looked at. Measured at 80 000 photos it takes ~25 s, so `ensure_near_duplicates`
+runs it on a worker thread and nothing waits on it — decisions made before it lands
+simply do not expand.
+
+The expansion itself (`_expand_to_duplicates`) is **off by default** and behind a named
+checkbox, because one click deciding eight photos has to be something the reviewer
+turned on. The card says `1 of N near-identical` either way: it is the reason to switch
+it on, and once on it is the only warning that one keystroke is about to decide a burst.
+
 ## Four Views, and What a Card Says
 
 The results grid answers four different questions and `view_mode` names which one:

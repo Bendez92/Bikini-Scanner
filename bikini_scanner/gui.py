@@ -54,6 +54,7 @@ from .config_profiles import (
     save_profile,
     without_secrets,
 )
+from .duplicates import near_duplicate_groups
 from .global_store import GlobalLearningStore
 from .image_formats import heif_supported, open_oriented, oriented_size
 from .logging_setup import configure_logging, log_path, read_log_tail
@@ -320,6 +321,9 @@ class BikiniScannerApp:
         # instead of re-rendering the same page. Off, every view keeps showing what you
         # already judged, which is what made the queue look stuck.
         self.hide_decided_var = BooleanVar(value=bool(self.user_prefs.get("hide_decided", True)))
+        # Off by default: it multiplies one click into several, and that has to be
+        # something the reviewer turned on knowing what it does.
+        self.near_duplicate_var = BooleanVar(value=bool(self.user_prefs.get("apply_to_near_duplicates", False)))
         self.output_organization_var = StringVar(value=str(self.user_prefs.get("output_organization", "flat")))
         self.output_template_var = StringVar(value=str(self.user_prefs.get("output_template", "{stem}")))
         self.output_duplicate_var = StringVar(value=str(self.user_prefs.get("output_duplicate", "rename")))
@@ -352,6 +356,18 @@ class BikiniScannerApp:
         self._path_index: dict[str, int] = {}
         self._path_index_state: ScoreState | None = None
         self.displayed_samples: list[dict[str, object]] = []
+        # Cards picked out for one bulk decision. Between "decide this photo" and
+        # "decide all 5 000 shown" there was nothing at all, which on a contact sheet
+        # holding twenty obvious rejects meant twenty separate clicks.
+        self.selected_paths: set[str] = set()
+        # Burst shots: one pose, eight frames, one verdict. path -> every photo in
+        # its group, built off the embeddings on demand because it is folder-sized
+        # work. Empty until asked for; `_near_duplicate_state` says what it is for.
+        self._near_duplicate_index: dict[str, list[str]] = {}
+        self._near_duplicate_state: ScoreState | None = None
+        self._near_duplicate_busy = False
+        # Where a Shift-click measures its range from.
+        self._selection_anchor: str | None = None
         # Bumped whenever `displayed_samples` is rebuilt, so anything derived from
         # that list can cache against it instead of walking the folder again.
         self._display_generation = 0
@@ -612,10 +628,10 @@ class BikiniScannerApp:
         self.preview_frame = ttk.Frame(self.workspace, padding=(10, 4, 10, 6))
         preview_buttons = ttk.Frame(self.preview_frame)
         preview_buttons.pack(side=BOTTOM, pady=(6, 0))
-        ttk.Button(preview_buttons, text="Accept (A)", width=14, command=lambda: self.label_focused_card(1)).pack(
+        ttk.Button(preview_buttons, text="Accept (A)", width=14, command=lambda: self.label_selection(1)).pack(
             side=LEFT, padx=(0, 8)
         )
-        ttk.Button(preview_buttons, text="REJECT (D)", width=14, command=lambda: self.label_focused_card(0)).pack(
+        ttk.Button(preview_buttons, text="REJECT (D)", width=14, command=lambda: self.label_selection(0)).pack(
             side=LEFT
         )
         self.preview_caption_label = ttk.Label(
@@ -752,6 +768,18 @@ class BikiniScannerApp:
             hide_decided,
             "Take a photo out of the grid as soon as you Accept, REJECT or Skip it, so the "
             "queue moves on. Untick to keep looking at what you have already judged.",
+        )
+        bursts = ttk.Checkbutton(
+            panel,
+            text="Apply decisions to near-duplicates",
+            variable=self.near_duplicate_var,
+            command=self._toggle_near_duplicates,
+        )
+        bursts.pack(side=TOP, anchor="w", pady=(2, 0))
+        self._tooltip(
+            bursts,
+            "Burst shots are the same photo several times over. With this on, deciding one "
+            "decides every near-identical copy of it — the card says how many that is.",
         )
         ttk.Checkbutton(
             panel, text="Only explicit (NSFW)", variable=self.nsfw_only_var, command=self._toggle_nsfw_only
@@ -1682,6 +1710,23 @@ class BikiniScannerApp:
         # the card stops looking like a surface and recedes, while its decision stays
         # legible. It never takes the accent match border — an undecided detection has
         # to be the thing that stands out.
+        # Selection is a border, not a background: the card lines each paint their own
+        # background, so changing the card colour under them would need a third copy of
+        # every label style. A thick accent border reads clearly and costs two styles.
+        style.configure(
+            "SelectedCard.TFrame",
+            background=palette["panel"],
+            bordercolor=palette["accent"],
+            relief="solid",
+            borderwidth=4,
+        )
+        style.configure(
+            "DimSelectedCard.TFrame",
+            background=palette["bg"],
+            bordercolor=palette["accent"],
+            relief="solid",
+            borderwidth=4,
+        )
         style.configure("DimCard.TFrame", background=palette["bg"])
         style.configure("FocusedDimCard.TFrame", background=palette["select_bg"])
         # VLM badge in the status bar: accent background so it reads as an active feature.
@@ -2040,6 +2085,7 @@ class BikiniScannerApp:
             "match_filter": self.match_filter_var.get(),
             "label_filter": self.label_filter_var.get(),
             "hide_decided": bool(self.hide_decided_var.get()),
+            "apply_to_near_duplicates": bool(self.near_duplicate_var.get()),
             "score_min": self.score_min_var.get().strip(),
             "score_max": self.score_max_var.get().strip(),
             "preview_share": round(self._preview_height_share(), 3),
@@ -2159,6 +2205,7 @@ class BikiniScannerApp:
         inspect_menu.add_command(label="Prompt tester", command=self.open_prompt_tester_dialog)
         inspect_menu.add_separator()
         inspect_menu.add_command(label="Duplicate groups", command=self.show_duplicate_groups)
+        inspect_menu.add_command(label="Near-duplicate groups", command=self.show_near_duplicate_groups)
         inspect_menu.add_command(label="Files that could not be read", command=self.show_skipped_files)
         inspect_menu.add_command(label="Recently trashed", command=self.show_trashed_files)
 
@@ -3413,6 +3460,7 @@ class BikiniScannerApp:
         pages = self._page_count()
         self.page_index = max(0, min(self.page_index, pages - 1))
         self.page_samples = self._hold_page_order(self._page_slice())
+        self._prune_selection()
         self._page_order = [str(sample["path"]) for sample in self.page_samples]
         if not keep_focus:
             # Turning a page moves the active picture onto that page, otherwise the
@@ -3658,6 +3706,13 @@ class BikiniScannerApp:
             parts.append(f"crop {state.detail_regions[index]}")
         if index < len(state.cascade_reason) and state.cascade_reason[index]:
             parts.append(f"— {state.cascade_reason[index]}")
+        # Say when a photo is one of a burst, and say it whether or not the expansion
+        # is switched on: it is the reason to switch it on, and once it is on it is
+        # the only warning that one click is about to decide eight photos.
+        group = self._duplicate_group(path)
+        if group:
+            marker = f"◆ 1 of {len(group)} near-identical"
+            parts.append(marker if self.near_duplicate_var.get() else f"{marker} (not linked)")
         return "  ".join(parts)
 
     def _match_score_for_path(self, path: str) -> float:
@@ -6205,6 +6260,8 @@ class BikiniScannerApp:
         self.root.bind_all("<KeyPress-2>", lambda event: self._handle_view_shortcut(event, self.show_detected_files))
         self.root.bind_all("<KeyPress-3>", lambda event: self._handle_view_shortcut(event, self.restore_review_view))
         self.root.bind_all("<KeyPress-4>", lambda event: self._handle_view_shortcut(event, self.show_decisions))
+        self.root.bind_all("<Escape>", self._handle_clear_selection_shortcut)
+        self.root.bind_all("<Control-a>", self._handle_select_all_shortcut)
         self.root.bind_all("<KeyPress-w>", self._handle_explain_shortcut)
         self.root.bind_all("<KeyPress-n>", self._handle_note_shortcut)
         self.root.bind_all("<BackSpace>", self._handle_back_shortcut)
@@ -6275,13 +6332,25 @@ class BikiniScannerApp:
     def _handle_label_shortcut(self, event, label: int) -> str:
         if self._focus_is_text_input():
             return ""
-        self.label_focused_card(label)
+        self.label_selection(label)
         return "break"
 
     def _handle_view_shortcut(self, event, switch) -> str:
         if self._focus_is_text_input():
             return ""
         switch()
+        return "break"
+
+    def _handle_clear_selection_shortcut(self, event) -> str:
+        if self._focus_is_text_input():
+            return ""
+        self.clear_selection()
+        return "break"
+
+    def _handle_select_all_shortcut(self, event) -> str:
+        if self._focus_is_text_input():
+            return ""
+        self.select_all_on_page()
         return "break"
 
     def _handle_explain_shortcut(self, event) -> str:
@@ -6357,6 +6426,190 @@ class BikiniScannerApp:
         self.focused_path = path
         self._apply_focus_visuals()
 
+    # --- near-duplicate bursts ----------------------------------------------
+    def _toggle_near_duplicates(self) -> None:
+        """React to the checkbox: build the groups, or forget the expansion."""
+        if self.near_duplicate_var.get():
+            self.ensure_near_duplicates()
+        else:
+            self.status_var.set("Decisions apply to one photo at a time again.")
+        self._render_samples()
+
+    def ensure_near_duplicates(self, force: bool = False) -> None:
+        """Group the folder's burst shots, off the main thread.
+
+        Comparing every photo with every other is 3.2 billion pairs at 80 000 photos,
+        so this is LSH over the embeddings (`duplicates.py`) — but even that is tens of
+        seconds on a folder that size, which is far too long to hold the UI for.
+        Decisions made before it lands simply do not expand; nothing waits on it.
+        """
+        state = self.current_state
+        if state is None or state.embeddings.size == 0:
+            return
+        if self._near_duplicate_busy:
+            return
+        if not force and self._near_duplicate_state is state:
+            return
+        self._near_duplicate_busy = True
+        self.status_var.set("Grouping near-identical photos…")
+        paths = list(state.paths)
+        embeddings = np.asarray(state.embeddings, dtype=np.float32)
+        generation = self._refresh_generation
+
+        def worker() -> None:
+            try:
+                groups = near_duplicate_groups(paths, embeddings)
+            except Exception as exc:
+                LOGGER.exception("Near-duplicate grouping failed")
+                self._after(0, lambda error=exc: self._near_duplicates_failed(error))
+                return
+            self._after(0, lambda found=groups, token=generation: self._near_duplicates_ready(found, state, token))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _near_duplicates_failed(self, error: Exception) -> None:
+        self._near_duplicate_busy = False
+        self.status_var.set(f"Could not group near-identical photos: {error}")
+
+    def _near_duplicates_ready(self, groups: list[list[str]], state: ScoreState, generation: int) -> None:
+        self._near_duplicate_busy = False
+        if self.current_state is not state:
+            # The folder or the scan moved on while this ran; the answer is for a
+            # state nobody is looking at any more.
+            return
+        index: dict[str, list[str]] = {}
+        for group in groups:
+            for path in group:
+                index[path] = group
+        self._near_duplicate_index = index
+        self._near_duplicate_state = state
+        copies = sum(len(group) for group in groups)
+        self.status_var.set(
+            f"{len(groups)} groups of near-identical photos covering {copies} images."
+            + (" Deciding one decides its group." if self.near_duplicate_var.get() else "")
+        )
+        self._render_samples()
+
+    def _duplicate_group(self, path: str) -> list[str]:
+        """Every photo sharing this one's shot, itself included."""
+        return self._near_duplicate_index.get(path, [])
+
+    def _expand_to_duplicates(self, paths: Sequence[str]) -> list[str]:
+        """Widen a decision to whole bursts, when the reviewer asked for that."""
+        if not self.near_duplicate_var.get() or not self._near_duplicate_index:
+            return list(paths)
+        expanded: list[str] = []
+        seen: set[str] = set()
+        for path in paths:
+            for member in self._duplicate_group(path) or [path]:
+                if member not in seen:
+                    seen.add(member)
+                    expanded.append(member)
+        return expanded
+
+    def show_near_duplicate_groups(self) -> None:
+        """Report the burst groups, and offer to build them if they are not ready."""
+        if self.current_state is None:
+            messagebox.showinfo("No results", "Run a scan first.")
+            return
+        if self._near_duplicate_state is not self.current_state:
+            self.ensure_near_duplicates()
+            messagebox.showinfo(
+                "Grouping near-identical photos",
+                "Working through the folder now — the status bar reports the groups when it lands.",
+            )
+            return
+        groups: list[list[str]] = []
+        seen: set[int] = set()
+        for group in self._near_duplicate_index.values():
+            if id(group) not in seen:
+                seen.add(id(group))
+                groups.append(group)
+        if not groups:
+            messagebox.showinfo("No near-duplicates", "No two photos in this folder are the same shot.")
+            return
+        copies = sum(len(group) for group in groups)
+        largest = max(len(group) for group in groups)
+        messagebox.showinfo(
+            "Near-duplicate groups",
+            f"{len(groups)} groups covering {copies} photos; the largest holds {largest}.\n\n"
+            f"Reviewing one photo per group instead of all of them is {copies - len(groups)} "
+            "fewer decisions.\n\nTick 'Apply decisions to near-duplicates' in Filters & view "
+            "to decide a whole group at once.",
+        )
+
+    # --- selection ----------------------------------------------------------
+    def click_card(self, path: str, extend: bool = False, toggle: bool = False) -> None:
+        """Focus a card, and maintain the selection the way a file list would.
+
+        Plain click collapses the selection to nothing and focuses; Ctrl-click adds
+        or removes one card; Shift-click takes everything between the anchor and here
+        in the order the grid is showing them.
+        """
+        order = [str(sample["path"]) for sample in self.page_samples]
+        if extend and self._selection_anchor in order and path in order:
+            first, last = sorted((order.index(self._selection_anchor), order.index(path)))
+            self.selected_paths = set(order[first : last + 1])
+        elif toggle:
+            self.selected_paths.symmetric_difference_update({path})
+            self._selection_anchor = path
+        else:
+            self.selected_paths = set()
+            self._selection_anchor = path
+        self.focused_path = path
+        self._apply_focus_visuals()
+        self._announce_selection()
+
+    def select_all_on_page(self) -> None:
+        self.selected_paths = {str(sample["path"]) for sample in self.page_samples}
+        if self.selected_paths and self._selection_anchor not in self.selected_paths:
+            self._selection_anchor = str(self.page_samples[0]["path"])
+        self._apply_focus_visuals()
+        self._announce_selection()
+
+    def clear_selection(self) -> None:
+        if not self.selected_paths:
+            return
+        self.selected_paths = set()
+        self._apply_focus_visuals()
+        self._announce_selection()
+
+    def _prune_selection(self) -> None:
+        """Drop anything no longer on the page. Called when the page is rebuilt.
+
+        A selection that outlived its page would apply a bulk decision to photos the
+        reviewer can no longer see, which is the one thing a bulk action must not do.
+        """
+        if not self.selected_paths:
+            return
+        on_page = {str(sample["path"]) for sample in self.page_samples}
+        self.selected_paths &= on_page
+
+    def _announce_selection(self) -> None:
+        count = len(self.selected_paths)
+        if count:
+            self.status_var.set(
+                f"{count} selected — A accepts, D rejects, S skips all {count}. Esc clears."
+            )
+
+    def _decision_targets(self, path: str | None = None) -> list[str]:
+        """Which photos one Accept/REJECT applies to.
+
+        A decision aimed at a card inside the selection takes the whole selection, the
+        way dragging one file out of a highlighted group takes the group. Aimed at a
+        card outside it, it takes just that card and the selection is left alone.
+        """
+        target = path or self.focused_path
+        if self.selected_paths and (target is None or target in self.selected_paths):
+            chosen = [
+                str(sample["path"])
+                for sample in self.page_samples
+                if str(sample["path"]) in self.selected_paths
+            ]
+        else:
+            chosen = [target] if target else []
+        return self._expand_to_duplicates(chosen)
+
     def _apply_focus_visuals(self) -> None:
         threshold = float(self.threshold_var.get())
         fades_decided = self.view_mode == "triage"
@@ -6367,7 +6620,9 @@ class BikiniScannerApp:
             focused = path == self.focused_path
             is_match = self.view_mode != "browse" and card.score >= threshold
             faded = fades_decided and labels.get(path) is not None
-            style = self._frame_style(matched=is_match, focused=focused, faded=faded)
+            style = self._frame_style(
+                matched=is_match, focused=focused, faded=faded, selected=path in self.selected_paths
+            )
             # Every other card on the page is being redrawn to exactly what it already
             # shows. Moving the focus only ever changes two cards.
             if card.focused == focused and card.style == style:
@@ -7424,14 +7679,14 @@ class BikiniScannerApp:
             # horizontal line, whatever the card width.
             primary = ttk.Frame(buttons)
             primary.grid(row=0, column=0, sticky="w", pady=(0, 4))
-            ttk.Button(primary, text="Accept", width=12, command=lambda: self.set_label(path, 1)).pack(
+            ttk.Button(primary, text="Accept", width=12, command=lambda: self.label_selection(1, path)).pack(
                 side=LEFT, padx=(0, 6)
             )
-            ttk.Button(primary, text="REJECT", width=12, command=lambda: self.set_label(path, 0)).pack(side=LEFT)
+            ttk.Button(primary, text="REJECT", width=12, command=lambda: self.label_selection(0, path)).pack(side=LEFT)
             # Six more buttons under Accept/REJECT cost a whole row of height on every
             # card, which is most of what was squeezing the grid. They live on the
             # card's context menu now, and behind one "More" button for discoverability.
-            ttk.Button(primary, text="Skip", width=8, command=lambda: self.set_label(path, 2)).pack(
+            ttk.Button(primary, text="Skip", width=8, command=lambda: self.label_selection(2, path)).pack(
                 side=LEFT, padx=(6, 0)
             )
             more = ttk.Button(primary, text="More \u25be", width=8)
@@ -7463,7 +7718,15 @@ class BikiniScannerApp:
             word = self._label_text(path) if labels is None else _LABEL_WORDS.get(labels.get(path), "unlabeled")
             label_label.configure(text=self._card_label_text(path, word), style=self._label_style(path, word))
         def _on_click(_event: object, candidate: str = path) -> None:
-            self.focus_path(candidate)
+            self.click_card(candidate)
+
+        def _on_shift_click(_event: object, candidate: str = path) -> str:
+            self.click_card(candidate, extend=True)
+            return "break"
+
+        def _on_control_click(_event: object, candidate: str = path) -> str:
+            self.click_card(candidate, toggle=True)
+            return "break"
 
         def _on_double_click(_event: object, candidate: str = path) -> None:
             self.view_image(candidate)
@@ -7471,7 +7734,10 @@ class BikiniScannerApp:
         card_menu = menu if show_actions else self._card_menu(path)
 
         def _on_right_click(event: object, target: Menu = card_menu) -> None:
-            self.focus_path(path)
+            # Right-clicking inside a selection keeps it, so the menu can act on the
+            # whole set; right-clicking outside collapses to the card under the cursor.
+            if path not in self.selected_paths:
+                self.click_card(path)
             try:
                 target.tk_popup(int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
             finally:
@@ -7489,6 +7755,8 @@ class BikiniScannerApp:
             details_label,
         ):
             widget.bind("<Button-1>", _on_click)
+            widget.bind("<Shift-Button-1>", _on_shift_click)
+            widget.bind("<Control-Button-1>", _on_control_click)
             widget.bind("<Double-Button-1>", _on_double_click)
             widget.bind("<Button-3>", _on_right_click)
         return photo
@@ -7649,19 +7917,24 @@ class BikiniScannerApp:
             matched=not browse and card.score >= threshold,
             focused=path == self.focused_path,
             faded=faded,
+            selected=path in self.selected_paths,
         )
         if card.style != frame_style:
             card.frame.configure(style=frame_style)
             card.style = frame_style
 
     @staticmethod
-    def _frame_style(matched: bool, focused: bool, faded: bool) -> str:
+    def _frame_style(matched: bool, focused: bool, faded: bool, selected: bool = False) -> str:
         """The one rule for what a card's frame looks like.
 
         Shared with `_apply_focus_visuals`, which sets the same property on the same
         widgets from the focus path; when the two disagreed about faded cards, moving
         the focus repainted a dimmed card as an undecided one.
         """
+        if selected:
+            # About to be decided in bulk, which outranks every other thing a card
+            # can be saying about itself.
+            return "DimSelectedCard.TFrame" if faded else "SelectedCard.TFrame"
         if faded:
             # No accent border on a photo already dealt with: an undecided detection
             # has to be the thing that stands out on the page.
@@ -7947,6 +8220,31 @@ class BikiniScannerApp:
         if self.focused_path is None:
             return
         self.set_label(self.focused_path, label)
+
+    def label_selection(self, label: int, path: str | None = None) -> None:
+        """Apply one decision to the selection, or to a single card when there is none.
+
+        No confirmation: the selection is on screen and highlighted, so the reviewer
+        can see exactly what they are about to decide — unlike "everything shown",
+        which reaches across pages and does ask. Ctrl+Z takes the whole batch back.
+        """
+        targets = self._decision_targets(path)
+        if not targets:
+            return
+        if len(targets) == 1:
+            self.set_label(targets[0], label)
+            return
+        verb = {1: "Accepted", 0: "REJECTED", 2: "Skipped"}.get(int(label), "Labelled")
+        picked = len(self.selected_paths) or 1
+        extra = len(targets) - picked
+        note = f" (+{extra} near-identical)" if extra > 0 else ""
+        self.selected_paths = set()
+        self._apply_label_batch(
+            dict.fromkeys(targets, int(label)),
+            status=f"{verb} {len(targets)} photos{note}.",
+            retrain=True,
+        )
+        self._apply_focus_visuals()
 
     def mark_all_shown(self, label: int) -> None:
         """Label every image currently on screen. Confirmed first — it is a bulk edit."""

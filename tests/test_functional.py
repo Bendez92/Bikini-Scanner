@@ -52,6 +52,7 @@ os.environ["USERPROFILE"] = str(_STATE_DIR)
 from bikini_scanner import (
     cascade,
     config_profiles,
+    duplicates,
     image_formats,
     learning,
     linear_model,
@@ -1616,6 +1617,114 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(len(counted), 1)
         self.assertIn("You:", self.app.stats_var.get())
 
+    def test_shift_click_selects_a_range_and_one_key_decides_it(self) -> None:
+        """Between "decide this photo" and "decide all 5 000" there was nothing."""
+        self._spread_scores()
+        self.app.show_all_results()
+        order = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.click_card(order[1])
+        self.app.click_card(order[3], extend=True)
+        self.assertEqual(self.app.selected_paths, set(order[1:4]))
+        for path in order[1:4]:
+            self.assertEqual(self.app.cards[path].style, "SelectedCard.TFrame")
+        self.app.label_selection(0)
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertTrue(all(labels.get(path) == 0 for path in order[1:4]))
+        self.assertIsNone(labels.get(order[0]), "the decision reached past the selection")
+        self.assertEqual(self.app.selected_paths, set(), "the selection outlived the decision")
+
+    def test_control_click_toggles_one_card_and_a_plain_click_clears(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        order = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.click_card(order[0])
+        self.app.click_card(order[2], toggle=True)
+        self.app.click_card(order[4], toggle=True)
+        self.assertEqual(self.app.selected_paths, {order[2], order[4]})
+        self.app.click_card(order[2], toggle=True)
+        self.assertEqual(self.app.selected_paths, {order[4]})
+        self.app.click_card(order[1])
+        self.assertEqual(self.app.selected_paths, set(), "a plain click left the selection standing")
+
+    def test_a_decision_aimed_outside_the_selection_takes_only_that_card(self) -> None:
+        """The file-manager rule: dragging a file outside a highlight takes just it."""
+        self._spread_scores()
+        self.app.show_all_results()
+        order = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.click_card(order[1])
+        self.app.click_card(order[3], extend=True)
+        self.app.label_selection(1, order[5])
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertEqual(labels.get(order[5]), 1)
+        self.assertTrue(all(labels.get(path) is None for path in order[1:4]))
+
+    def test_a_selection_never_outlives_the_page_it_was_made_on(self) -> None:
+        """A bulk decision must not reach photos the reviewer can no longer see."""
+        self._spread_scores()
+        self.app.page_size_var.set(20)
+        self.app.show_all_results()
+        self.app.select_all_on_page()
+        self.assertTrue(self.app.selected_paths)
+        self.app.current_samples = [
+            sample for sample in self.app.current_samples if str(sample["bucket"]) == "Detected"
+        ]
+        self.app._refresh_displayed_results()
+        on_page = {str(sample["path"]) for sample in self.app.page_samples}
+        self.assertTrue(self.app.selected_paths <= on_page, "the selection kept photos that left the page")
+
+    def test_escape_clears_the_selection(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        self.app.select_all_on_page()
+        self.app._handle_clear_selection_shortcut(None)
+        self.assertEqual(self.app.selected_paths, set())
+
+    def _link_a_burst(self) -> list[str]:
+        """Pretend the grouping pass found one burst among the folder's photos."""
+        group = self.paths[1:4]
+        self.app._near_duplicate_index = dict.fromkeys(group, group)
+        self.app._near_duplicate_state = self.app.current_state
+        return group
+
+    def test_deciding_one_of_a_burst_decides_the_burst_when_asked(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        group = self._link_a_burst()
+        self.app.near_duplicate_var.set(True)
+        self.app.click_card(group[0])
+        self.app.label_selection(1)
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertTrue(all(labels.get(path) == 1 for path in group), "the burst was not decided together")
+        self.assertIn("near-identical", self.app.status_var.get())
+
+    def test_the_burst_expansion_is_off_unless_switched_on(self) -> None:
+        """One click deciding eight photos has to be something you turned on."""
+        self._spread_scores()
+        self.app.show_all_results()
+        group = self._link_a_burst()
+        self.app.near_duplicate_var.set(False)
+        self.app.click_card(group[0])
+        self.app.label_selection(0)
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertEqual(labels.get(group[0]), 0)
+        self.assertTrue(all(labels.get(path) is None for path in group[1:]))
+
+    def test_a_card_says_it_is_one_of_a_burst_either_way(self) -> None:
+        """It is the reason to switch the expansion on, and the warning once it is."""
+        self._spread_scores()
+        self.app.show_all_results()
+        group = self._link_a_burst()
+        self.app.near_duplicate_var.set(False)
+        self.assertIn("not linked", self.app._axis_details_text(group[0]))
+        self.app.near_duplicate_var.set(True)
+        details = self.app._axis_details_text(group[0])
+        self.assertIn(f"1 of {len(group)} near-identical", details)
+        self.assertNotIn("not linked", details)
+
     def test_the_three_views_can_be_switched_from_the_keyboard(self) -> None:
         """Every other step of the review loop has a key; switching view did not."""
         self._decide_one_of_each()
@@ -1653,6 +1762,81 @@ class GuiReviewQueue(unittest.TestCase):
         buckets = {str(sample["path"]): str(sample["bucket"]) for sample in self.app.page_samples}
         self.assertEqual(buckets[self.paths[2]], "True positives")
         self.assertEqual(buckets[self.paths[3]], "False positives")
+
+
+class NearDuplicateGrouping(unittest.TestCase):
+    """Burst shots are one decision, not eight."""
+
+    @staticmethod
+    def _burst(base: np.ndarray, count: int, rng, spread: float = 0.005) -> list[np.ndarray]:
+        frames = [base]
+        for _ in range(count - 1):
+            noisy = base + rng.normal(scale=spread, size=base.shape).astype(np.float32)
+            frames.append(noisy / np.linalg.norm(noisy))
+        return frames
+
+    def _folder(self, sizes: list[int], rng, dim: int = 64) -> tuple[list[str], np.ndarray, dict[str, int]]:
+        paths: list[str] = []
+        rows: list[np.ndarray] = []
+        shot_of: dict[str, int] = {}
+        for shot, count in enumerate(sizes):
+            base = rng.normal(size=dim).astype(np.float32)
+            base /= np.linalg.norm(base)
+            for frame, vector in enumerate(self._burst(base, count, rng)):
+                path = f"shot{shot:02d}_{frame}.jpg"
+                paths.append(path)
+                rows.append(vector)
+                shot_of[path] = shot
+        return paths, np.vstack(rows).astype(np.float32), shot_of
+
+    def test_a_burst_becomes_one_group_and_singles_are_left_alone(self) -> None:
+        rng = np.random.default_rng(11)
+        paths, embeddings, shot_of = self._folder([4, 3, 1, 1, 2], rng)
+        groups = duplicates.near_duplicate_groups(paths, embeddings)
+        self.assertEqual(sorted(len(group) for group in groups), [2, 3, 4])
+        for group in groups:
+            self.assertEqual(
+                len({shot_of[path] for path in group}),
+                1,
+                "two different shots were merged into one group",
+            )
+        # A photo that is nobody's near-duplicate is not returned at all.
+        grouped = {path for group in groups for path in group}
+        self.assertNotIn("shot02_0.jpg", grouped)
+
+    def test_photos_below_the_threshold_are_not_grouped(self) -> None:
+        rng = np.random.default_rng(12)
+        paths, embeddings, _ = self._folder([2, 2], rng)
+        # Far above any real burst's similarity: nothing should survive it.
+        self.assertEqual(duplicates.near_duplicate_groups(paths, embeddings, threshold=0.999999), [])
+
+    def test_a_zero_vector_is_never_anybodys_duplicate(self) -> None:
+        """It has no direction, so it is not similar to anything, including itself."""
+        rng = np.random.default_rng(13)
+        paths, embeddings, _ = self._folder([2], rng)
+        paths = [*paths, "blank_a.jpg", "blank_b.jpg"]
+        embeddings = np.vstack([embeddings, np.zeros((2, embeddings.shape[1]), dtype=np.float32)])
+        groups = duplicates.near_duplicate_groups(paths, embeddings)
+        grouped = {path for group in groups for path in group}
+        self.assertNotIn("blank_a.jpg", grouped)
+        self.assertNotIn("blank_b.jpg", grouped)
+
+    def test_mismatched_inputs_are_refused_rather_than_guessed_at(self) -> None:
+        rng = np.random.default_rng(14)
+        paths, embeddings, _ = self._folder([2], rng)
+        self.assertEqual(duplicates.near_duplicate_groups(paths[:1], embeddings), [])
+        self.assertEqual(duplicates.near_duplicate_groups([], np.empty((0, 4), dtype=np.float32)), [])
+
+    def test_grouping_is_transitive_across_a_long_burst(self) -> None:
+        """Frame 1 and frame 8 may not pair directly; the union-find still joins them."""
+        rng = np.random.default_rng(15)
+        base = rng.normal(size=64).astype(np.float32)
+        base /= np.linalg.norm(base)
+        frames = self._burst(base, 8, rng)
+        paths = [f"burst_{i}.jpg" for i in range(8)]
+        groups = duplicates.near_duplicate_groups(paths, np.vstack(frames).astype(np.float32))
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(groups[0]), 8)
 
 
 class WorkflowTools(unittest.TestCase):
