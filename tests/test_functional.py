@@ -1110,6 +1110,169 @@ class GuiReviewQueue(unittest.TestCase):
         report = self.app._retrain_report(state, {}, threshold=0.5)
         self.assertIn("zero-shot", report)
 
+    def _decide_one_of_each(self) -> None:
+        """One true positive, false positive, false negative, true negative and skip."""
+        assert self.app.store is not None
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        state.scores[2] = 0.1
+        state.scores[3] = 0.1
+        self.app.store.save_labels(
+            {self.paths[0]: 1, self.paths[1]: 0, self.paths[2]: 1, self.paths[3]: 0, self.paths[4]: 2}
+        )
+
+    def test_the_decisions_view_lists_every_decision_by_what_it_says_about_the_scanner(self) -> None:
+        """A decided photo the scanner missed was shown in no view at all.
+
+        The review queue is built from undecided photos and the detected list from
+        what scored above the threshold, so a false negative had nowhere to appear
+        and "what did it get wrong?" could not be answered from the screen.
+        """
+        self._decide_one_of_each()
+        self.app.hide_decided_var.set(True)
+        self.app.show_decisions()
+        self.assertEqual(self.app.view_mode, "decided")
+        buckets = {str(sample["path"]): str(sample["bucket"]) for sample in self.app.page_samples}
+        self.assertEqual(
+            buckets,
+            {
+                self.paths[0]: "True positives",
+                self.paths[1]: "False positives",
+                self.paths[2]: "False negatives",
+                self.paths[3]: "True negatives",
+                self.paths[4]: "Skipped",
+            },
+            "decided photos were not grouped by outcome, or 'Hide decided' hid them",
+        )
+        # The scanner's mistakes come first; the undecided photo is not a decision.
+        order = [str(sample["bucket"]) for sample in self.app.page_samples]
+        self.assertEqual(order[:2], ["False positives", "False negatives"])
+        self.assertNotIn(self.paths[5], buckets)
+
+    def test_a_card_says_whether_it_is_detected_and_whether_the_scanner_was_right(self) -> None:
+        self._decide_one_of_each()
+        self.app.show_decisions()
+        false_positive = self.app.cards[self.paths[1]]
+        self.assertTrue(str(false_positive.score_label.cget("text")).startswith("DETECTED"))
+        self.assertIn("FALSE POSITIVE", str(false_positive.verdict_label.cget("text")))
+        self.assertEqual(str(false_positive.verdict_label.cget("style")), "FalsePositive.TLabel")
+        false_negative = self.app.cards[self.paths[2]]
+        self.assertTrue(str(false_negative.score_label.cget("text")).startswith("not detected"))
+        self.assertIn("FALSE NEGATIVE", str(false_negative.verdict_label.cget("text")))
+        self.assertIn("True positive", str(self.app.cards[self.paths[0]].verdict_label.cget("text")))
+        # The undecided photo, back in the review queue, carries no verdict at all.
+        self.app.review_samples = [
+            {"path": path, "score": 0.9, "bucket": "Likely match"} for path in self.paths
+        ]
+        self.app.restore_review_view()
+        undecided = self.app.cards[self.paths[5]]
+        self.assertEqual(undecided.verdict_label.grid_info(), {}, "an undecided card showed a verdict line")
+        self.assertIn("DETECTED", str(undecided.score_label.cget("text")))
+
+    def test_the_card_names_the_verdict_and_leaves_the_explaining_to_the_preview(self) -> None:
+        """The card said one fact three times over.
+
+        "DETECTED", then "REJECTED", then "detected, but you rejected it" — the third
+        line restated the two above it on every card in the grid, and it was the line
+        that wrapped. The term is named on the card and glossed in the preview, which
+        has a full row to itself.
+        """
+        self._decide_one_of_each()
+        self.app.show_decisions()
+        verdict = str(self.app.cards[self.paths[1]].verdict_label.cget("text"))
+        self.assertEqual(verdict, "✘ FALSE POSITIVE")
+        self.assertNotIn("but you rejected it", verdict)
+        self.assertIn("but you rejected it", self.app._preview_caption_text(self.paths[1]))
+
+    def test_the_preview_caption_carries_the_verdict(self) -> None:
+        self._decide_one_of_each()
+        caption = self.app._preview_caption_text(self.paths[1])
+        self.assertIn("DETECTED", caption)
+        self.assertIn("REJECTED", caption)
+        self.assertIn("FALSE POSITIVE", caption)
+        self.assertIn("not detected", self.app._preview_caption_text(self.paths[2]))
+
+    def test_the_stats_line_separates_what_you_did_from_what_the_scanner_got_wrong(self) -> None:
+        """Eight pipe-separated numbers in a row answered two questions at once.
+
+        "Accepted 2" and "False positives 1" are counts of different things — one is
+        the reviewer's tally, the other the scanner's error rate — and read as one
+        undifferentiated run they could not be told apart at a glance.
+        """
+        self._decide_one_of_each()
+        self.app._update_stats_panel()
+        stats = self.app.stats_var.get()
+        self.assertIn("You: 2 accepted", stats)
+        self.assertIn("1 skipped", stats)
+        self.assertIn("Scanner: 1 false positive · 1 false negative", stats)
+
+    def test_the_stats_line_says_so_when_the_scanner_has_made_no_mistakes(self) -> None:
+        assert self.app.store is not None
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        # Both accepted, both detected: two true positives and nothing wrong.
+        self.app.store.save_labels({self.paths[0]: 1, self.paths[1]: 1})
+        self.app._update_stats_panel()
+        self.assertIn("Scanner: no mistakes so far", self.app.stats_var.get())
+
+    def test_opening_the_decisions_view_with_nothing_decided_raises_no_dialog(self) -> None:
+        """The empty-state panel already says it; a modal on top was one more click."""
+        assert self.app.store is not None
+        self.app.store.save_labels({})
+        from bikini_scanner import gui as gui_module
+
+        raised: list[tuple[str, str]] = []
+        original = gui_module.messagebox.showinfo
+        gui_module.messagebox.showinfo = lambda title, message, **kw: raised.append((title, message))
+        try:
+            self.app.show_decisions()
+        finally:
+            gui_module.messagebox.showinfo = original
+        self.assertEqual(raised, [], "opening an empty Decisions view raised a dialog")
+        self.assertEqual(self.app.view_mode, "decided")
+        self.assertEqual(self.app.page_samples, [])
+        self.assertIn("Nothing decided yet", self.app.status_var.get())
+
+    def test_the_three_views_can_be_switched_from_the_keyboard(self) -> None:
+        """Every other step of the review loop has a key; switching view did not."""
+        self._decide_one_of_each()
+        self.app.review_samples = [
+            {"path": path, "score": 0.9, "bucket": "Likely match"} for path in self.paths
+        ]
+        self.app._handle_view_shortcut(None, self.app.show_decisions)
+        self.assertEqual(self.app.view_mode, "decided")
+        self.app._handle_view_shortcut(None, self.app.restore_review_view)
+        self.assertEqual(self.app.view_mode, "review")
+        self.app._handle_view_shortcut(None, self.app.show_detected_files)
+        self.assertEqual(self.app.view_mode, "detected")
+
+    def test_a_view_shortcut_does_not_fire_while_typing_in_a_filter(self) -> None:
+        self.app.view_mode = "review"
+        self.app._focus_is_text_input = lambda: True  # type: ignore[method-assign]
+        self.app._handle_view_shortcut(None, self.app.show_decisions)
+        self.assertEqual(self.app.view_mode, "review", "typing '3' in a filter box switched view")
+
+    def test_changing_a_decision_in_the_decisions_view_moves_the_photo_to_its_new_group(self) -> None:
+        self._decide_one_of_each()
+        self.app.show_decisions()
+        self.app.set_label(self.paths[1], 1)
+        buckets = {str(sample["path"]): str(sample["bucket"]) for sample in self.app.page_samples}
+        self.assertEqual(buckets[self.paths[1]], "True positives")
+        self.assertEqual(self.app.view_mode, "decided", "changing a decision threw the reviewer out of the view")
+
+    def test_the_decisions_view_follows_the_sensitivity_slider(self) -> None:
+        self._decide_one_of_each()
+        self.app.show_decisions()
+        # Dragged below every score: nothing is "missed" any more, so the accepted
+        # photo that was a false negative becomes a true positive.
+        self.app.threshold_var.set(0.05)
+        self.app._after_threshold_settles()
+        buckets = {str(sample["path"]): str(sample["bucket"]) for sample in self.app.page_samples}
+        self.assertEqual(buckets[self.paths[2]], "True positives")
+        self.assertEqual(buckets[self.paths[3]], "False positives")
+
 
 class WorkflowTools(unittest.TestCase):
     """The queue, notes, browse mode and bulk scopes, driven the way a user drives them."""

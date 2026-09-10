@@ -74,3 +74,38 @@ Vertical space is the scarce resource; several things exist only to defend it.
   viewer keep `_preview_letterbox` — cropping is right for a contact sheet and wrong
   for judging a photo.
 
+
+## Three Views, and What a Card Says
+
+The results grid answers three different questions and `view_mode` names which one:
+
+- **`detected`** — everything above the sensitivity threshold, grouped by what was seen.
+- **`review`** — the curated shortlist of *undecided* photos, built by `bucketed_sampling`.
+- **`decided`** — everything carrying an Accept/REJECT/Skip, grouped by whether the
+  decision agreed with the scanner.
+
+The third exists because the first two between them could not show a decided photo the
+scanner missed: the queue holds only undecided photos and the detected list only what
+scored above the threshold, so a false negative appeared in no view at all and "what did
+it get wrong?" had no answer on screen. `decided` is therefore the one view that
+**ignores `hide_decided`** — hiding decided photos there would empty it by definition
+(`FilterContext.decided`, `_sample_visible`, `_hidden_decided_count`).
+
+`decision_outcome` is the single definition of true/false positive/negative, and
+`VERDICTS` maps each outcome to its card text, style and plain-English gloss. Both
+depend on the threshold, so dragging the sensitivity slider re-buckets this view rather
+than only re-listing it (`_after_threshold_settles`), and a retrain rebuilds it because
+a re-rank can move a decided photo across the threshold.
+
+A card states each fact **once**, and it is worth keeping it that way:
+
+- `DETECTED · 0.840` — what the scanner said, styled by which side of the threshold.
+- `REJECTED` — what you said.
+- `✘ FALSE POSITIVE` — whether those two agree. The scanner's mistakes are uppercase and
+  coloured; its correct calls stay quiet, so a page can be skimmed for the things worth
+  a second look.
+
+The term is **named** on the card and **glossed** only in the preview caption
+(`_verdict_detail`), which has a full row to itself. The card line used to read
+"✘ FALSE POSITIVE — detected, but you rejected it", which restated the two lines above
+it on every card in the grid and was the line that wrapped.

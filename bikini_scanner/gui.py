@@ -106,6 +106,26 @@ LOGGER = logging.getLogger(__name__)
 CARD_INFO_WIDTH = 340
 # Buckets used by the detected-files view, in the order they are listed.
 DETECTED_BUCKETS = ("Cleavage", "Bikini", "Midriff", "Explicit (NSFW)", "Other detections")
+# Buckets used by the decisions view, in the order they are listed: what the reviewer
+# said set against what the scanner said, with the scanner's mistakes first.
+DECIDED_BUCKETS = ("False positives", "False negatives", "True positives", "True negatives", "Skipped")
+# Outcome name -> the decisions-view bucket it is listed under.
+OUTCOME_BUCKETS = {
+    "false positive": "False positives",
+    "false negative": "False negatives",
+    "true positive": "True positives",
+    "true negative": "True negatives",
+    "skipped": "Skipped",
+}
+# Outcome name -> (card text, style, plain-English gloss). The scanner's two mistakes
+# shout and its two correct calls do not, so a page of cards can be skimmed for the
+# things worth a second look without reading a word of it.
+VERDICTS: dict[str, tuple[str, str, str]] = {
+    "true positive": ("✔ True positive", "Correct.TLabel", "detected, and you accepted it"),
+    "true negative": ("✔ True negative", "Correct.TLabel", "not detected, and you rejected it"),
+    "false positive": ("✘ FALSE POSITIVE", "FalsePositive.TLabel", "detected, but you rejected it"),
+    "false negative": ("✘ FALSE NEGATIVE", "FalseNegative.TLabel", "missed, but you accepted it"),
+}
 
 # How many cards one page of the results grid holds. Chosen so a page renders in well
 # under a second on a slow disk; the pager below the grid walks the rest.
@@ -137,6 +157,7 @@ BUCKET_ORDER = {
     "Uncertain": 3,
 }
 BUCKET_ORDER.update({name: 10 + position for position, name in enumerate(DETECTED_BUCKETS)})
+BUCKET_ORDER.update({name: 30 + position for position, name in enumerate(DECIDED_BUCKETS)})
 
 # Label value to the word the filters and the UI match on.
 _LABEL_WORDS: dict[int | None, str] = {1: "good", 0: "bad", 2: "skip"}
@@ -164,6 +185,22 @@ RETRAIN_LABEL_BURST = 25
 SESSION_SAVE_IDLE_MS = 1200
 
 
+def decision_outcome(label: int | None, detected: bool) -> str:
+    """Name what one decision says about one detection.
+
+    A "false positive" is a photo the scanner flagged and the reviewer rejected; a
+    "false negative" one it missed and the reviewer accepted. A skip is recorded as
+    such, and an undecided photo has no outcome at all.
+    """
+    if label == 1:
+        return "true positive" if detected else "false negative"
+    if label == 0:
+        return "false positive" if detected else "true negative"
+    if label == 2:
+        return "skipped"
+    return ""
+
+
 @dataclass(slots=True)
 class FilterContext:
     """The filter settings, read once and reused for a whole pass.
@@ -183,6 +220,9 @@ class FilterContext:
     score_min: float | None
     score_max: float | None
     browse: bool
+    # The decisions view exists to show decided photos, so "hide decided" does not
+    # apply to it; every other view honours the checkbox.
+    decided: bool
 
 
 @dataclass(slots=True)
@@ -192,6 +232,8 @@ class ResultCard:
     name_label: ttk.Label
     score_label: ttk.Label
     label_label: ttk.Label
+    # Whether the decision agreed with the scanner: true/false positive/negative.
+    verdict_label: ttk.Label
     details_label: ttk.Label
     image_ref: ImageTk.PhotoImage
     score: float = 0.0
@@ -752,10 +794,20 @@ class BikiniScannerApp:
             row, text="Detected files", command=self.show_detected_files, style="Accent.TButton"
         )
         self.detected_button.pack(side=LEFT)
-        self._tooltip(self.detected_button, "Every photo found, grouped by what was detected")
+        self._tooltip(self.detected_button, "Every photo found, grouped by what was detected  (1)")
         self.review_button = ttk.Button(row, text="Review queue", command=self.restore_review_view)
-        self.review_button.pack(side=LEFT, padx=(6, 16))
-        self._tooltip(self.review_button, "A curated shortlist to Accept or REJECT so the scanner learns")
+        self.review_button.pack(side=LEFT, padx=(6, 0))
+        self._tooltip(self.review_button, "A curated shortlist to Accept or REJECT so the scanner learns  (2)")
+        # The queue only ever holds undecided photos and the detected list only what
+        # scored above the threshold, so a decided photo the scanner missed was shown
+        # nowhere. This view is the answer to "what did I decide, and what did it get
+        # wrong?"
+        self.decisions_button = ttk.Button(row, text="Decisions", command=self.show_decisions)
+        self.decisions_button.pack(side=LEFT, padx=(6, 16))
+        self._tooltip(
+            self.decisions_button,
+            "Everything you have decided, sorted into false positives, false negatives and confirmed calls  (3)",
+        )
         # Pager to the right before the slider claims the slack, so it keeps its width.
         self._build_pager(row)
         ttk.Label(row, text="Sensitivity", style="Muted.TLabel").pack(side=LEFT)
@@ -864,20 +916,23 @@ class BikiniScannerApp:
         if not hasattr(self, "detected_button"):
             return
         detected = self.view_mode == "detected"
+        decided = self.view_mode == "decided"
         hints = {
             "detected": "Everything above the sensitivity threshold.",
             "review": "A shortlist chosen to teach the scanner fastest.",
             "similar": "Images similar to the one you picked.",
             "browse": "Not scanned — decisions here are saved for the next scan.",
+            "decided": "What you decided, set against what the scanner detected. Its mistakes come first.",
         }
         hint = hints.get(self.view_mode, "")
         # Say it out loud: a photo vanishing on Accept is only obvious once you know
         # it is meant to, and the checkbox that governs it lives in a closed panel.
-        if self.hide_decided_var.get():
+        if self.hide_decided_var.get() and not decided:
             hint = f"{hint} Decided photos are hidden."
         try:
             self.detected_button.configure(style="Accent.TButton" if detected else "TButton")
-            self.review_button.configure(style="TButton" if detected else "Accent.TButton")
+            self.review_button.configure(style="TButton" if detected or decided else "Accent.TButton")
+            self.decisions_button.configure(style="Accent.TButton" if decided else "TButton")
             self.view_hint.configure(text=hint.strip())
         except Exception:  # noqa: BLE001
             pass
@@ -983,17 +1038,22 @@ class BikiniScannerApp:
             finished = hidden > 0 or (
                 self.store is not None and bool(self.store.load_labels()) and self._undecided_remaining() == 0
             )
-            if finished and not self._filters_active():
+            if self.view_mode == "decided" and not self._filters_active():
+                title = "No decisions yet"
+                body = (
+                    "Accept, REJECT or Skip a photo and it is listed here, sorted by whether "
+                    "the scanner got it right: false positives and false negatives first."
+                )
+                action = ("Review queue", self.restore_review_view)
+            elif finished and not self._filters_active():
                 title = "Everything here has been decided"
                 body = (
                     "Every photo this view can show carries an Accept, REJECT or Skip, so there "
-                    "is nothing left to judge.\n\nScan another folder, drag the sensitivity "
-                    "slider left to pull in the near misses, or look back over what you decided."
+                    "is nothing left to judge.\n\nLook back over what you decided to see which "
+                    "photos were detected and where the scanner was wrong, scan another folder, "
+                    "or drag the sensitivity slider left to pull in the near misses."
                 )
-                if self.hide_decided_var.get():
-                    action = ("Show decided photos", lambda: self.hide_decided_var.set(False))
-                else:
-                    action = ("Show detected files", self.show_detected_files)
+                action = ("Show your decisions", self.show_decisions)
             elif self._filters_active():
                 title = "Nothing matches these filters"
                 body = "Your search, score range, or label filter is hiding every result."
@@ -1089,7 +1149,7 @@ class BikiniScannerApp:
         """How many of the current results the 'Hide decided' rule is holding back."""
         if not self.hide_decided_var.get() or self.store is None or not self.current_samples:
             return 0
-        if self.label_filter_var.get().strip() not in ("", "all", "unlabeled"):
+        if self.view_mode == "decided" or self.label_filter_var.get().strip() not in ("", "all", "unlabeled"):
             return 0
         labels = self.store.load_labels()
         return sum(1 for sample in self.current_samples if labels.get(str(sample["path"])) is not None)
@@ -1216,6 +1276,7 @@ class BikiniScannerApp:
             "  n                     add or edit a note on the active photo\n"
             "  w                     why did this photo score what it did\n"
             "  f                     focus mode: one photo, full screen, no grid\n"
+            "  1 / 2 / 3             detected files / review queue / your decisions\n"
             "  Backspace             back out of Find similar\n"
             "  Ctrl+Z / Ctrl+Y       undo / redo a decision\n"
             "  double-click          open the full-size viewer\n\n"
@@ -1233,6 +1294,9 @@ class BikiniScannerApp:
             "  • Watch 'learning:' in the status bar: it names the labels counted and how much\n"
             "    influence they currently have over the ranking.\n"
             "  • 'Detected files' lists everything found, grouped by what was detected.\n"
+            "  • 'Decisions' lists everything you judged, sorted into false positives, false\n"
+            "    negatives and confirmed calls. Every card says whether the photo is detected\n"
+            "    at the current sensitivity, what you called it, and whether those agree.\n"
             "  • Long lists are paged: use Prev/Next at the right of the view buttons, or\n"
             "    raise 'Per page' to show more at once.\n"
             "  • Drag the sensitivity slider left to see near misses.",
@@ -1265,6 +1329,9 @@ class BikiniScannerApp:
                 # vision and the word beside them still carries the meaning.
                 "accepted": "#5fd08a",
                 "rejected": "#ff8f8f",
+                # A miss the scanner made: neither the reviewer's green nor red, so
+                # it does not read as a decision.
+                "warning": "#f2b95c",
             }
         return {
             "bg": "#eef0f4",
@@ -1286,6 +1353,7 @@ class BikiniScannerApp:
             "tooltip_bg": "#ffffff",
             "accepted": "#1f7a45",
             "rejected": "#b3261e",
+            "warning": "#a85d00",
         }
 
     def _theme_is_dark(self) -> bool:
@@ -1564,6 +1632,23 @@ class BikiniScannerApp:
                 foreground=colour,
                 font=("TkDefaultFont", base, "bold" if name in ("Accepted", "Rejected") else "normal"),
             )
+        # Detection and verdict lines on a card. "Detected" borrows the accent so it
+        # agrees with the match border; a scanner mistake is bold and coloured, a
+        # confirmed call is quiet green, and an undecided photo says nothing.
+        for name, colour, weight in (
+            ("Detected", palette["accent"], "bold"),
+            ("NotDetected", palette["muted"], "normal"),
+            ("Correct", palette["accepted"], "normal"),
+            ("FalsePositive", palette["rejected"], "bold"),
+            ("FalseNegative", palette["warning"], "bold"),
+            ("NoVerdict", palette["muted"], "normal"),
+        ):
+            style.configure(
+                f"{name}.TLabel",
+                background=palette["panel"],
+                foreground=colour,
+                font=("TkDefaultFont", base, weight),
+            )
         style.configure(
             "BucketHeading.TLabel",
             background=palette["bg"],
@@ -1769,6 +1854,10 @@ class BikiniScannerApp:
         elif self.view_mode == "similar" and self.similar_anchor_path:
             self._refresh_displayed_results()
             return
+        elif self.view_mode == "decided":
+            self.current_samples = self._decided_samples()
+            self._refresh_displayed_results()
+            return
         self._refresh_current_results()
 
     def _restore_ui_prefs(self) -> None:
@@ -1893,6 +1982,7 @@ class BikiniScannerApp:
 
         view_menu.add_command(label="Detected files", command=self.show_detected_files)
         view_menu.add_command(label="Review queue", command=self.restore_review_view)
+        view_menu.add_command(label="Decisions", command=self.show_decisions)
         view_menu.add_command(label="Focus mode (one photo, full screen)", command=self.toggle_focus_mode, accelerator="F")
         view_menu.add_command(label="Back", command=self.go_back, accelerator="Backspace")
         view_menu.add_separator()
@@ -2422,10 +2512,28 @@ class BikiniScannerApp:
             if excluded:
                 gated = sum(1 for stage in self.current_state.cascade_stage if stage == "minor")
                 excluded_text = f" | {excluded} filtered out" + (f" ({gated} age-gated)" if gated else "")
-        self.stats_var.set(
-            f"Accepted {counts['good']} | Rejected {counts['bad']} | Skipped {counts['skip']} | "
-            f"Unlabeled {counts['unlabeled']} | {quality_text} | learning: {learning_text}{excluded_text}"
+        # Two different questions, so two labelled groups rather than one run of eight
+        # pipe-separated numbers: what you did, and what it says the scanner got wrong.
+        # Unlabelled reads as "left", which is the form a reviewer actually wants.
+        outcomes = self._outcome_counts(labels)
+        yours = (
+            f"You: {counts['good']} accepted · {counts['bad']} rejected · "
+            f"{counts['skip']} skipped · {counts['unlabeled']} left"
         )
+        decided = counts["good"] + counts["bad"] + counts["skip"]
+        mistakes = outcomes["false positive"] + outcomes["false negative"]
+        if not decided:
+            scanner = ""
+        elif mistakes:
+            scanner = (
+                f" | Scanner: {outcomes['false positive']} false positive"
+                f"{'s' if outcomes['false positive'] != 1 else ''} · "
+                f"{outcomes['false negative']} false negative"
+                f"{'s' if outcomes['false negative'] != 1 else ''}"
+            )
+        else:
+            scanner = " | Scanner: no mistakes so far"
+        self.stats_var.set(f"{yours}{scanner} | {quality_text} | learning: {learning_text}{excluded_text}")
         self.notice_var.set(plateau)
 
     def _session_focus(self) -> None:
@@ -3031,6 +3139,7 @@ class BikiniScannerApp:
             score_min=score_min,
             score_max=score_max,
             browse=self.view_mode == "browse",
+            decided=self.view_mode == "decided",
         )
 
     def _sample_visible(self, sample: dict[str, object], context: FilterContext | None = None) -> bool:
@@ -3055,7 +3164,12 @@ class BikiniScannerApp:
         # A photo you have decided leaves the grid. Asking for the labeled or skipped
         # ones by name overrides this: that request is explicit, and silently answering
         # it with an empty grid would be the same bug in the other direction.
-        if context.hide_decided and label != "unlabeled" and label_mode in ("", "all", "unlabeled"):
+        if (
+            context.hide_decided
+            and not context.decided
+            and label != "unlabeled"
+            and label_mode in ("", "all", "unlabeled")
+        ):
             return False
         if context.browse:
             # Nothing here has been scored, so every score-based filter would hide the
@@ -3454,6 +3568,81 @@ class BikiniScannerApp:
             + (f" — {breakdown}" if breakdown else "")
             + (f" ({hidden} already decided or filtered out)" if hidden > 0 else "")
             + ". Switch to 'Review queue' to teach the scanner."
+        )
+
+    def _outcome_counts(self, labels: dict[str, int] | None = None) -> dict[str, int]:
+        """How many decisions agree with the scanner, and how many say it was wrong."""
+        counts = dict.fromkeys(OUTCOME_BUCKETS, 0)
+        state = self.current_state
+        if state is None:
+            return counts
+        if labels is None:
+            labels = self._label_map()
+        threshold = float(self.threshold_var.get())
+        mask = self._result_visibility_mask()
+        for path, label in labels.items():
+            index = self._state_index(path)
+            if index is None or index >= len(mask) or not mask[index]:
+                continue
+            outcome = decision_outcome(label, float(state.scores[index]) >= threshold)
+            if outcome:
+                counts[outcome] += 1
+        return counts
+
+    def _decided_samples(self) -> list[dict[str, object]]:
+        """Every decided photo, bucketed by what the decision says about the scanner."""
+        state = self.current_state
+        if state is None:
+            return []
+        labels = self._label_map()
+        threshold = float(self.threshold_var.get())
+        mask = self._result_visibility_mask()
+        samples: list[dict[str, object]] = []
+        for index, path in enumerate(state.paths):
+            label = labels.get(str(path))
+            if label is None or index >= len(mask) or not mask[index]:
+                continue
+            score = float(state.scores[index])
+            outcome = decision_outcome(label, score >= threshold)
+            if not outcome:
+                continue
+            samples.append({"path": str(path), "score": score, "bucket": OUTCOME_BUCKETS[outcome]})
+        return samples
+
+    def show_decisions(self, reset_page: bool = True) -> None:
+        """List what the reviewer decided, the scanner's mistakes first.
+
+        The review queue is assembled from undecided photos and the detected list from
+        what scored above the threshold, so between them a decided photo the scanner
+        missed was shown nowhere at all: "am I done, and what did it get wrong?" had no
+        answer on screen.
+        """
+        if self.current_state is None:
+            messagebox.showinfo("No results", "Run a scan first.")
+            return
+        # No modal when there is nothing to list. The empty-state panel already says
+        # "No decisions yet" and offers the way back to the queue, so a dialog on top
+        # of it was one more thing to dismiss to reach the same words.
+        self._apply_decided_view(self._decided_samples(), reset_page=reset_page)
+
+    def _apply_decided_view(self, samples: list[dict[str, object]], reset_page: bool) -> None:
+        self.view_mode = "decided"
+        self.similar_anchor_path = None
+        self.current_samples = samples
+        threshold = float(self.threshold_var.get())
+        self._refresh_displayed_results(reset_page=reset_page)
+        counts: dict[str, int] = {}
+        for sample in self.displayed_samples:
+            bucket = str(sample.get("bucket", ""))
+            counts[bucket] = counts.get(bucket, 0) + 1
+        if not self.displayed_samples:
+            self.status_var.set("Nothing decided yet — Accept, REJECT or Skip a photo and it is listed here.")
+            return
+        breakdown = ", ".join(f"{name} {counts[name]}" for name in DECIDED_BUCKETS if counts.get(name))
+        self.status_var.set(
+            f"{len(self.displayed_samples)} decided photos at threshold {threshold:.3f}"
+            + (f" — {breakdown}" if breakdown else "")
+            + ". Change a decision here and the photo moves to the right group."
         )
 
     def restore_review_view(self) -> None:
@@ -5646,6 +5835,8 @@ class BikiniScannerApp:
             self.page_index = max(0, wanted_page)
             if wanted_view == "detected" and matches:
                 self.show_detected_files(reset_page=False)
+            elif wanted_view == "decided":
+                self._apply_decided_view(self._decided_samples(), reset_page=False)
             else:
                 self._refresh_displayed_results(reset_page=False)
             self._update_stats_panel(record_history=True)
@@ -5659,6 +5850,10 @@ class BikiniScannerApp:
         # A fresh scan lands on the full detected-files list; retrains keep whichever view was active.
         if matches and (full_rescan or previous_view == "detected"):
             self.show_detected_files(reset_page=not keep_page)
+        elif previous_view == "decided" and not full_rescan:
+            # A re-rank can move a decided photo across the threshold, which changes
+            # the group it belongs in, so the list is rebuilt rather than kept.
+            self._apply_decided_view(self._decided_samples(), reset_page=False)
         else:
             self._refresh_displayed_results(reset_page=not keep_page)
         self._update_stats_panel(record_history=True)
@@ -5727,24 +5922,43 @@ class BikiniScannerApp:
     def _on_threshold_change(self, _value: str) -> None:
         self.threshold_text_var.set(f"{float(self.threshold_var.get()):.2f}")
         self._refresh_summary()
-        if self.view_mode != "detected" or self.current_state is None:
+        if self.current_state is None:
             return
-        # Re-list the detected files for the new threshold, debounced so dragging the
-        # slider does not rebuild the grid on every pixel.
+        # Bring the grid in line with the new threshold, debounced so dragging the
+        # slider does not rebuild it on every pixel.
         if self._threshold_refresh_after_id is not None:
             try:
                 self.root.after_cancel(self._threshold_refresh_after_id)
             except Exception:  # noqa: BLE001
                 pass
-        self._threshold_refresh_after_id = self._after(400, self._relist_detected_files)
+        self._threshold_refresh_after_id = self._after(400, self._after_threshold_settles)
 
-    def _relist_detected_files(self) -> None:
+    def _after_threshold_settles(self) -> None:
         self._threshold_refresh_after_id = None
-        if self.view_mode != "detected" or self.current_state is None:
+        if self.current_state is None:
             return
-        # Dragging the slider past every match must not raise a modal; just empty the
-        # grid and let the empty-state panel explain itself.
-        self._apply_detected_view(self._detected_samples(), reset_page=True)
+        if self.view_mode == "detected":
+            # Dragging the slider past every match must not raise a modal; just empty
+            # the grid and let the empty-state panel explain itself.
+            self._apply_detected_view(self._detected_samples(), reset_page=True)
+        elif self.view_mode == "decided":
+            # Which photos count as detected just changed, so which are false
+            # positives and false negatives changed with it.
+            self._apply_decided_view(self._decided_samples(), reset_page=True)
+        else:
+            self._refresh_card_detection()
+
+    def _refresh_card_detection(self) -> None:
+        """Redraw what every card on screen says about the threshold.
+
+        A card's border and its DETECTED line both depend on the sensitivity, and
+        until now nothing redrew them when it moved: a photo could sit on screen
+        with a match border after the slider had been dragged past its score.
+        """
+        threshold = float(self.threshold_var.get())
+        labels = self._label_map()
+        for card in self.cards.values():
+            self._paint_card_state(card, threshold, labels)
 
     def _bind_shortcuts(self) -> None:
         self.root.bind_all("<KeyPress-j>", self._handle_next_card)
@@ -5758,6 +5972,12 @@ class BikiniScannerApp:
         self.root.bind_all("<KeyPress-a>", lambda event: self._handle_label_shortcut(event, 1))
         self.root.bind_all("<KeyPress-d>", lambda event: self._handle_label_shortcut(event, 0))
         self.root.bind_all("<KeyPress-s>", lambda event: self._handle_label_shortcut(event, 2))
+        # Switching view was the one part of the review loop that still needed the
+        # mouse: every other step has a key, so a reviewer working from the keyboard
+        # had to reach for the pointer purely to ask "what did it get wrong?".
+        self.root.bind_all("<KeyPress-1>", lambda event: self._handle_view_shortcut(event, self.show_detected_files))
+        self.root.bind_all("<KeyPress-2>", lambda event: self._handle_view_shortcut(event, self.restore_review_view))
+        self.root.bind_all("<KeyPress-3>", lambda event: self._handle_view_shortcut(event, self.show_decisions))
         self.root.bind_all("<KeyPress-w>", self._handle_explain_shortcut)
         self.root.bind_all("<KeyPress-n>", self._handle_note_shortcut)
         self.root.bind_all("<BackSpace>", self._handle_back_shortcut)
@@ -5829,6 +6049,12 @@ class BikiniScannerApp:
         if self._focus_is_text_input():
             return ""
         self.label_focused_card(label)
+        return "break"
+
+    def _handle_view_shortcut(self, event, switch) -> str:
+        if self._focus_is_text_input():
+            return ""
+        switch()
         return "break"
 
     def _handle_explain_shortcut(self, event) -> str:
@@ -6238,9 +6464,22 @@ class BikiniScannerApp:
                         self._decoded_cache.popitem(last=False)
 
     def _preview_caption_text(self, path: str) -> str:
-        caption = (
-            f"{Path(path).name}  —  score {self._match_score_for_path(path):.3f}  —  {self._label_display_text(path)}"
-        )
+        score = self._match_score_for_path(path)
+        word = self._label_text(path)
+        parts = [Path(path).name]
+        if self.view_mode == "browse":
+            # Nothing here has been scored, so there is no detection to report.
+            parts.append(self._label_display_text(path, word))
+        else:
+            detected = score >= float(self.threshold_var.get())
+            # One reading of the score, not two: the word and the number said the same
+            # thing in adjacent segments of the same line.
+            parts.append(f"{'DETECTED' if detected else 'not detected'} {score:.3f}")
+            parts.append(self._label_display_text(path, word))
+            verdict = self._verdict_detail(word, detected)
+            if verdict:
+                parts.append(verdict)
+        caption = "  —  ".join(parts)
         note = self.note_for(path)
         return f"{caption}\n{note}" if note else caption
 
@@ -6669,6 +6908,9 @@ class BikiniScannerApp:
             self._bucket_headings.pop(name).destroy()
 
         threshold = float(self.threshold_var.get())
+        # One copy of the label map for the whole page. Reading it per card meant
+        # copying every label in the folder once per card on screen.
+        labels = self._label_map()
         row = 0
         for bucket in buckets:
             items = grouped[bucket]
@@ -6698,22 +6940,13 @@ class BikiniScannerApp:
                         column=target_column,
                         columnspan=1,
                         info_width=info_width,
+                        labels=labels,
                     )
                     continue
                 # Reused card: move it, and refresh the parts a retrain can change.
                 card.score = score
-                card.score_label.configure(text=f"Score: {score:.3f}")
-                card.label_label.configure(
-                    text=self._card_label_text(path), style=self._label_style(path)
-                )
+                self._paint_card_state(card, threshold, labels)
                 card.details_label.configure(text=self._axis_details_text(path))
-                focused = path == self.focused_path
-                matched = score >= threshold
-                if focused:
-                    style = "FocusedMatchCard.TFrame" if matched else "FocusedCard.TFrame"
-                else:
-                    style = "MatchCard.TFrame" if matched else "Card.TFrame"
-                card.frame.configure(style=style)
                 card.frame.grid(
                     row=target_row, column=target_column, columnspan=1, sticky="nsew", padx=10, pady=6
                 )
@@ -6731,6 +6964,7 @@ class BikiniScannerApp:
         register: bool = True,
         show_actions: bool = True,
         info_width: int = CARD_INFO_WIDTH,
+        labels: dict[str, int] | None = None,
     ) -> ImageTk.PhotoImage:
         threshold = float(self.threshold_var.get())
         is_match = score >= threshold
@@ -6774,20 +7008,21 @@ class BikiniScannerApp:
         wrap_length = max(120, info_width - 12)
         name_label = ttk.Label(info, text=Path(path).name, wraplength=wrap_length, justify="left")
         name_label.grid(row=0, column=0, sticky="ew")
+        # "Score: 0.412" said nothing about which side of the threshold that was, so
+        # whether a photo counted as detected could only be read off the border
+        # colour. The line says it outright, and the verdict line under the decision
+        # says whether the reviewer agreed with the scanner.
         score_label = ttk.Label(info, text=f"Score: {score:.3f}")
         score_label.grid(row=1, column=0, sticky="w", pady=(2, 0))
         # A decision used to be one more line of grey text among four, so a page of
         # cards could not be read for state at a glance. It gets its own colour now.
-        label_label = ttk.Label(
-            info,
-            text=self._card_label_text(path),
-            wraplength=wrap_length,
-            justify="left",
-            style=self._label_style(path),
-        )
+        label_label = ttk.Label(info, text="", wraplength=wrap_length, justify="left", style="Undecided.TLabel")
         label_label.grid(row=2, column=0, sticky="w", pady=(2, 0))
+        verdict_label = ttk.Label(info, text="", wraplength=wrap_length, justify="left", style="NoVerdict.TLabel")
+        verdict_label.grid(row=3, column=0, sticky="w", pady=(2, 0))
+        verdict_label.grid_remove()
         details_label = ttk.Label(info, text=self._axis_details_text(path), wraplength=wrap_length, justify="left")
-        details_label.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+        details_label.grid(row=4, column=0, sticky="ew", pady=(2, 0))
         # The card width is fixed above, so wrap the long labels to whatever width they
         # are actually given instead of letting them run past the card edge.
         self._autowrap(name_label)
@@ -6820,18 +7055,26 @@ class BikiniScannerApp:
                 self._post_menu(widget, target)
 
             more.configure(command=_open_more)
+        card = ResultCard(
+            frame=frame,
+            path=path,
+            name_label=name_label,
+            score_label=score_label,
+            label_label=label_label,
+            verdict_label=verdict_label,
+            details_label=details_label,
+            image_ref=photo,
+            score=score,
+        )
         if register:
-            self.cards[path] = ResultCard(
-                frame=frame,
-                path=path,
-                name_label=name_label,
-                score_label=score_label,
-                label_label=label_label,
-                details_label=details_label,
-                image_ref=photo,
-                score=score,
-            )
+            self.cards[path] = card
             self.photo_refs.append(photo)
+            self._paint_card_state(card, threshold, labels)
+        else:
+            # An unregistered card is a prompt-tester preview: its score is a prompt
+            # score, not a detection, so it keeps the plain reading.
+            word = self._label_text(path) if labels is None else _LABEL_WORDS.get(labels.get(path), "unlabeled")
+            label_label.configure(text=self._card_label_text(path, word), style=self._label_style(path, word))
         def _on_click(_event: object, candidate: str = path) -> None:
             self.focus_path(candidate)
 
@@ -6847,7 +7090,17 @@ class BikiniScannerApp:
             finally:
                 target.grab_release()
 
-        for widget in (frame, image_label, right, info, name_label, score_label, label_label, details_label):
+        for widget in (
+            frame,
+            image_label,
+            right,
+            info,
+            name_label,
+            score_label,
+            label_label,
+            verdict_label,
+            details_label,
+        ):
             widget.bind("<Button-1>", _on_click)
             widget.bind("<Double-Button-1>", _on_double_click)
             widget.bind("<Button-3>", _on_right_click)
@@ -6930,18 +7183,81 @@ class BikiniScannerApp:
         tile.paste(thumb, (0, (height - thumb.height) // 2))
         return tile
 
-    def _card_label_text(self, path: str) -> str:
+    def _card_label_text(self, path: str, word: str | None = None) -> str:
         """Label plus note, which is what the card has room to show."""
-        text = self._label_display_text(path)
+        text = self._label_display_text(path, word)
         note = self.note_for(path)
         return f"{text} — {note}" if note else text
 
-    def _label_style(self, path: str) -> str:
+    def _label_style(self, path: str, word: str | None = None) -> str:
         return {
             "good": "Accepted.TLabel",
             "bad": "Rejected.TLabel",
             "skip": "Skipped.TLabel",
-        }.get(self._label_text(path), "Undecided.TLabel")
+        }.get(word if word is not None else self._label_text(path), "Undecided.TLabel")
+
+    @staticmethod
+    def _detection_text(score: float, threshold: float) -> tuple[str, str]:
+        """The card line that says which side of the threshold a score is on."""
+        if score >= threshold:
+            return f"DETECTED  ·  {score:.3f}", "Detected.TLabel"
+        return f"not detected  ·  {score:.3f}", "NotDetected.TLabel"
+
+    @staticmethod
+    def _verdict_text(word: str, detected: bool) -> tuple[str, str]:
+        """What a decision says about the scanner, and the style that says it.
+
+        Read together with the decision line: "REJECTED" plus "false positive" is a
+        photo the scanner flagged and the reviewer threw out. Skips and undecided
+        photos have no verdict.
+        """
+        label = {"good": 1, "bad": 0, "skip": 2}.get(word)
+        name, style, _gloss = VERDICTS.get(decision_outcome(label, detected), ("", "NoVerdict.TLabel", ""))
+        return name, style
+
+    @staticmethod
+    def _verdict_detail(word: str, detected: bool) -> str:
+        """The verdict spelled out, for the one place with room to explain it.
+
+        The card says `✘ FALSE POSITIVE` and leaves it there: the two lines above it
+        already give the detection and the decision, so a sentence restating both was
+        a third copy of one fact on every card in the grid. The preview is showing a
+        single photo across the full width, so that is where the term is glossed.
+        """
+        label = {"good": 1, "bad": 0, "skip": 2}.get(word)
+        name, _style, gloss = VERDICTS.get(decision_outcome(label, detected), ("", "", ""))
+        return f"{name} ({gloss})" if name else ""
+
+    def _paint_card_state(self, card: ResultCard, threshold: float, labels: dict[str, int] | None = None) -> None:
+        """Draw everything on a card that a decision or the threshold can change.
+
+        `labels` is the map the caller already holds; without it the card fetches its
+        own copy, which is what every render used to do once per card.
+        """
+        path = card.path
+        word = self._label_text(path) if labels is None else _LABEL_WORDS.get(labels.get(path), "unlabeled")
+        browse = self.view_mode == "browse"
+        if browse:
+            card.score_label.configure(text="not scanned", style="NotDetected.TLabel")
+        else:
+            text, style = self._detection_text(card.score, threshold)
+            card.score_label.configure(text=text, style=style)
+        card.label_label.configure(text=self._card_label_text(path, word), style=self._label_style(path, word))
+        verdict, verdict_style = ("", "NoVerdict.TLabel") if browse else self._verdict_text(word, card.score >= threshold)
+        if verdict:
+            card.verdict_label.configure(text=verdict, style=verdict_style)
+            card.verdict_label.grid()
+        else:
+            card.verdict_label.grid_remove()
+        focused = path == self.focused_path
+        matched = not browse and card.score >= threshold
+        if focused:
+            frame_style = "FocusedMatchCard.TFrame" if matched else "FocusedCard.TFrame"
+        else:
+            frame_style = "MatchCard.TFrame" if matched else "Card.TFrame"
+        if card.style != frame_style:
+            card.frame.configure(style=frame_style)
+            card.style = frame_style
 
     def note_for(self, path: str) -> str:
         if self.store is None:
@@ -6998,12 +7314,12 @@ class BikiniScannerApp:
         )
         dialog.bind("<Escape>", lambda _event: dialog._safe_close())  # type: ignore[attr-defined]
 
-    def _label_display_text(self, path: str) -> str:
+    def _label_display_text(self, path: str, word: str | None = None) -> str:
         return {
             "good": "Accepted",
             "bad": "REJECTED",
             "skip": "Skipped",
-        }.get(self._label_text(path), "Unlabeled")
+        }.get(word if word is not None else self._label_text(path), "Unlabeled")
 
     def _label_text(self, path: str) -> str:
         if self.store is None:
@@ -7148,6 +7464,9 @@ class BikiniScannerApp:
         # grid still showed every photo the reviewer had just decided — the click
         # looked like it had done nothing at all.
         if self.current_state is not None:
+            if self.view_mode == "decided":
+                # A changed decision changes which group the photo belongs in.
+                self.current_samples = self._decided_samples()
             self._refresh_displayed_results(reset_page=False)
         # Always say how much is actually left. Without this the queue refilling after
         # every retrain looks infinite, because nothing on screen ever counts down.
@@ -7308,7 +7627,7 @@ class BikiniScannerApp:
     def _refresh_label_state(self, path: str) -> None:
         card = self.cards.get(path)
         if card is not None:
-            card.label_label.configure(text=self._card_label_text(path), style=self._label_style(path))
+            self._paint_card_state(card, float(self.threshold_var.get()))
             card.details_label.configure(text=self._axis_details_text(path))
         if path == self.focused_path:
             self.preview_caption_var.set(self._preview_caption_text(path))
