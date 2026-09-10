@@ -165,6 +165,14 @@ def plan_auto_decisions(
     on its own training data, which is not a rate at all.
     """
     plan = AutoDecidePlan(target=float(target))
+    paths = [str(path) for path in undecided_paths]
+    candidates: np.ndarray = np.asarray(undecided_scores, dtype=np.float64)
+    if candidates.size != len(paths):
+        raise ValueError("undecided_paths and undecided_scores must be the same length")
+    # Nothing is decided until a cut is found, so every refusal below leaves the
+    # whole candidate set remaining. Leaving this at its default of 0 meant a plan
+    # that decided nothing still claimed nothing was left to judge.
+    plan.remaining = len(paths)
     scores: np.ndarray = np.asarray(labelled_scores, dtype=np.float64)
     truth: np.ndarray = np.asarray(labelled_labels, dtype=np.int64)
     keep = np.isfinite(scores)
@@ -186,10 +194,6 @@ def plan_auto_decisions(
     plan.accept = _cut(scores, truth == 1, target, min_support, high=True)
     plan.reject = _cut(scores, truth == 0, target, min_support, high=False)
 
-    candidates: np.ndarray = np.asarray(undecided_scores, dtype=np.float64)
-    paths = [str(path) for path in undecided_paths]
-    if candidates.size != len(paths):
-        raise ValueError("undecided_paths and undecided_scores must be the same length")
     taken: np.ndarray = np.zeros(len(paths), dtype=bool)
     if plan.accept.found:
         chosen = candidates >= float(plan.accept.threshold or 0.0)

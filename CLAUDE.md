@@ -17,7 +17,7 @@ Run these before committing to `main`:
 
 Expected outcomes:
 
-- 287 functional tests pass (1 skipped without a display).
+- 296 functional tests pass (1 skipped without a display).
 - Ruff reports `All checks passed!`.
 - Mypy reports `Success: no issues found in ... source files`.
 - Baseline reports `Baseline matches ...`.
@@ -55,6 +55,14 @@ and both are constrained on purpose:
 - **`classifier.pkl`**, per-folder and global, is loaded with `RestrictedUnpickler`
   (`store.py`). Never call bare `pickle.load` on either.
 
+A per-subject age reading may **add** exclusions, never cancel one the whole frame
+made. `strongly_minor` and `weak_adult` are a `frame_veto` that survives the
+per-subject verdict; the other two whole-frame tests are comparative and a real
+face crop outranks them. `np.where(has_readable_subjects, all_minor, age_fail)` on
+its own meant one readable adult face switched the frame's own answer off: measured
+on a frame with 0.98 child evidence, adding a second subject whose face read adult
+flipped it from excluded to scored with the child evidence unchanged.
+
 The age gate is not a property of the cascade pipeline: `pipeline="legacy"` runs it too.
 `exclude_minors` must mean the same thing in both pipelines.
 
@@ -80,9 +88,12 @@ thread reads: Tools > Duplicate groups and Tools > Clear cached scan data are bo
 reachable during a scan.
 
 So reads go through `_fetchall`/`_fetchone`, which hold the lock across execute **and**
-fetch. `_execute` released it as soon as the statement was issued and handed back a
-cursor, so the caller's `.fetchall()` ran unguarded — that returned truncated blobs
-(`np.load` raising "No data left in file") and silently dropped writes. The lock is an
+fetch. There used to be an `_execute` that released it as soon as the statement was
+issued and handed back a cursor, so the caller's `.fetchall()` ran unguarded — that
+returned truncated blobs (`np.load` raising "No data left in file") and silently dropped
+writes. It is deleted rather than left unused, because a method that hands back a cursor
+is an invitation to write the same bug again; `tests/SQLiteReadsStayLocked` fails if it
+comes back. The lock is an
 `RLock` so `clear()` can hold it across purge, close, unlink and schema rebuild; doing
 the rebuild outside it left a window where a reader saw a database with no tables.
 
@@ -100,11 +111,20 @@ alike:
   hand-made and nothing can rebuild them.
 
 `FolderStore.clear_cache()` defaults to `keep_decisions=True` and preserves the second
-group; `delete_decisions()` removes labels and notes only, and is a separate,
+group by **never touching those files at all** — `_clear_cache_dir(keep_names=...)`
+walks the directory and skips them, so no failure anywhere in the clear can lose
+them. It must never go back to reading them into memory and rmtree-ing the
+directory: a read failure was logged at WARNING and the file deleted anyway (routine
+on Windows, where antivirus and OneDrive hold files open), and a failed write-back
+had nothing left to restore from. Measured on 500 labels, either fault left zero
+behind while `notes.json` survived, so the loss was silent and partial.
+
+`delete_decisions()` removes labels and notes only, and is a separate,
 separately-worded menu action. `clear_cache()` used to rmtree the whole directory,
 which meant an action named for the recomputable half silently destroyed hours of
-review. Anything new that lands in the cache directory has to be classified into one of
-these two groups.
+review. Anything new that lands in the cache directory has to be classified into one
+of these two groups.
+
 
 ## Never Rewrite the User's Originals
 

@@ -72,10 +72,16 @@ def _unit_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     matrix = np.asarray(embeddings, dtype=np.float32)
     if matrix.ndim != 2:
         raise ValueError("embeddings must be a 2-D array")
-    norms = np.linalg.norm(matrix, axis=1)
-    # A zero vector has no direction, so it can never be near-identical to anything.
+    # Zeroed before the norm so an inf or NaN row cannot make the division below
+    # emit a runtime warning, and cannot produce a NaN unit vector that then rides
+    # through every LSH band for nothing.
+    finite = np.isfinite(matrix).all(axis=1)
+    clean = np.where(finite[:, None], matrix, 0.0)
+    norms = np.linalg.norm(clean, axis=1)
+    # A zero vector has no direction, so it can never be near-identical to anything,
+    # and neither can one the model could not produce a real number for.
     safe = np.where(norms > 0, norms, 1.0)
-    return (matrix / safe[:, None]).astype(np.float32), norms > 0
+    return (clean / safe[:, None]).astype(np.float32), finite & (norms > 0)
 
 
 def _candidate_pairs(

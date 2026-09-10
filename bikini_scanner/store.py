@@ -720,36 +720,53 @@ class FolderStore:
         It defaults to True because this used to rmtree the lot, and an action named
         for the recomputable half was quietly taking hours of human decisions with it.
         """
-        preserved: dict[str, bytes] = {}
+        keep: frozenset[str] = frozenset()
         if keep_decisions:
-            for path in (
-                self.labels_path,
-                self.notes_path,
-                self.config_override_path,
-                self.review_session_path,
-            ):
-                try:
-                    if path.exists():
-                        preserved[path.name] = path.read_bytes()
-                except OSError as exc:
-                    LOGGER.warning("Could not preserve %s while clearing the cache: %s", path, exc)
-        self._clear_cache_dir()
-        for name, payload in preserved.items():
-            try:
-                (self.cache_dir / name).write_bytes(payload)
-            except OSError as exc:
-                LOGGER.exception("Could not restore %s after clearing the cache: %s", name, exc)
+            keep = frozenset(
+                path.name
+                for path in (
+                    self.labels_path,
+                    self.notes_path,
+                    self.config_override_path,
+                    self.review_session_path,
+                )
+            )
+        self._clear_cache_dir(keep_names=keep)
 
-    def _clear_cache_dir(self) -> None:
+    def _clear_cache_dir(self, keep_names: frozenset[str] = frozenset()) -> None:
+        """Delete the cache directory's contents, except the names in `keep_names`.
+
+        The files named there are never read, moved or deleted — they are simply
+        skipped, so no failure anywhere in this method can lose them.
+
+        It used to rmtree the directory and carry the irreplaceable files across in
+        memory. Both halves of that could lose hours of review and only log it:
+        `labels.json` momentarily unreadable (antivirus, OneDrive, Dropbox all hold
+        files open on Windows) was logged at WARNING and then deleted anyway, and a
+        failed write-back afterwards had nothing left to restore from. Measured on 500
+        labels, either fault left zero behind while `notes.json` survived, so the loss
+        was silent and partial.
+        """
         if self.sqlite_cache is not None:
             try:
                 self.sqlite_cache.close()
             except Exception as exc:  # noqa: BLE001
-                # rmtree below is what actually matters; a close failure only risks a
-                # locked file on Windows, and knowing that is why it is logged.
+                # Deleting the file below is what actually matters; a close failure only
+                # risks a locked file on Windows, and knowing that is why it is logged.
                 LOGGER.warning("Could not close the SQLite cache before clearing it: %s", exc)
         if self.cache_dir.exists():
-            shutil.rmtree(self.cache_dir)
+            for entry in self.cache_dir.iterdir():
+                if entry.name in keep_names:
+                    continue
+                try:
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                except OSError as exc:
+                    # Everything reachable here is recomputable, so one stubborn file is
+                    # not worth abandoning the clear — but it must not pass in silence.
+                    LOGGER.warning("Could not remove %s while clearing the cache: %s", entry, exc)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.embeddings_path = self.cache_dir / "embeddings.npz"
         self.index_path = self.cache_dir / "embeddings_index.json"

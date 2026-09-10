@@ -2148,6 +2148,81 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(buckets[self.paths[3]], "False positives")
 
 
+class AgeGateFrameVeto(unittest.TestCase):
+    """A per-subject reading may add exclusions, never cancel the frame's own."""
+
+    @staticmethod
+    def _frame(with_readable_adult: bool) -> cascade.RegionScoreTable:
+        kinds: list[str] = []
+        subject: list[int] = []
+        rows: list[dict[str, float]] = []
+
+        def add(kind: str, who: int, child: float, adult: float, detail: float) -> None:
+            kinds.append(kind)
+            subject.append(who)
+            rows.append(
+                {
+                    "child": child, "adult": adult, "person": 0.95, "female": 0.95, "nsfw": 0.5,
+                    "bikini": detail, "cleavage": detail, "midriff": detail,
+                    "bikini_top": detail, "bikini_bottom": detail,
+                }
+            )
+
+        # Whole frame: overwhelming child evidence, strong swimwear evidence.
+        add(regions.KIND_FULL, -1, 0.99, 0.02, 0.95)
+        # An unaged subject: body crops, but a face too small to crop, so never `minor`.
+        for kind in (regions.KIND_CHEST, regions.KIND_WAIST, regions.KIND_TORSO):
+            add(kind, 0, 0.5, 0.5, 0.97)
+        if with_readable_adult:
+            add(regions.KIND_FACE, 1, 0.02, 0.99, 0.5)
+            add(regions.KIND_TORSO, 1, 0.5, 0.5, 0.55)
+        count = len(kinds)
+        return cascade.RegionScoreTable(
+            owner=np.zeros(count, dtype=np.int64),
+            kinds=np.array(kinds),
+            axis_scores={
+                axis: np.array([row[axis] for row in rows], dtype=np.float32) for axis in rows[0]
+            },
+            image_count=1,
+            full_row=np.array([0], dtype=np.int64),
+            subject=np.array(subject, dtype=np.int64),
+        )
+
+    def test_a_readable_adult_face_cannot_switch_off_the_frame_veto(self) -> None:
+        """One adult in shot used to un-exclude a frame that screamed minor.
+
+        The per-subject verdict replaced the whole-frame answer outright, so adding a
+        second subject whose face read clearly adult flipped the identical frame from
+        excluded to scored with its child evidence unchanged at 0.98. The soft gate
+        still zeroed the score, so it could not surface as a match, but it stopped
+        being filtered out of the results.
+        """
+        config = ScannerConfig()
+        self.assertTrue(config.exclude_minors, "the gate under test is off by default")
+        for readable in (False, True):
+            result = cascade.evaluate(
+                self._frame(readable),
+                config,
+                face_counts=np.array([1 if readable else 0], dtype=np.int32),
+            )
+            self.assertEqual(
+                result.stage[0],
+                cascade.STAGE_MINOR,
+                f"a frame with 0.98 child evidence was not age-gated (readable adult={readable})",
+            )
+            self.assertTrue(bool(result.excluded[0]))
+            self.assertEqual(float(result.score[0]), 0.0)
+
+    def test_a_frame_with_no_child_evidence_is_still_scored(self) -> None:
+        """The veto must not become a blanket exclusion."""
+        table = self._frame(True)
+        table.axis_scores["child"] = np.full(len(table.kinds), 0.02, dtype=np.float32)
+        table.axis_scores["adult"] = np.full(len(table.kinds), 0.98, dtype=np.float32)
+        result = cascade.evaluate(table, ScannerConfig(), face_counts=np.array([1], dtype=np.int32))
+        self.assertEqual(result.stage[0], cascade.STAGE_SCORED)
+        self.assertFalse(bool(result.excluded[0]))
+
+
 class AutoDecideCalibration(unittest.TestCase):
     """The scanner may only decide alone where it has earned the right to."""
 
@@ -2179,6 +2254,29 @@ class AutoDecideCalibration(unittest.TestCase):
         self.assertEqual(plan.accept_paths, ["hi.jpg"])
         self.assertEqual(plan.reject_paths, ["lo.jpg"])
         self.assertEqual(plan.remaining, 1, "the uncertain photo was decided anyway")
+
+    def test_a_refused_plan_still_reports_everything_as_remaining(self) -> None:
+        """It decided nothing, so nothing can have stopped remaining.
+
+        Found by fuzzing: 532 of 4000 random trials broke
+        decided + remaining == len(undecided_paths), because every early return left
+        `remaining` at its default of 0. Nothing renders it on a refused plan today,
+        but the obvious next use would report "0 left for you" for a folder of 80,000
+        undecided photos.
+        """
+        paths = [f"p{index}.jpg" for index in range(25)]
+        scores = [0.5] * 25
+        for labelled, truth in (
+            ([], []),                                   # nothing judged yet
+            ([0.9] * 60, [1] * 60),                     # all one verdict
+            ([0.9, 0.1], [1, 0]),                       # too few to measure
+        ):
+            plan = autodecide.plan_auto_decisions(paths, scores, labelled, truth)
+            self.assertFalse(plan.usable)
+            self.assertEqual(
+                plan.decided + plan.remaining, len(paths), f"partition broken for {plan.reason!r}"
+            )
+            self.assertEqual(plan.remaining, len(paths))
 
     def test_too_few_labels_decides_nothing_and_says_why(self) -> None:
         plan = autodecide.plan_auto_decisions(["a.jpg"], [0.9], [0.9, 0.1], [1, 0])
@@ -2283,6 +2381,22 @@ class NearDuplicateGrouping(unittest.TestCase):
         paths, embeddings, _ = self._folder([2, 2], rng)
         # Far above any real burst's similarity: nothing should survive it.
         self.assertEqual(duplicates.near_duplicate_groups(paths, embeddings, threshold=0.999999), [])
+
+    def test_an_unusable_embedding_is_never_anybodys_duplicate(self) -> None:
+        """inf and NaN rows used to be divided through, warning and yielding NaN units."""
+        import warnings
+
+        paths = ["inf.jpg", "nan.jpg", "a.jpg", "b.jpg"]
+        embeddings = np.array(
+            [[np.inf, 1.0, 0.0, 0.0], [np.nan, 0.0, 1.0, 0.0], [1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]],
+            dtype=np.float32,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            groups = duplicates.near_duplicate_groups(paths, embeddings)
+        self.assertEqual(groups, [["a.jpg", "b.jpg"]], "the genuine pair was not grouped")
+        grouped = {path for group in groups for path in group}
+        self.assertFalse({"inf.jpg", "nan.jpg"} & grouped, "a non-finite row was grouped")
 
     def test_a_zero_vector_is_never_anybodys_duplicate(self) -> None:
         """It has no direction, so it is not similar to anything, including itself."""
@@ -2438,6 +2552,68 @@ class CacheAndDecisions(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_clearing_the_cache_never_touches_what_it_promises_to_keep(self) -> None:
+        """It used to carry them through memory, and either end could lose them.
+
+        The old path read each irreplaceable file, rmtree'd the whole directory, then
+        wrote them back. A read failure was logged at WARNING and the file was deleted
+        anyway — routine on Windows, where antivirus and OneDrive hold files open — and
+        a failed write-back afterwards had nothing left to restore from. Measured on
+        500 labels, either fault left zero behind while notes.json survived, so the
+        loss was silent and partial. Nothing is read or moved now, so there is no
+        window at all: this asserts the files are not so much as opened.
+        """
+        guarded = {
+            self.store.labels_path.name,
+            self.store.notes_path.name,
+            self.store.config_override_path.name,
+            self.store.review_session_path.name,
+        }
+        touched: list[str] = []
+        real_unlink, real_read, real_rename = Path.unlink, Path.read_bytes, Path.rename
+
+        def watch(real, verb):
+            def guard(target, *args, **kwargs):
+                if target.name in guarded:
+                    touched.append(f"{verb} {target.name}")
+                return real(target, *args, **kwargs)
+
+            return guard
+
+        Path.unlink = watch(real_unlink, "deleted")  # type: ignore[method-assign]
+        Path.read_bytes = watch(real_read, "read")  # type: ignore[method-assign]
+        Path.rename = watch(real_rename, "moved")  # type: ignore[method-assign]
+        try:
+            self.store.clear_cache(keep_decisions=True)
+        finally:
+            Path.unlink = real_unlink  # type: ignore[method-assign]
+            Path.read_bytes = real_read  # type: ignore[method-assign]
+            Path.rename = real_rename  # type: ignore[method-assign]
+        self.assertEqual(touched, [], f"clear_cache put the irreplaceable files at risk: {touched}")
+        self.assertEqual(self.store.load_labels(), {self.paths[0]: 1, self.paths[1]: 0})
+        self.assertEqual(self.store.load_notes(), {self.paths[0]: "keep this one"})
+
+    def test_an_undeletable_recomputable_file_does_not_abort_the_clear(self) -> None:
+        """One stubborn file must not leave the rest of the cache behind."""
+        stubborn = self.store.cache_dir / "scan_metadata.json"
+        stubborn.write_text("{}", encoding="utf-8")
+        doomed = self.store.cache_dir / "face_counts.json"
+        doomed.write_text("{}", encoding="utf-8")
+        real_unlink = Path.unlink
+
+        def flaky(target, *args, **kwargs):
+            if target.name == stubborn.name:
+                raise PermissionError(32, "The process cannot access the file")
+            return real_unlink(target, *args, **kwargs)
+
+        Path.unlink = flaky  # type: ignore[method-assign]
+        try:
+            self.store.clear_cache(keep_decisions=True)
+        finally:
+            Path.unlink = real_unlink  # type: ignore[method-assign]
+        self.assertFalse(doomed.exists(), "the clear stopped at the first failure")
+        self.assertEqual(self.store.load_labels(), {self.paths[0]: 1, self.paths[1]: 0})
 
     def test_clearing_the_cache_keeps_decisions_notes_and_the_override(self) -> None:
         """The old behaviour rmtree'd the lot, including hours of hand-made decisions."""
@@ -3537,6 +3713,68 @@ class TrashBatching(unittest.TestCase):
                 sys.modules["send2trash"] = original
         self.assertFalse(outcome.available)
         self.assertEqual(outcome.trashed_count, 0)
+
+
+class UpdateCheckTrust(unittest.TestCase):
+    """The update URL is fetched automatically, so it gets the same guard as the VLM."""
+
+    def test_only_http_urls_are_ever_fetched(self) -> None:
+        """urlopen also speaks file: and ftp:, and neither is a release manifest."""
+        import bikini_scanner.update_checker as update_checker
+
+        opened: list[str] = []
+        original = update_checker.urlopen
+        update_checker.urlopen = lambda *a, **k: opened.append("fetched")  # type: ignore[assignment]
+        try:
+            for url in (
+                "file:///C:/Windows/win.ini",
+                "ftp://example.invalid/latest.json",
+                "javascript:alert(1)",
+                "not-a-url",
+                "http://",
+                "   ",
+            ):
+                self.assertIsNone(update_checker.check_for_update(url), f"{url!r} was accepted")
+        finally:
+            update_checker.urlopen = original
+        self.assertEqual(opened, [], "a non-http(s) update URL was actually fetched")
+
+    def test_an_ordinary_https_url_is_still_allowed_through(self) -> None:
+        import bikini_scanner.update_checker as update_checker
+
+        reached: list[str] = []
+
+        def fake_urlopen(request, timeout=None):
+            reached.append(request.full_url)
+            raise OSError("no network in tests")
+
+        original = update_checker.urlopen
+        update_checker.urlopen = fake_urlopen  # type: ignore[assignment]
+        try:
+            self.assertIsNone(update_checker.check_for_update("https://example.invalid/latest.json"))
+        finally:
+            update_checker.urlopen = original
+        self.assertEqual(reached, ["https://example.invalid/latest.json"])
+
+
+class SQLiteReadsStayLocked(unittest.TestCase):
+    """The cursor-outside-the-lock hazard must not be reintroduced."""
+
+    def test_there_is_no_execute_that_hands_back_a_cursor(self) -> None:
+        """It had no callers left, but it sat there inviting the original bug back.
+
+        Returning a cursor after releasing the lock is what returned truncated blobs
+        (np.load raising "No data left in file") and dropped writes, because the scan
+        worker writes while the main thread reads on the same connection.
+        """
+        from bikini_scanner.sqlite_cache import SQLiteCache
+
+        self.assertFalse(
+            hasattr(SQLiteCache, "_execute"),
+            "SQLiteCache._execute is back; reads must go through _fetchall/_fetchone",
+        )
+        for name in ("_fetchall", "_fetchone"):
+            self.assertTrue(hasattr(SQLiteCache, name), f"{name} is missing")
 
 
 class VLMEndpointTrust(unittest.TestCase):

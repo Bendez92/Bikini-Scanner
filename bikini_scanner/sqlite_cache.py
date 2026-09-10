@@ -87,23 +87,14 @@ class SQLiteCache:
     def _transaction(self) -> _SQLiteTransaction:
         return _SQLiteTransaction(self._lock, self._connect)
 
-    def _execute(
-        self,
-        sql: str,
-        parameters: tuple[Any, ...] | list[Any] = (),
-        conn: sqlite3.Connection | None = None,
-    ) -> sqlite3.Cursor:
-        if conn is not None:
-            return conn.execute(sql, parameters)
-        with self._lock:
-            return self._connect().execute(sql, parameters)
-
-    # Reads must fetch inside the lock. _execute released it as soon as the statement
-    # was issued and handed the cursor back, so the caller's .fetchall() ran unguarded
-    # on a connection another thread could be using — the scan worker writes while the
-    # main thread answers Tools > Duplicate groups, which shares one connection. That
-    # interleaving returned truncated rows (np.load raising "No data left in file") and
-    # dropped writes.
+    # Reads must fetch inside the lock. There used to be an `_execute` here that
+    # released it as soon as the statement was issued and handed the cursor back, so
+    # the caller's .fetchall() ran unguarded on a connection another thread could be
+    # using — the scan worker writes while the main thread answers Tools > Duplicate
+    # groups, which shares one connection. That interleaving returned truncated rows
+    # (np.load raising "No data left in file") and dropped writes. Its callers were
+    # moved to the two helpers below; the method itself is gone rather than left as a
+    # loaded gun for the next query somebody adds.
     def _fetchall(
         self, sql: str, parameters: tuple[Any, ...] | list[Any] = ()
     ) -> list[tuple[Any, ...]]:

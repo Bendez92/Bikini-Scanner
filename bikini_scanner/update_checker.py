@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .__version__ import __version__
@@ -22,6 +23,13 @@ def _version_tuple(value: str) -> tuple[int, ...]:
 
 def check_for_update(url: str, timeout: float = 3.0) -> dict[str, str] | None:
     if not url.strip():
+        return None
+    # urlopen also speaks file: and ftp:, so an update URL pointing at a local path
+    # would be read and parsed as a release manifest. VLMClient already refuses
+    # everything but http(s) for exactly this reason; this is the same guard.
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        LOGGER.warning("Refusing to check for updates at a non-http(s) URL: %s", url)
         return None
     try:
         request = Request(url, headers={"Accept": "application/json", "User-Agent": "BikiniScanner"})

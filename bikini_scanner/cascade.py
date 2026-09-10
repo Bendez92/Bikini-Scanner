@@ -546,8 +546,17 @@ def evaluate(
             has_face & (detail >= float(config.weak_adult_detail)) & (adult < float(config.min_adult_confidence))
         )
         age_fail = looks_minor | strongly_minor | reads_younger | weak_adult
+        # The two whole-frame tests a per-subject reading may never overrule. The other
+        # two are comparative — they weigh child evidence against adult evidence across
+        # the whole frame — and reading one person's own face is strictly better
+        # evidence than that, which is what the per-subject verdict is for. These two
+        # are not comparative: one is overwhelming child evidence on its own terms, and
+        # the other is the guard that stops an unaged subject riding out on somebody
+        # else's adult reading.
+        frame_veto = strongly_minor | weak_adult
     else:
         age_fail = np.zeros((count,), dtype=bool)
+        frame_veto = np.zeros((count,), dtype=bool)
 
     if subjects is not None:
         # Where a face was actually read, that reading decides. The whole-frame tests
@@ -555,7 +564,14 @@ def evaluate(
         # subjects all lost their face crop to the minimum-size rule, because there the
         # per-subject verdict has nothing to go on and handing it the decision would
         # replace a real answer with an empty one.
-        age_fail = np.where(subjects.has_readable_subjects, subjects.all_minor, age_fail)
+        # The per-subject verdict may *add* exclusions, never remove one. It used to
+        # replace the whole-frame answer outright, so a single readable adult face
+        # switched the frame veto off: measured on one frame with child evidence 0.98,
+        # adding a second subject whose face read clearly adult flipped it from
+        # excluded to scored, with the child evidence unchanged. The soft gate still
+        # zeroed its score, so it could not surface as a match — but it stopped being
+        # filtered out and became visible in the results.
+        age_fail = np.where(subjects.has_readable_subjects, subjects.all_minor, age_fail) | frame_veto
 
     if config.require_person:
         person_conf = _ramp(person, float(config.person_gate_threshold), float(config.person_gate_threshold) + 0.2)
