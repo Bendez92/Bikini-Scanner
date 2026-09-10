@@ -208,9 +208,19 @@ class GlobalLearningStore:
                 features[key] = feature
             if len(index) > MAX_ENTRIES:
                 ordered = sorted(index.items(), key=lambda item: int(item[1].get("seq", 0)))
-                for key, _ in ordered[: len(index) - MAX_ENTRIES]:
+                evicted = {key for key, _ in ordered[: len(index) - MAX_ENTRIES]}
+                for key in evicted:
                     index.pop(key, None)
                     features.pop(key, None)
+                # An evicted row can never be consulted again, so its retained mark is
+                # dead weight. Without this the list grew by one key per deleted photo
+                # for the life of the install and was rewritten in full on every retain.
+                retained = self._load_retained()
+                if retained & evicted:
+                    try:
+                        atomic_write_json(self.retained_path, sorted(retained - evicted))
+                    except Exception:
+                        LOGGER.exception("Could not prune the retained-label list")
             # Only keep features that still have a label, and vice versa.
             for key in list(features):
                 if key not in index:

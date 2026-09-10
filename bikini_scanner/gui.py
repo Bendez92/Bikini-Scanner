@@ -70,6 +70,7 @@ from .output_ops import (
     format_output_name,
     label_name,
     organization_parts,
+    trash_available,
     trash_files,
     write_image_metadata,
 )
@@ -368,8 +369,17 @@ class BikiniScannerApp:
         self._near_duplicate_index: dict[str, list[str]] = {}
         self._near_duplicate_state: ScoreState | None = None
         self._near_duplicate_busy = False
+        # Held-out accuracy for auto-decide: (state, blended out-of-fold scores,
+        # their true labels). Expensive enough to need a worker, and independent of
+        # the confidence target, so it is measured once per state.
+        self._oof_measurement: tuple[ScoreState, list[float], list[int]] | None = None
+        self._oof_busy = False
+        self._oof_ready_callbacks: list[Callable[[], None]] = []
         # Where a Shift-click measures its range from.
         self._selection_anchor: str | None = None
+        # Whether the status bar is currently showing a selection count, so clearing
+        # the selection only overwrites a message the selection itself put there.
+        self._selection_announced = False
         # Bumped whenever `displayed_samples` is rebuilt, so anything derived from
         # that list can cache against it instead of walking the folder again.
         self._display_generation = 0
@@ -6448,6 +6458,24 @@ class BikiniScannerApp:
         scorer = self.scorer
         if state is None or scorer is None or state.features is None:
             return None
+        # Cached against the state it was measured on. The measurement does not depend
+        # on the confidence target, so changing that in the dialog must not re-run it.
+        cached = self._oof_measurement
+        if cached is not None and cached[0] is state:
+            return cached[1], cached[2]
+        return None
+
+    def _measure_out_of_fold(self, state: ScoreState) -> tuple[list[float], list[int]] | None:
+        """The out-of-fold measurement itself. Safe to call off the main thread.
+
+        Touches nothing but the state passed in and the label map handed to it, so it
+        can run on a worker: it fits one model per fold over every labelled row, which
+        after a first auto-decide pass means tens of thousands of rows and minutes of
+        work. Doing that inline froze the window with the dialog already painted.
+        """
+        scorer = self.scorer
+        if scorer is None or state.features is None:
+            return None
         labels = self._label_map()
         rows = [
             index for index, path in enumerate(state.paths) if labels.get(str(path)) in (0, 1)
@@ -6473,6 +6501,52 @@ class BikiniScannerApp:
         blended = (1.0 - weight) * zero_shot + weight * np.asarray(learned, dtype=np.float64)
         return [float(value) for value in blended], truth
 
+    def ensure_out_of_fold(self, on_ready: Callable[[], None]) -> bool:
+        """Measure held-out accuracy for the current state, off the main thread.
+
+        Returns True when the answer is already in hand, in which case `on_ready` is
+        not called; otherwise a worker is started and `on_ready` runs on the main
+        thread when it lands.
+        """
+        state = self.current_state
+        if state is None:
+            return True
+        cached = self._oof_measurement
+        if cached is not None and cached[0] is state:
+            return True
+        # Registered before the busy check: a second caller arriving while the first
+        # measurement is in flight still has to be told when it lands, or its dialog
+        # sits on "Measuring…" for good.
+        self._oof_ready_callbacks.append(on_ready)
+        if self._oof_busy:
+            return False
+
+        self._oof_busy = True
+
+        def worker() -> None:
+            try:
+                measured = self._measure_out_of_fold(state)
+            except Exception:
+                LOGGER.exception("Held-out measurement failed")
+                measured = None
+            self._after(0, lambda found=measured: self._out_of_fold_ready(state, found))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return False
+
+    def _out_of_fold_ready(
+        self, state: ScoreState, measured: tuple[list[float], list[int]] | None
+    ) -> None:
+        self._oof_busy = False
+        if self.current_state is state and measured is not None:
+            self._oof_measurement = (state, measured[0], measured[1])
+        callbacks, self._oof_ready_callbacks = self._oof_ready_callbacks, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                LOGGER.exception("Auto-decide callback failed")
+
     def auto_decide_plan(self, target: float) -> autodecide.AutoDecidePlan:
         """What the scanner could decide alone at this confidence, and at what cost."""
         state = self.current_state
@@ -6483,8 +6557,12 @@ class BikiniScannerApp:
             return autodecide.AutoDecidePlan(
                 target=target,
                 reason=(
-                    f"Judge about {autodecide.MIN_SUPPORT} photos first, with some of each "
-                    "verdict. Until then there is no measured accuracy to trust."
+                    "Measuring how accurate the scanner has been…"
+                    if self._oof_busy
+                    else (
+                        f"Judge about {autodecide.MIN_SUPPORT} photos first, with some of each "
+                        "verdict. Until then there is no measured accuracy to trust."
+                    )
                 ),
             )
         labelled_scores, truth = measured
@@ -6558,6 +6636,13 @@ class BikiniScannerApp:
         current: dict[str, autodecide.AutoDecidePlan] = {}
 
         def recompute(*_args: object) -> None:
+            # The measurement runs on a worker, so this can fire after the dialog has
+            # been closed; every widget it touches would already be destroyed.
+            try:
+                if not dialog.winfo_exists():
+                    return
+            except Exception:  # noqa: BLE001
+                return
             try:
                 target = float(target_var.get())
             except ValueError:
@@ -6616,7 +6701,11 @@ class BikiniScannerApp:
 
         apply_button.configure(command=apply)
         picker.bind("<<ComboboxSelected>>", recompute)
-        self._after(0, recompute)
+        # The measurement fits a model per fold over every label, so it runs on a
+        # worker; the dialog paints "Measuring…" and fills in when it lands.
+        # Every later target change reuses it, so only this first pass ever waits.
+        if self.ensure_out_of_fold(recompute):
+            self._after(0, recompute)
 
     # --- near-duplicate bursts ----------------------------------------------
     def _toggle_near_duplicates(self) -> None:
@@ -6682,18 +6771,31 @@ class BikiniScannerApp:
         )
         self._render_samples()
 
+    def _duplicate_index(self) -> dict[str, list[str]]:
+        """The burst groups, but only while they still describe this scan.
+
+        A rescan replaces `current_state` — "reject and delete" ends in one — and
+        nothing recomputes the grouping for it. Using the old index anyway expanded
+        decisions through groups built from a different set of photos, including ones
+        already in the recycle bin.
+        """
+        if self._near_duplicate_state is not self.current_state:
+            return {}
+        return self._near_duplicate_index
+
     def _duplicate_group(self, path: str) -> list[str]:
         """Every photo sharing this one's shot, itself included."""
-        return self._near_duplicate_index.get(path, [])
+        return self._duplicate_index().get(path, [])
 
     def _expand_to_duplicates(self, paths: Sequence[str]) -> list[str]:
         """Widen a decision to whole bursts, when the reviewer asked for that."""
-        if not self.near_duplicate_var.get() or not self._near_duplicate_index:
+        index = self._duplicate_index()
+        if not self.near_duplicate_var.get() or not index:
             return list(paths)
         expanded: list[str] = []
         seen: set[str] = set()
         for path in paths:
-            for member in self._duplicate_group(path) or [path]:
+            for member in index.get(path) or [path]:
                 if member not in seen:
                     seen.add(member)
                     expanded.append(member)
@@ -6766,6 +6868,21 @@ class BikiniScannerApp:
         self._apply_focus_visuals()
         self._announce_selection()
 
+    def _decision_moves_photos(self) -> bool:
+        """Whether one decision can change which samples the grid should show.
+
+        The all-results view keeps decided photos in place, so normally a decision
+        cannot change the displayed list and the expensive re-filter is skipped. Two
+        filters break that: asking for the labelled, unlabelled or skipped ones by
+        name is answered before the keep-decided rule in `_sample_visible`, and the
+        search box matches against the decision word. With either of those active a
+        decision does move photos, and skipping the refresh left one on screen that
+        the filter had just excluded.
+        """
+        if self.label_filter_var.get().strip() not in ("", "all"):
+            return True
+        return bool(self.search_var.get().strip())
+
     def _prune_selection(self) -> None:
         """Drop anything no longer on the page. Called when the page is rebuilt.
 
@@ -6783,6 +6900,11 @@ class BikiniScannerApp:
             self.status_var.set(
                 f"{count} selected — A accepts, D rejects, S skips all {count}. Esc clears."
             )
+        elif self._selection_announced:
+            # Saying nothing left the old count on screen still promising that A would
+            # accept photos that are no longer selected.
+            self.status_var.set("Selection cleared.")
+        self._selection_announced = bool(count)
 
     def _decision_targets(self, path: str | None = None) -> list[str]:
         """Which photos one Accept/REJECT applies to.
@@ -7676,13 +7798,27 @@ class BikiniScannerApp:
             ]
         return []
 
-    def _band_paths(self, band: str) -> list[str]:
-        """Every path in one band, across all pages rather than the page on screen."""
-        return [
-            str(sample["path"])
-            for sample in self.displayed_samples
-            if str(sample.get("bucket", "")) == band
-        ]
+    def _band_paths(self, band: str, deletable_only: bool = False) -> list[str]:
+        """Every path in one band, across all pages rather than the page on screen.
+
+        `deletable_only` drops the photos an explicit decision says to keep. The
+        all-results view deliberately keeps decided photos on screen, so without it a
+        band action reached everything the reviewer had already judged — and for
+        "reject and delete" that meant overwriting an Accept and binning the file.
+        """
+        labels = self._label_map() if deletable_only else {}
+        paths: list[str] = []
+        for sample in self.displayed_samples:
+            if str(sample.get("bucket", "")) != band:
+                continue
+            path = str(sample["path"])
+            # Accepted and Skipped both say "not this one": accepted is the opposite
+            # verdict, and skipped means come back to it. An already-rejected photo is
+            # the same verdict, so deleting it destroys nothing.
+            if deletable_only and labels.get(path) in (1, 2):
+                continue
+            paths.append(path)
+        return paths
 
     def export_band(self, band: str) -> None:
         """Export one band's photos, the same way Export matches exports its own set."""
@@ -7718,9 +7854,25 @@ class BikiniScannerApp:
         if self.current_state is None:
             messagebox.showinfo("No results", "Run a scan first.")
             return
-        paths = self._band_paths(band)
+        # Checked before anything is written: the labels below are permanent and are
+        # marked to keep teaching after their files are gone, so discovering only
+        # afterwards that nothing can be deleted leaves half an action done.
+        available, why = trash_available()
+        if not available:
+            messagebox.showinfo(
+                "Trash unavailable",
+                f"Recycle-bin support is unavailable, so nothing can be deleted: {why}\n\n"
+                "Nothing has been rejected either — this action does both or neither.",
+            )
+            return
+        paths = self._band_paths(band, deletable_only=True)
+        held_back = len(self._band_paths(band)) - len(paths)
         if not paths:
-            messagebox.showinfo("Nothing to delete", f"There are no photos in “{band}”.")
+            messagebox.showinfo(
+                "Nothing to delete",
+                f"There are no photos in “{band}” left to reject."
+                + (f"\n\nAll {held_back} of them are ones you accepted or skipped." if held_back else ""),
+            )
             return
         count = len(paths)
         if not messagebox.askyesno(
@@ -7729,8 +7881,13 @@ class BikiniScannerApp:
             f"{'them' if count != 1 else 'it'} to the recycle bin?\n\n"
             "The scanner learns from the rejections, and keeps learning from them after "
             "the files are gone.\n\n"
-            "The files go to the recycle bin, so you can restore them from there. "
-            "Anything you have already decided is not included.",
+            "The files go to the recycle bin, so you can restore them from there."
+            + (
+                f"\n\n{held_back} photo{'s' if held_back != 1 else ''} you accepted or skipped "
+                f"{'are' if held_back != 1 else 'is'} left alone."
+                if held_back
+                else ""
+            ),
             default="no",
             icon="warning",
         ):
@@ -8340,7 +8497,7 @@ class BikiniScannerApp:
         # grid still showed every photo the reviewer had just decided — the click
         # looked like it had done nothing at all.
         if self.current_state is not None:
-            if self.view_mode == "triage":
+            if self.view_mode == "triage" and not self._decision_moves_photos():
                 # Nothing to re-decide: the bands are cut off the score, and a decided
                 # photo keeps its place and fades. So the displayed list and its order
                 # are provably unchanged, and the cards were repainted above.
@@ -8424,7 +8581,14 @@ class BikiniScannerApp:
         if not targets:
             return
         if len(targets) == 1:
+            # Cleared first, so the card repaints as decided rather than keeping the
+            # selection border — and so it does not silently join the next click.
+            had_selection = bool(self.selected_paths)
+            self.selected_paths = set()
             self.set_label(targets[0], label)
+            if had_selection:
+                self._apply_focus_visuals()
+                self._announce_selection()
             return
         verb = {1: "Accepted", 0: "REJECTED", 2: "Skipped"}.get(int(label), "Labelled")
         picked = len(self.selected_paths) or 1

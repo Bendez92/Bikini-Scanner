@@ -62,6 +62,7 @@ from bikini_scanner import (
     safe_io,
     vision_analysis,
 )
+from bikini_scanner import global_store as global_store_module
 from bikini_scanner import run as run_module
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
@@ -688,6 +689,36 @@ class Learning(unittest.TestCase):
         # Clearing the label retires it for good, retained or not.
         store.forget([str(kept)])
         self.assertEqual(len(store.training_set(expected_dim=4)), 0)
+        store.clear()
+
+    def test_evicting_an_entry_drops_its_retained_mark_too(self) -> None:
+        """Otherwise the list grows by a key per deleted photo, for good.
+
+        `record` prunes the oldest rows once the store passes MAX_ENTRIES. A retained
+        key whose row has gone can never be consulted again, so leaving it behind is a
+        leak in a file that is rewritten in full on every retain.
+        """
+        store = GlobalLearningStore(model_name="retain-evict-test")
+        store.clear()
+        folder = Path(tempfile.mkdtemp(prefix="bikini_evict_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        old = folder / "old.jpg"
+        old.write_bytes(b"x")
+        store.record([(str(old), 0, np.ones(4, dtype=np.float32))], sequence=1)
+        store.retain([str(old)])
+        self.assertIn(str(old), [str(path) for path in store.training_set(expected_dim=4).paths])
+        # Push it out with newer rows, more than the store will keep.
+        original_max = global_store_module.MAX_ENTRIES
+        global_store_module.MAX_ENTRIES = 2
+        try:
+            for index in range(3):
+                fresh = folder / f"new{index}.jpg"
+                fresh.write_bytes(b"x")
+                store.record([(str(fresh), 1, np.ones(4, dtype=np.float32))], sequence=10 + index)
+        finally:
+            global_store_module.MAX_ENTRIES = original_max
+        retained = json.loads(store.retained_path.read_text(encoding="utf-8"))
+        self.assertEqual(retained, [], "the evicted row kept its retained mark")
         store.clear()
 
     def test_retaining_is_visible_to_a_training_set_already_cached(self) -> None:
@@ -1523,17 +1554,149 @@ class GuiReviewQueue(unittest.TestCase):
             trashed.extend(paths),
         )
         original = gui_module.messagebox.askyesno
+        original_available = gui_module.trash_available
         gui_module.messagebox.askyesno = lambda *a, **k: True
+        # Not every machine has send2trash; without this the action would refuse
+        # with a modal and the test would hang on it.
+        gui_module.trash_available = lambda: (True, "")
         try:
             self.app.reject_and_delete_band("Probable reject")
         finally:
             gui_module.messagebox.askyesno = original
+            gui_module.trash_available = original_available
         assert self.app.store is not None
         labels = self.app.store.load_labels()
         self.assertTrue(all(labels.get(path) == 0 for path in targets), "the band was not rejected")
         self.assertEqual(sorted(retained), sorted(targets))
         self.assertEqual(sorted(trashed), sorted(targets))
         self.assertEqual(order, ["retain", "trash"], "the files went before the labels were secured")
+
+    def test_reject_and_delete_leaves_photos_you_already_judged_alone(self) -> None:
+        """It used to overwrite an Accept and bin the file, while promising not to.
+
+        The all-results view deliberately keeps decided photos on screen, so a band
+        action reached everything the reviewer had already judged — including a photo
+        they had rescued from the reject band by accepting it.
+        """
+        from bikini_scanner import gui as gui_module
+
+        self._spread_scores()
+        self.app.show_all_results()
+        band = self.app._band_paths("Probable reject")
+        self.assertGreaterEqual(len(band), 2)
+        rescued, skipped = band[0], band[1]
+        assert self.app.store is not None
+        self.app.store.save_labels({rescued: 1, skipped: 2})
+        self.app.show_all_results()
+        trashed: list[str] = []
+        self.app._trash_and_report = lambda paths: trashed.extend(paths)  # type: ignore[method-assign]
+        self.app._retain_global_labels = lambda paths: None  # type: ignore[method-assign]
+        original = gui_module.messagebox.askyesno
+        original_info = gui_module.messagebox.showinfo
+        original_available = gui_module.trash_available
+        gui_module.messagebox.askyesno = lambda *a, **k: True
+        gui_module.messagebox.showinfo = lambda *a, **k: None
+        gui_module.trash_available = lambda: (True, "")
+        try:
+            self.app.reject_and_delete_band("Probable reject")
+        finally:
+            gui_module.messagebox.askyesno = original
+            gui_module.messagebox.showinfo = original_info
+            gui_module.trash_available = original_available
+        labels = self.app.store.load_labels()
+        self.assertEqual(labels.get(rescued), 1, "an accepted photo was re-labelled REJECT")
+        self.assertEqual(labels.get(skipped), 2, "a skipped photo was re-labelled REJECT")
+        self.assertNotIn(rescued, trashed, "an accepted photo was moved to the recycle bin")
+        self.assertNotIn(skipped, trashed, "a skipped photo was moved to the recycle bin")
+
+    def test_reject_and_delete_writes_nothing_when_the_bin_is_unavailable(self) -> None:
+        """Both halves or neither: the labels are permanent and keep training."""
+        from bikini_scanner import gui as gui_module
+
+        self._spread_scores()
+        self.app.show_all_results()
+        band = self.app._band_paths("Probable reject")
+        retained: list[str] = []
+        self.app._retain_global_labels = lambda paths: retained.extend(paths)  # type: ignore[method-assign]
+        original_available = gui_module.trash_available
+        original_ask = gui_module.messagebox.askyesno
+        original_info = gui_module.messagebox.showinfo
+        gui_module.trash_available = lambda: (False, "send2trash is not installed")
+        gui_module.messagebox.askyesno = lambda *a, **k: True
+        # The refusal is itself a modal, and in a test nobody presses OK.
+        gui_module.messagebox.showinfo = lambda *a, **k: None
+        try:
+            self.app.reject_and_delete_band("Probable reject")
+        finally:
+            gui_module.trash_available = original_available
+            gui_module.messagebox.askyesno = original_ask
+            gui_module.messagebox.showinfo = original_info
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertTrue(
+            all(labels.get(path) is None for path in band),
+            "the band was rejected even though nothing could be deleted",
+        )
+        self.assertEqual(retained, [], "labels were retained for a deletion that never happened")
+
+    def test_a_decision_still_refreshes_when_a_label_filter_is_hiding_it(self) -> None:
+        """The fast path's premise fails when a filter answers on the label itself."""
+        self._spread_scores()
+        self.app.label_filter_var.set("unlabeled")
+        self.app.show_all_results()
+        target = str(self.app.page_samples[0]["path"])
+        self.app.set_label(target, 1)
+        self.assertNotIn(
+            target,
+            [str(sample["path"]) for sample in self.app.page_samples],
+            "a decided photo stayed on screen while 'Labels: unlabeled' was set",
+        )
+
+    def test_deciding_one_selected_card_clears_the_selection(self) -> None:
+        """It kept its selection border and joined the next click."""
+        self._spread_scores()
+        self.app.show_all_results()
+        order = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.click_card(order[2], toggle=True)
+        self.assertEqual(self.app.selected_paths, {order[2]})
+        self.app.label_selection(0)
+        self.assertEqual(self.app.selected_paths, set(), "a one-card selection survived its decision")
+        self.assertEqual(self.app.cards[order[2]].style, "DimCard.TFrame")
+
+    def test_clearing_the_selection_says_so(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        self.app.select_all_on_page()
+        self.assertIn("selected", self.app.status_var.get())
+        self.app.clear_selection()
+        self.assertNotIn("selected —", self.app.status_var.get())
+
+    def test_burst_groups_are_dropped_once_they_describe_another_scan(self) -> None:
+        """A rescan replaces the state; the old grouping must stop expanding."""
+        self._spread_scores()
+        self.app.show_all_results()
+        group = self._link_a_burst()
+        self.app.near_duplicate_var.set(True)
+        self.assertEqual(self.app._expand_to_duplicates([group[0]]), group)
+        # A rescan hands over a new state object; nothing has regrouped it yet.
+        state = self.app.current_state
+        assert state is not None
+        self.app.current_state = scorer_module.ScoreState(
+            paths=list(state.paths),
+            embeddings=state.embeddings,
+            zero_shot_scores=state.zero_shot_scores,
+            scores=state.scores,
+            axis_scores=state.axis_scores,
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=state.excluded,
+        )
+        self.assertEqual(
+            self.app._expand_to_duplicates([group[0]]),
+            [group[0]],
+            "a decision expanded through groups built for a previous scan",
+        )
 
     def test_declining_the_reject_and_delete_prompt_changes_nothing(self) -> None:
         from bikini_scanner import gui as gui_module
@@ -1544,11 +1707,17 @@ class GuiReviewQueue(unittest.TestCase):
         trashed: list[str] = []
         self.app._trash_and_report = lambda paths: trashed.extend(paths)  # type: ignore[method-assign]
         original = gui_module.messagebox.askyesno
+        original_info = gui_module.messagebox.showinfo
+        original_available = gui_module.trash_available
         gui_module.messagebox.askyesno = lambda *a, **k: False
+        gui_module.messagebox.showinfo = lambda *a, **k: None
+        gui_module.trash_available = lambda: (True, "")
         try:
             self.app.reject_and_delete_band("Probable reject")
         finally:
             gui_module.messagebox.askyesno = original
+            gui_module.messagebox.showinfo = original_info
+            gui_module.trash_available = original_available
         assert self.app.store is not None
         labels = self.app.store.load_labels()
         self.assertEqual(trashed, [], "files were binned after the prompt was declined")
@@ -1745,6 +1914,53 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(plan.accept_paths, [])
         self.assertEqual(plan.reject_paths, [])
         self.assertTrue(plan.reason, "the refusal gave no reason")
+
+    def test_the_held_out_measurement_runs_off_the_main_thread(self) -> None:
+        """It fits a model per fold over every label, so it cannot run inline.
+
+        After a first auto-decide pass writes tens of thousands of labels, doing this
+        on the main thread froze the window for minutes with the dialog already
+        painted — and repeated the whole cost on every change of confidence.
+        """
+        self._spread_scores()
+        self.app.show_all_results()
+        ran_on: list[str] = []
+        measured: list[tuple[list[float], list[int]] | None] = [([0.9] * 60, [1] * 30 + [0] * 30)]
+
+        def fake_measure(state: object) -> tuple[list[float], list[int]] | None:
+            ran_on.append(threading.current_thread().name)
+            return measured[0]
+
+        self.app._measure_out_of_fold = fake_measure  # type: ignore[method-assign]
+        landed: list[int] = []
+        self.assertFalse(
+            self.app.ensure_out_of_fold(lambda: landed.append(1)),
+            "the first call claimed the answer was already in hand",
+        )
+        # Wait for the worker itself. The hand-back goes through root.after from that
+        # thread, which needs a running mainloop the harness does not have, so the
+        # delivery half is driven directly below rather than polled for.
+        for _ in range(400):
+            if ran_on:
+                break
+            time.sleep(0.01)
+        self.assertTrue(ran_on, "the measurement never ran")
+        self.assertNotEqual(ran_on[0], "MainThread", "the measurement ran on the UI thread")
+        self.app._out_of_fold_ready(self.app.current_state, measured[0])  # type: ignore[arg-type]
+        self.assertEqual(landed, [1], "the waiter was never called back")
+        # Measured once per state: changing the confidence must not re-run it.
+        self.assertTrue(self.app.ensure_out_of_fold(lambda: landed.append(2)))
+        self.assertEqual(len(ran_on), 1, "the measurement was repeated for the same state")
+
+    def test_a_second_waiter_is_not_forgotten_while_a_measurement_runs(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        self.app._measure_out_of_fold = lambda state: None  # type: ignore[method-assign]
+        landed: list[int] = []
+        self.app._oof_busy = True
+        self.assertFalse(self.app.ensure_out_of_fold(lambda: landed.append(1)))
+        self.app._out_of_fold_ready(self.app.current_state, None)  # type: ignore[arg-type]
+        self.assertEqual(landed, [1], "a caller arriving mid-measurement never heard back")
 
     def test_auto_decide_declines_when_the_state_carries_no_features(self) -> None:
         """An older cached state has no feature matrix, so nothing can be measured."""
@@ -1946,6 +2162,24 @@ class NearDuplicateGrouping(unittest.TestCase):
         paths, embeddings, _ = self._folder([2], rng)
         self.assertEqual(duplicates.near_duplicate_groups(paths[:1], embeddings), [])
         self.assertEqual(duplicates.near_duplicate_groups([], np.empty((0, 4), dtype=np.float32)), [])
+
+    def test_the_candidate_pairs_are_capped_rather_than_left_to_grow(self) -> None:
+        """Bucket size is bounded; the total was not, and it grows quadratically.
+
+        A folder of one subject buckets far more unevenly than random vectors, so the
+        pair set — the peak memory of the whole pass — could reach tens of millions of
+        entries. Past the ceiling the grouping degrades by finding fewer bursts, which
+        is the right way for it to fail.
+        """
+        rng = np.random.default_rng(16)
+        paths, embeddings, shot_of = self._folder([4] * 20, rng)
+        capped = duplicates.near_duplicate_groups(paths, embeddings, max_pairs=1)
+        # Whatever survives the cap must still be correct, never a wrong merge.
+        for group in capped:
+            self.assertEqual(len({shot_of[path] for path in group}), 1)
+        full = duplicates.near_duplicate_groups(paths, embeddings)
+        self.assertGreaterEqual(len(full), len(capped))
+        self.assertEqual(sum(len(group) for group in full), 80)
 
     def test_grouping_is_transitive_across_a_long_burst(self) -> None:
         """Frame 1 and frame 8 may not pair directly; the union-find still joins them."""

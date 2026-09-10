@@ -36,6 +36,13 @@ BITS = 12
 # flat grey frames, say — would otherwise reintroduce the quadratic blow-up this whole
 # approach exists to avoid.
 MAX_BUCKET = 512
+# Hard ceiling on candidate pairs held at once. MAX_BUCKET bounds one bucket, not the
+# total, and the total grows with the square of the bucket size: a folder of 80 000
+# photos of one subject — the case this exists for — buckets far more unevenly than
+# random vectors, and buckets averaging ~150 members would hold tens of millions of
+# pairs. Past this the grouping is merged from what it already has, so it degrades by
+# finding fewer groups rather than by exhausting memory.
+MAX_PAIRS = 4_000_000
 
 
 class _Union:
@@ -72,12 +79,24 @@ def _unit_rows(embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _candidate_pairs(
-    unit: np.ndarray, usable: np.ndarray, bands: int, bits: int, seed: int, max_bucket: int
-) -> set[tuple[int, int]]:
-    """Row pairs worth comparing exactly, from the LSH signatures."""
-    dim = int(unit.shape[1])
+    unit: np.ndarray,
+    usable: np.ndarray,
+    bands: int,
+    bits: int,
+    seed: int,
+    max_bucket: int,
+    max_pairs: int = MAX_PAIRS,
+) -> set[int]:
+    """Row pairs worth comparing exactly, from the LSH signatures.
+
+    Pairs are packed into one integer each (`left * rows + right`) rather than kept
+    as tuples: a set of ints costs roughly a third of a set of two-element tuples,
+    and this set is the peak memory of the whole pass.
+    """
+    rows, dim = int(unit.shape[0]), int(unit.shape[1])
     rng = np.random.default_rng(seed)
-    pairs: set[tuple[int, int]] = set()
+    pairs: set[int] = set()
+    capped = False
     weights = 1 << np.arange(bits, dtype=np.int64)
     for band in range(bands):
         planes = rng.normal(size=(dim, bits)).astype(np.float32)
@@ -97,7 +116,19 @@ def _candidate_pairs(
                 members = members[:max_bucket]
             for position, left in enumerate(members):
                 for right in members[position + 1 :]:
-                    pairs.add((left, right) if left < right else (right, left))
+                    low, high_index = (left, right) if left < right else (right, left)
+                    pairs.add(low * rows + high_index)
+            if len(pairs) >= max_pairs:
+                capped = True
+                break
+        if capped:
+            break
+    if capped:
+        LOGGER.warning(
+            "Near-duplicate search hit its %d candidate-pair ceiling; grouping from what "
+            "was collected so far, so some bursts may be missed.",
+            max_pairs,
+        )
     return pairs
 
 
@@ -109,6 +140,7 @@ def near_duplicate_groups(
     bits: int = BITS,
     seed: int = 0,
     max_bucket: int = MAX_BUCKET,
+    max_pairs: int = MAX_PAIRS,
 ) -> list[list[str]]:
     """Group photos that are the same shot, near enough to share one verdict.
 
@@ -122,12 +154,15 @@ def near_duplicate_groups(
     unit, usable = _unit_rows(matrix)
     if not usable.any():
         return []
-    pairs = _candidate_pairs(unit, usable, bands=bands, bits=bits, seed=seed, max_bucket=max_bucket)
+    pairs = _candidate_pairs(
+        unit, usable, bands=bands, bits=bits, seed=seed, max_bucket=max_bucket, max_pairs=max_pairs
+    )
     if not pairs:
         return []
     # One vectorised pass over the candidates rather than a dot product per pair.
-    left: np.ndarray = np.fromiter((pair[0] for pair in pairs), dtype=np.int64, count=len(pairs))
-    right: np.ndarray = np.fromiter((pair[1] for pair in pairs), dtype=np.int64, count=len(pairs))
+    packed: np.ndarray = np.fromiter(pairs, dtype=np.int64, count=len(pairs))
+    left: np.ndarray = packed // len(paths)
+    right: np.ndarray = packed % len(paths)
     similarity = np.einsum("ij,ij->i", unit[left], unit[right])
     union = _Union(len(paths))
     for index in np.flatnonzero(similarity >= float(threshold)):

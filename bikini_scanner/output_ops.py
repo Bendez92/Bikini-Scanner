@@ -713,6 +713,20 @@ class TrashOutcome:
         return len(self.failures)
 
 
+def trash_available() -> tuple[bool, str]:
+    """Whether anything can be moved to the recycle bin, and why not when it cannot.
+
+    Callers that pair deletion with something irreversible — rejecting a whole band
+    teaches the scanner permanently — need to know this *before* they start, or a
+    missing send2trash leaves the permanent half done and the deletion half not.
+    """
+    try:
+        import send2trash  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return True, ""
+
+
 def trash_files(paths: Sequence[str | Path]) -> TrashOutcome:
     try:
         from send2trash import send2trash

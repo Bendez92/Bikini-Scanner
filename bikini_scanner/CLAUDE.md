@@ -214,6 +214,13 @@ Two rules keep that view usable and are easy to undo:
   is the single rule for the frame itself, shared with `_apply_focus_visuals`; when those
   two disagreed, moving the focus repainted a faded card as an undecided one.
 
+A band action reads `_band_paths`, i.e. the whole band across every page. The
+destructive one passes `deletable_only=True`, which drops photos labelled Accept or
+Skip: this view keeps decided photos on screen, so without it "Reject all & delete"
+overwrote an Accept and binned the file. It also checks `trash_available()` *before*
+writing any label, because those labels are permanent and retained — discovering
+afterwards that nothing can be deleted leaves the irreversible half done alone.
+
 Each band carries the one bulk action that belongs to it (`_band_actions`), because
 doing any of them a card at a time is the work the bands exist to avoid: **Detected**
 exports, **Probable reject** rejects the lot and bins the files, and **Possible** gets
