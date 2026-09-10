@@ -20,3 +20,8 @@ models/
 *.pt
 *.bin
 *.safetensors
+
+# Coverage measurement output (see [tool.coverage] in pyproject.toml).
+.coverage
+.coverage.*
+htmlcov/

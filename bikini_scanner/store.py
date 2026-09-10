@@ -26,26 +26,44 @@ from .image_formats import DECODE_VERSION
 from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
 from .sqlite_cache import SQLiteCache
 
-# Pickle is used only for the classifier cache. Rather than deleting legacy caches, a
-# restricted unpickler limits what can be loaded to the few scanner-owned classes and
-# basic building blocks a trained model legitimately contains.
-_CLASSIFIER_PICKLE_ALLOWLIST: set[str] = {
-    "builtins",
-    "collections.abc",
-    "copyreg",
-    "numpy",
-    "numpy.core.multiarray",
-    "numpy.core.numeric",
-    "numpy.dtypes",
-    "bikini_scanner.linear_model",
-}
+# Pickle is used only for the classifier cache. A restricted unpickler limits what can
+# be loaded, because a classifier.pkl lives inside a scanned folder and a scanned folder
+# is attacker-influenced.
+#
+# The allowlist is (module, name) pairs, not bare module names. Allowing a whole module
+# is not a restriction at all: `builtins` on its own hands over `exec` and `eval`, and
+# any `numpy.*` wildcard reaches `numpy.testing._private.utils.runstring`, which is a
+# two-argument `exec`, and `numpy.ctypeslib.load_library`, which loads a DLL of the
+# attacker's choosing out of the folder being scanned. Both were reachable through this
+# class while the check was per-module, and a test that only tried `os.system` passed
+# throughout, because `os` was never the way in. `tests/ClassifierPickleGadgets` covers
+# the reachable-module case specifically.
+#
+# numpy 1.x spelled the array reconstructors `numpy.core.*`; numpy 2.x renamed them to
+# `numpy._core.*`. Both are listed so a cache written under either still loads.
+_CLASSIFIER_PICKLE_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("numpy", "ndarray"),
+        ("numpy", "dtype"),
+        ("numpy.core.multiarray", "_reconstruct"),
+        ("numpy.core.multiarray", "scalar"),
+        ("numpy.core.numeric", "_frombuffer"),
+        ("numpy._core.multiarray", "_reconstruct"),
+        ("numpy._core.multiarray", "scalar"),
+        ("numpy._core.numeric", "_frombuffer"),
+        ("bikini_scanner.linear_model", "LogisticRegression"),
+        ("bikini_scanner.linear_model", "PlattCalibrator"),
+        ("bikini_scanner.linear_model", "StandardScaler"),
+    }
+)
 
 
 class RestrictedUnpickler(pickle.Unpickler):
     def find_class(self, module: str, name: str):
-        if module not in _CLASSIFIER_PICKLE_ALLOWLIST and not module.startswith("numpy."):
+        if (module, name) not in _CLASSIFIER_PICKLE_ALLOWLIST:
             raise pickle.UnpicklingError(f"Refusing to unpickle {module}.{name}")
         return super().find_class(module, name)
+
 
 SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".heic", ".heif"}
 MATCHES_DIR_NAME = "bikini_matches"

@@ -53,3 +53,71 @@ jobs:
         env:
           PYTHONPATH: .
         run: python scripts/score_baseline.py --compare tests/baseline_scores.json
+
+  # Mypy and coverage run once on 3.12 rather than across the matrix above. Mypy is
+  # pinned to one interpreter on purpose: the config sets python_version = "3.12", and
+  # NumPy 2.x stubs use `type` syntax that mypy cannot parse under --python-version 3.10.
+  types-and-coverage:
+    name: mypy + coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install analysis dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy>=2.0,<3" "Pillow>=10.0" "mypy>=1.11,<2" "coverage>=7.5,<8"
+
+      # This was in the local verification list but never enforced, so a type
+      # regression only got caught if someone remembered to run it by hand.
+      - name: Types
+        run: python -m mypy bikini_scanner
+
+      # Measurement, not a gate. The number exists to aim review effort at code the
+      # suite never reaches; a fail_under threshold would invite tests that move the
+      # number without exercising anything.
+      - name: Coverage
+        env:
+          PYTHONPATH: .
+        run: python -m coverage run tests/test_functional.py
+
+      - name: Coverage report
+        run: |
+          python -m coverage report --sort=cover
+          {
+            echo '### Coverage'
+            echo
+            echo '```'
+            python -m coverage report --sort=cover --format=text
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Advisory check against the pinned set that actually ships. requirements.txt is
+  # unpinned by design, so auditing it would report on whatever resolved that morning;
+  # the lock file is the environment a release is built from. torch is skipped because
+  # the CPU wheel comes from the PyTorch index rather than PyPI.
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pip-audit>=2.7,<3"
+
+      - name: Audit pinned dependencies
+        run: python -m pip_audit -r requirements.lock.txt --no-deps --progress-spinner off

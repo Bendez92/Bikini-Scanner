@@ -1347,6 +1347,61 @@ class GlobalClassifierUnpickling(unittest.TestCase):
             store_module.RestrictedUnpickler(io.BytesIO(blob)).load()
 
 
+class ClassifierPickleGadgets(unittest.TestCase):
+    """A module the allowlist admits must not carry a code-execution gadget with it.
+
+    GlobalClassifierUnpickling above only tries `os.system`, and `os` was never on the
+    allowlist, so that test passed while the unpickler was wide open. These use the
+    modules the allowlist actually admits, which is where the exploitable callables
+    were: a per-module check let `builtins.exec` and every `numpy.*` submodule through,
+    including `numpy.testing._private.utils.runstring`, a bare two-argument `exec`.
+    Both ran arbitrary code out of a scanned folder's classifier.pkl.
+    """
+
+    def _refuses(self, reduce_target, *args: object) -> None:
+        class Payload:
+            def __reduce__(self):
+                return (reduce_target, args)
+
+        blob = pickle.dumps({"version": 1, "classifier": Payload()})
+        with self.assertRaises(pickle.UnpicklingError):
+            store_module.RestrictedUnpickler(io.BytesIO(blob)).load()
+
+    def test_builtins_exec_is_refused(self) -> None:
+        self._refuses(exec, "raise SystemExit")
+
+    def test_builtins_eval_is_refused(self) -> None:
+        self._refuses(eval, "1")
+
+    def test_numpy_submodule_gadget_is_refused(self) -> None:
+        try:
+            from numpy.testing._private.utils import runstring
+        except ImportError:  # pragma: no cover - numpy ships it today
+            self.skipTest("numpy.testing._private.utils.runstring not present")
+        self._refuses(runstring, "pass", {})
+
+    def test_numpy_ctypeslib_loader_is_refused(self) -> None:
+        try:
+            from numpy.ctypeslib import load_library
+        except ImportError:  # pragma: no cover - numpy always ships it today
+            self.skipTest("numpy.ctypeslib.load_library not present")
+        self._refuses(load_library, "anything", ".")
+
+    def test_legitimate_classifier_payload_still_loads(self) -> None:
+        """The narrowing must not break the caches it exists to keep readable."""
+        payload = {
+            "version": 1,
+            "weights": np.zeros((3, 2), dtype=np.float32),
+            "scale": np.float64(0.5),
+            "dtype": np.dtype("float32"),
+        }
+        blob = pickle.dumps(payload)
+        loaded = store_module.RestrictedUnpickler(io.BytesIO(blob)).load()
+        self.assertEqual(loaded["version"], 1)
+        self.assertEqual(loaded["weights"].shape, (3, 2))
+        self.assertEqual(loaded["dtype"], np.dtype("float32"))
+
+
 class RefineWeightSelection(unittest.TestCase):
     """vlm_weight and refine_weight are separate knobs, so the blend must tell them apart."""
 

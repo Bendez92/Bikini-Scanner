@@ -81,6 +81,23 @@ python_files = ["test_*.py"]
 # tests/ is on the path so the suite and the baseline script share fake_backend.
 pythonpath = [".", "tests"]
 
+[tool.coverage.run]
+# The suite is a unittest script, not a pytest run, so coverage drives it directly:
+#   .venv\Scripts\python.exe -m coverage run tests\test_functional.py
+source = ["bikini_scanner"]
+branch = true
+
+[tool.coverage.report]
+# Measurement only. No `fail_under` gate: the number is here to aim review effort at
+# unexercised code, and a threshold would just invite tests written to move it.
+show_missing = true
+skip_covered = false
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+]
+
 [tool.mypy]
 python_version = "3.12"
 files = ["bikini_scanner"]
