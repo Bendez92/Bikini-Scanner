@@ -75,9 +75,12 @@ Vertical space is the scarce resource; several things exist only to defend it.
   for judging a photo.
 
 
-## Three Views, and What a Card Says
+## Four Views, and What a Card Says
 
-The results grid answers three different questions and `view_mode` names which one:
+The results grid answers four different questions and `view_mode` names which one:
+
+- **`triage`** — every photo the gates allow, in three confidence bands. This is what a
+  finished scan lands on and the only view that shows the whole folder.
 
 - **`detected`** — everything above the sensitivity threshold, grouped by what was seen.
 - **`review`** — the curated shortlist of *undecided* photos, built by `bucketed_sampling`.
@@ -90,6 +93,30 @@ scored above the threshold, so a false negative appeared in no view at all and "
 it get wrong?" had no answer on screen. `decided` is therefore the one view that
 **ignores `hide_decided`** — hiding decided photos there would empty it by definition
 (`FilterContext.decided`, `_sample_visible`, `_hidden_decided_count`).
+
+The three `triage` bands are cut off the threshold by `triage_band`: at or above it is
+**Detected**, within `TRIAGE_MARGIN` below it is **Possible**, and the rest is
+**Probable reject**. They sub-divide the scanner's own answer rather than competing with
+it, so everything in Detected reads DETECTED on its card and nothing else does — a band
+and a card can never contradict each other.
+
+Two rules keep that view usable and are easy to undo:
+
+- **A page is split across the bands, not sliced off a sorted list.** `_band_quotas`
+  gives each band a share of the page and lets a band too small to spend its share hand
+  the remainder back. Cutting one band-sorted list into pages put 300 detected photos on
+  the first fifteen pages and nothing else, which is exactly what the separate views
+  already did.
+- **A decided photo stays where it is and fades.** `triage` is the only view that does
+  this, and with `hide_decided` deliberately ignored (`FilterContext.keep_decided`).
+  Rows that empty as you work move the next photo under the cursor mid-click. Because a
+  ttk label paints its own background, every card line exists twice — once per card
+  background — and `_paint_card_state` picks the pair with a `Dim` prefix. `_frame_style`
+  is the single rule for the frame itself, shared with `_apply_focus_visuals`; when those
+  two disagreed, moving the focus repainted a faded card as an undecided one.
+
+The `decided` view does **not** fade: every photo in it is decided by definition, so
+dimming them all would grey out the whole screen.
 
 `decision_outcome` is the single definition of true/false positive/negative, and
 `VERDICTS` maps each outcome to its card text, style and plain-English gloss. Both

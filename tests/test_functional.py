@@ -1235,6 +1235,153 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(self.app.page_samples, [])
         self.assertIn("Nothing decided yet", self.app.status_var.get())
 
+    def _band_of(self) -> dict[str, str]:
+        return {str(sample["path"]): str(sample["bucket"]) for sample in self.app.page_samples}
+
+    def test_all_results_bands_every_photo_by_how_sure_the_scanner_is(self) -> None:
+        """One view for the whole folder, rather than a tab per question.
+
+        The detected list showed only what cleared the threshold and the review queue
+        only what was undecided, so no single screen ever showed the folder. The bands
+        sub-divide the scanner's own answer, so a card and its band never disagree.
+        """
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        for index, score in enumerate([0.95, 0.82, 0.48, 0.40, 0.20, 0.05]):
+            state.scores[index] = score
+        self.app.show_all_results()
+        self.assertEqual(self.app.view_mode, "triage")
+        bands = self._band_of()
+        self.assertEqual(bands[self.paths[0]], "Detected")
+        self.assertEqual(bands[self.paths[1]], "Detected")
+        # Within the margin below the line: a near miss worth a look.
+        self.assertEqual(bands[self.paths[2]], "Possible")
+        self.assertEqual(bands[self.paths[3]], "Possible")
+        self.assertEqual(bands[self.paths[4]], "Probable reject")
+        self.assertEqual(bands[self.paths[5]], "Probable reject")
+        # Every photo is present exactly once — this view hides nothing.
+        self.assertEqual(len(bands), len(self.paths))
+        self.assertEqual(
+            [str(sample["bucket"]) for sample in self.app.page_samples][:2],
+            ["Detected", "Detected"],
+            "the bands are not in their fixed top-to-bottom order",
+        )
+
+    def test_a_card_never_disagrees_with_the_band_it_is_in(self) -> None:
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        for index, score in enumerate([0.95, 0.82, 0.48, 0.40, 0.20, 0.05]):
+            state.scores[index] = score
+        self.app.show_all_results()
+        for sample in self.app.page_samples:
+            card = self.app.cards[str(sample["path"])]
+            detected = str(card.score_label.cget("text")).startswith("DETECTED")
+            self.assertEqual(
+                detected,
+                str(sample["bucket"]) == "Detected",
+                f"{sample['bucket']} band disagreed with the card's own detection line",
+            )
+
+    def test_the_first_page_carries_every_band_not_just_the_top_one(self) -> None:
+        """Cutting one band-sorted list into pages showed one band at a time.
+
+        With 300 detected photos and a 20-card page, pages 1 to 15 were Detected and
+        nothing else — so the view whose whole point is that the three bands sit on
+        one screen delivered exactly what the separate tabs already did.
+        """
+        self.app.view_mode = "triage"
+        self.app.page_size_var.set(20)
+        self.app.displayed_samples = (
+            [{"path": f"/d{i}.jpg", "score": 0.9, "bucket": "Detected"} for i in range(300)]
+            + [{"path": f"/p{i}.jpg", "score": 0.4, "bucket": "Possible"} for i in range(5)]
+            + [{"path": f"/r{i}.jpg", "score": 0.1, "bucket": "Probable reject"} for i in range(900)]
+        )
+        self.app.page_index = 0
+        page = self.app._page_slice()
+        bands = {str(sample["bucket"]) for sample in page}
+        self.assertEqual(bands, {"Detected", "Possible", "Probable reject"})
+        # The small band spends what it has and hands the rest of its share back,
+        # rather than leaving a fifth of the page empty.
+        self.assertEqual(sum(1 for s in page if s["bucket"] == "Possible"), 5)
+        self.assertGreater(sum(1 for s in page if s["bucket"] == "Detected"), 5)
+        # Paging advances all three bands together, and never repeats a photo.
+        self.app.page_index = 1
+        second = self.app._page_slice()
+        self.assertTrue({"Detected", "Probable reject"} <= {str(s["bucket"]) for s in second})
+        self.assertFalse(
+            {str(s["path"]) for s in page} & {str(s["path"]) for s in second},
+            "a photo appeared on two pages",
+        )
+
+    def test_a_band_too_small_to_spend_its_share_hands_the_rest_back(self) -> None:
+        quotas = self.app._band_quotas({"Detected": 300, "Possible": 5, "Probable reject": 900}, 120)
+        self.assertEqual(quotas["Possible"], 5)
+        self.assertGreater(sum(quotas.values()), 110, "the page was left mostly empty")
+        # One band on its own takes the whole page.
+        self.assertEqual(self.app._band_quotas({"Detected": 500}, 120), {"Detected": 120})
+        self.assertEqual(self.app._band_quotas({"Detected": 0}, 120), {})
+
+    def test_deciding_a_photo_leaves_it_where_it_is_and_fades_it(self) -> None:
+        """Rows that empty as you work move the next photo under your cursor."""
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        for index, score in enumerate([0.95, 0.82, 0.48, 0.40, 0.20, 0.05]):
+            state.scores[index] = score
+        self.app.hide_decided_var.set(True)
+        self.app.show_all_results()
+        before = [str(sample["path"]) for sample in self.app.page_samples]
+        target = self.paths[1]
+        self.app.set_label(target, 0)
+        self.assertEqual(
+            [str(sample["path"]) for sample in self.app.page_samples],
+            before,
+            "deciding a photo reordered or removed it, despite 'hide decided'",
+        )
+        card = self.app.cards[target]
+        self.assertEqual(card.style, "DimCard.TFrame", "a decided photo kept its bright match border")
+        self.assertIn("REJECTED", str(card.label_label.cget("text")))
+        # An undecided detection is what must still stand out.
+        self.assertEqual(self.app.cards[self.paths[0]].style, "MatchCard.TFrame")
+
+    def test_a_finished_scan_lands_on_all_results(self) -> None:
+        """The landing view has to be the one that shows the whole folder."""
+        state = self.app.current_state
+        assert state is not None
+        self.app.view_mode = "review"
+        self.app._scan_completed(self.app._refresh_generation, state, [], full_rescan=True)
+        self.assertEqual(self.app.view_mode, "triage")
+        self.assertEqual(
+            len(self.app.page_samples), len(self.paths), "the landing view did not show the whole folder"
+        )
+
+    def test_a_retrain_keeps_the_view_the_reviewer_was_on(self) -> None:
+        state = self.app.current_state
+        assert state is not None
+        self.app.review_samples = [
+            {"path": path, "score": 0.9, "bucket": "Likely match"} for path in self.paths
+        ]
+        self.app.restore_review_view()
+        self.app._scan_completed(self.app._refresh_generation, state, [], full_rescan=False)
+        self.assertEqual(self.app.view_mode, "review", "a re-rank threw the reviewer into another view")
+
+    def test_moving_the_sensitivity_slider_rebands_everything(self) -> None:
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        for index, score in enumerate([0.95, 0.82, 0.48, 0.40, 0.20, 0.05]):
+            state.scores[index] = score
+        self.app.show_all_results()
+        self.assertEqual(self._band_of()[self.paths[2]], "Possible")
+        self.app.threshold_var.set(0.3)
+        self.app._after_threshold_settles()
+        bands = self._band_of()
+        self.assertEqual(bands[self.paths[2]], "Detected", "0.48 stayed below a 0.30 threshold")
+        self.assertEqual(bands[self.paths[4]], "Possible")
+        self.assertEqual(bands[self.paths[5]], "Probable reject")
+
     def test_the_three_views_can_be_switched_from_the_keyboard(self) -> None:
         """Every other step of the review loop has a key; switching view did not."""
         self._decide_one_of_each()
