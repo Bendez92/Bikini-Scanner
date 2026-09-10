@@ -234,8 +234,13 @@ class GlobalLearningStore:
                 LOGGER.exception("Could not update global learning memory")
 
     def training_set(self, expected_dim: int | None = None) -> TrainingSet:
-        index = self._load_index()
-        features = self._load_features()
+        with _LOCK:
+            # Snapshots, not the live caches. _load_index hands back the cache dict
+            # itself, and record()/forget() mutate it in place, so iterating the
+            # original raised "dictionary changed size during iteration" the moment
+            # anything else touched the store.
+            index = dict(self._load_index())
+            features = dict(self._load_features())
         # Building this walks every labelled row and stats every labelled path to drop
         # ones whose file is gone. That answer only changes when the store changes, so
         # it is derived once per (index, features, dim) rather than once per retrain.

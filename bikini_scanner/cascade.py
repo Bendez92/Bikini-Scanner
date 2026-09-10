@@ -318,12 +318,23 @@ class SubjectAnalysis:
     Images with no detected faces have no subjects and are not covered here at all -
     they keep the whole-frame gate unchanged, because without attribution there is no
     honest way to tell whose body the evidence belongs to.
+
+    "Reads as a minor" needs a face crop to read, and a subject can exist without one:
+    `plan_regions` drops any crop that clamps below _MIN_CROP_PX, so a face under about
+    28px yields waist and torso crops with no face crop at all. Such a subject's age is
+    *unknown*, not adult, and `all_minor` must not count them as evidence that an adult
+    is present - that let a photo whose only readable subject was a child surface on the
+    unaged subject's body crops, scoring exactly as if a confirmed adult were there.
+    So the verdict is taken over the subjects whose age could actually be read, and when
+    none could, the whole-frame gate is left in charge (`has_readable_subjects`).
     """
 
     row_minor: np.ndarray  # per row: belongs to a subject that reads as a minor
     full_allowed: np.ndarray  # per image: may the full frame still contribute evidence
     has_subjects: np.ndarray  # per image: at least one face-anchored subject exists
-    all_minor: np.ndarray  # per image: every detected subject reads as a minor
+    # per image: at least one subject has a face crop, so an age reading exists at all
+    has_readable_subjects: np.ndarray
+    all_minor: np.ndarray  # per image: every subject whose age could be read is a minor
     subject_child: np.ndarray  # (image, subject) child evidence, from face crops
     subject_adult: np.ndarray  # (image, subject) adult evidence, from face crops
     subject_detail: np.ndarray  # (image, subject) detail evidence, from body crops
@@ -400,7 +411,12 @@ def analyse_subjects(table: RegionScoreTable, config: ScannerConfig) -> SubjectA
 
     has_subjects = present.any(axis=1)
     any_minor = minor.any(axis=1)
-    all_minor = has_subjects & ~(present & ~minor).any(axis=1)
+    # Only subjects with a face crop have an age reading at all. Counting a subject
+    # whose face was too small to crop as "not a minor" is what let an unaged person
+    # stand in for an adult and carry an image past the gate.
+    readable = present & has_face
+    has_readable_subjects = readable.any(axis=1)
+    all_minor = has_readable_subjects & ~(readable & ~minor).any(axis=1)
 
     row_minor: np.ndarray = np.zeros(owner.size, dtype=bool)
     row_minor[attributed] = minor[owner[attributed], subject[attributed]]
@@ -412,6 +428,7 @@ def analyse_subjects(table: RegionScoreTable, config: ScannerConfig) -> SubjectA
         row_minor=row_minor,
         full_allowed=full_allowed,
         has_subjects=has_subjects,
+        has_readable_subjects=has_readable_subjects,
         all_minor=all_minor,
         subject_child=child,
         subject_adult=adult,
@@ -506,10 +523,12 @@ def evaluate(
         age_fail = np.zeros((count,), dtype=bool)
 
     if subjects is not None:
-        # Where people were actually detected, their own faces decide. The whole-frame
-        # tests above only still apply to images with no attributed subject, because for
-        # those there is nothing to attribute the evidence to.
-        age_fail = np.where(subjects.has_subjects, subjects.all_minor, age_fail)
+        # Where a face was actually read, that reading decides. The whole-frame tests
+        # above still apply to images with no attributed subject - and to images whose
+        # subjects all lost their face crop to the minimum-size rule, because there the
+        # per-subject verdict has nothing to go on and handing it the decision would
+        # replace a real answer with an empty one.
+        age_fail = np.where(subjects.has_readable_subjects, subjects.all_minor, age_fail)
 
     if config.require_person:
         person_conf = _ramp(person, float(config.person_gate_threshold), float(config.person_gate_threshold) + 0.2)

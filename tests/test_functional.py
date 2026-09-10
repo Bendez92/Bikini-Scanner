@@ -26,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import types
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -3143,6 +3144,298 @@ class VanishedFilesReadAsVanished(unittest.TestCase):
         skipped = metadata["skipped"]
         self.assertEqual(len(skipped), 1)
         self.assertEqual(skipped[0]["error"], "file disappeared during the scan")
+
+
+class UnagedSubjectsAreNotAdults(unittest.TestCase):
+    """A subject with no face crop has an unknown age, not an adult one.
+
+    plan_regions drops any crop that clamps below _MIN_CROP_PX, so a face under about
+    28px yields waist and torso crops and no face crop at all. That subject is
+    `present` but can never be `minor`, and counting them as evidence that an adult is
+    present let a photo whose only readable subject was a child surface on the unaged
+    subject's body crops, scoring exactly as if a confirmed adult were there.
+    """
+
+    NEUTRAL = 0.5
+
+    def _table(self, rows: list[tuple[str, float, float, float]]) -> cascade.RegionScoreTable:
+        """rows = (region key, child, adult, detail); row 0 is the full frame."""
+        kinds = []
+        for key, *_ in rows:
+            for prefix, kind in (
+                ("full", "full"), ("face", "face"), ("chest", "chest"),
+                ("waist", "waist"), ("torso", "torso"),
+            ):
+                if key.startswith(prefix):
+                    kinds.append(kind)
+                    break
+            else:
+                kinds.append("band")
+        child = np.asarray([r[1] for r in rows], dtype=np.float32)
+        adult = np.asarray([r[2] for r in rows], dtype=np.float32)
+        detail = np.asarray([r[3] for r in rows], dtype=np.float32)
+        axes = {
+            "child": child,
+            "adult": adult,
+            "person": np.full(len(rows), 0.9, dtype=np.float32),
+            "female": np.full(len(rows), 0.9, dtype=np.float32),
+            "nsfw": np.full(len(rows), 0.5, dtype=np.float32),
+        }
+        for axis in ("bikini", "cleavage", "midriff", "bikini_top", "bikini_bottom"):
+            axes[axis] = detail
+        return cascade.RegionScoreTable(
+            owner=np.zeros(len(rows), dtype=np.int64),
+            kinds=np.asarray(kinds, dtype=object),
+            axis_scores=axes,
+            image_count=1,
+            full_row=np.asarray([0], dtype=np.int64),
+            subject=np.asarray([regions.region_subject(r[0]) for r in rows], dtype=np.int64),
+        )
+
+    def _child_plus(self, second: list[tuple[str, float, float, float]]) -> cascade.CascadeResult:
+        rows = [
+            ("full", self.NEUTRAL, self.NEUTRAL, 0.95),
+            ("face0", 0.99, 0.05, self.NEUTRAL),
+            ("chest0", self.NEUTRAL, self.NEUTRAL, 0.95),
+            *second,
+        ]
+        return cascade.evaluate(self._table(rows), ScannerConfig(), np.asarray([2], dtype=np.int32))
+
+    def test_a_child_plus_an_unaged_subject_is_excluded(self) -> None:
+        result = self._child_plus(
+            [
+                ("waist1", self.NEUTRAL, self.NEUTRAL, 0.95),
+                ("torso1", self.NEUTRAL, self.NEUTRAL, 0.95),
+            ]
+        )
+        self.assertEqual(result.stage[0], cascade.STAGE_MINOR)
+        self.assertEqual(float(result.score[0]), 0.0)
+
+    def test_a_child_plus_a_confirmed_adult_is_still_scored(self) -> None:
+        """The whole point of per-subject reasoning; it must survive the fix."""
+        result = self._child_plus(
+            [
+                ("face1", 0.05, 0.95, self.NEUTRAL),
+                ("waist1", self.NEUTRAL, self.NEUTRAL, 0.95),
+                ("torso1", self.NEUTRAL, self.NEUTRAL, 0.95),
+            ]
+        )
+        self.assertEqual(result.stage[0], cascade.STAGE_SCORED)
+        self.assertGreater(float(result.score[0]), 0.0)
+
+    def test_unaged_and_adult_are_not_the_same_verdict(self) -> None:
+        unaged = self._child_plus(
+            [("waist1", self.NEUTRAL, self.NEUTRAL, 0.95), ("torso1", self.NEUTRAL, self.NEUTRAL, 0.95)]
+        )
+        adult = self._child_plus(
+            [
+                ("face1", 0.05, 0.95, self.NEUTRAL),
+                ("waist1", self.NEUTRAL, self.NEUTRAL, 0.95),
+                ("torso1", self.NEUTRAL, self.NEUTRAL, 0.95),
+            ]
+        )
+        self.assertNotEqual(unaged.stage[0], adult.stage[0])
+
+    def test_subjects_with_no_readable_face_fall_back_to_the_whole_frame_gate(self) -> None:
+        """Not excluded outright - that would bin every distant subject in the folder."""
+        table = self._table(
+            [
+                ("full", self.NEUTRAL, 0.95, 0.95),
+                ("waist0", self.NEUTRAL, self.NEUTRAL, 0.95),
+                ("torso0", self.NEUTRAL, self.NEUTRAL, 0.95),
+            ]
+        )
+        analysis = cascade.analyse_subjects(table, ScannerConfig())
+        assert analysis is not None
+        self.assertTrue(bool(analysis.has_subjects[0]))
+        self.assertFalse(bool(analysis.has_readable_subjects[0]))
+        result = cascade.evaluate(table, ScannerConfig(), np.asarray([1], dtype=np.int32))
+        self.assertEqual(result.stage[0], cascade.STAGE_SCORED)
+
+    def test_the_same_frame_reading_as_a_child_is_still_gated(self) -> None:
+        """The whole-frame fallback has to keep working, not just pass everything."""
+        table = self._table(
+            [
+                ("full", 0.99, 0.05, 0.95),
+                ("waist0", self.NEUTRAL, self.NEUTRAL, 0.95),
+                ("torso0", self.NEUTRAL, self.NEUTRAL, 0.95),
+            ]
+        )
+        result = cascade.evaluate(table, ScannerConfig(), np.asarray([1], dtype=np.int32))
+        self.assertEqual(result.stage[0], cascade.STAGE_MINOR)
+
+    def test_a_small_face_really_does_lose_its_face_crop(self) -> None:
+        """The geometry this whole class is about, asserted directly."""
+        from bikini_scanner.vision_analysis import FaceBox
+
+        small = regions.plan_regions((1200, 900), [FaceBox(x=400, y=200, width=22, height=29)])
+        keys = [r.key for r in small if r.key != regions.FULL_REGION]
+        self.assertTrue(keys, "a small face produced no regions at all")
+        self.assertFalse(any(k.startswith("face") for k in keys), keys)
+        self.assertTrue(any(k.startswith(("waist", "torso")) for k in keys), keys)
+
+        big = regions.plan_regions((1200, 900), [FaceBox(x=400, y=200, width=60, height=78)])
+        self.assertTrue(any(r.key.startswith("face") for r in big))
+
+
+class CacheIsThreadSafe(unittest.TestCase):
+    """The scan worker writes while the main thread reads the same connection.
+
+    Tools > Duplicate groups and Tools > Clear cached scan data are both reachable
+    during a scan and both go through SQLiteCache, so this is not a theoretical race.
+    """
+
+    def setUp(self) -> None:
+        from bikini_scanner.sqlite_cache import SQLiteCache
+
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_threads_"))
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        self.cache = SQLiteCache(self.folder / "cache.db")
+        self.addCleanup(self.cache.close)
+
+    def test_concurrent_writes_all_land_and_stay_intact(self) -> None:
+        threads_count, per_thread = 6, 40
+        errors: list[str] = []
+
+        def writer(tid: int) -> None:
+            try:
+                for i in range(per_thread):
+                    content_hash = f"t{tid}_{i}"
+                    path = self.folder / f"t{tid}_{i}.jpg"
+                    path.write_bytes(b"x" * (i % 5 + 1))
+                    stat = path.stat()
+                    self.cache.save_scan_cache(
+                        {content_hash: np.full(8, tid, dtype=np.float32)},
+                        {path: {"content_hash": content_hash, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}},
+                        {content_hash: i % 3},
+                    )
+                    self.cache.lookup_content_embedding(content_hash)
+                    self.cache.load_face_counts()
+            except Exception:  # noqa: BLE001
+                errors.append(traceback.format_exc())
+
+        workers = [threading.Thread(target=writer, args=(t,)) for t in range(threads_count)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(errors, [], errors[0] if errors else "")
+        rows = self.cache._load_all_embeddings()
+        # .fetchall() used to run outside the lock, so rows came back truncated
+        # (np.load raising "No data left in file") and writes were dropped.
+        self.assertEqual(len(rows), threads_count * per_thread)
+        for key, vector in rows.items():
+            self.assertEqual(float(vector[0]), float(key.split("_")[0][1:]), f"{key} holds another thread's vector")
+
+    def test_clearing_under_concurrent_readers_never_loses_the_schema(self) -> None:
+        self.cache.save_scan_cache({"h": np.ones(4, dtype=np.float32)}, {})
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def reader() -> None:
+            try:
+                while not stop.is_set():
+                    self.cache.lookup_content_embedding("h")
+                    self.cache.load_face_counts()
+            except Exception:  # noqa: BLE001
+                errors.append(traceback.format_exc())
+
+        readers = [threading.Thread(target=reader) for _ in range(3)]
+        for r in readers:
+            r.start()
+        try:
+            for _ in range(5):
+                self.cache.clear()
+                self.cache.save_scan_cache({"h": np.ones(4, dtype=np.float32)}, {})
+        finally:
+            stop.set()
+            for r in readers:
+                r.join()
+        # Rebuilding the schema outside the lock left a window where a reader could
+        # connect to a database with no tables in it.
+        self.assertEqual(errors, [], errors[0] if errors else "")
+
+
+class GlobalStoreIsThreadSafe(unittest.TestCase):
+    def test_reading_the_training_set_while_recording(self) -> None:
+        """_load_index hands back the live cache dict, which record() mutates in place."""
+        store = GlobalLearningStore(model_name="thread-probe")
+        self.addCleanup(store.clear)
+        folder = Path(tempfile.mkdtemp(prefix="bikini_globthreads_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        errors: list[str] = []
+
+        def learner(tid: int) -> None:
+            try:
+                for i in range(10):
+                    path = folder / f"g{tid}_{i}.jpg"
+                    path.write_bytes(b"y")
+                    store.record([(str(path), i % 2, np.full(6, tid, dtype=np.float32))], sequence=i)
+                    store.training_set(expected_dim=6)
+            except Exception:  # noqa: BLE001
+                errors.append(traceback.format_exc())
+
+        workers = [threading.Thread(target=learner, args=(t,)) for t in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        self.assertEqual(errors, [], errors[0] if errors else "")
+        self.assertEqual(store.stats()["total"], 4 * 10)
+
+
+class AtomicWriteRetriesOnWindows(unittest.TestCase):
+    def test_a_transient_permission_error_is_retried(self) -> None:
+        """os.replace fails on Windows if anything has the destination open for a moment."""
+        target = Path(tempfile.mkdtemp(prefix="bikini_retry_")) / "labels.json"
+        self.addCleanup(shutil.rmtree, target.parent, True)
+        real_replace = os.replace
+        attempts: list[int] = []
+
+        def flaky(src: object, dst: object) -> None:
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise PermissionError(5, "Access is denied")
+            real_replace(src, dst)  # type: ignore[arg-type]
+
+        safe_io.os.replace = flaky  # type: ignore[attr-defined]
+        self.addCleanup(setattr, safe_io.os, "replace", real_replace)
+        safe_io.atomic_write_json(target, {"kept": True})
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), {"kept": True})
+
+    def test_a_persistent_failure_still_raises(self) -> None:
+        target = Path(tempfile.mkdtemp(prefix="bikini_retry_fail_")) / "labels.json"
+        self.addCleanup(shutil.rmtree, target.parent, True)
+        real_replace = os.replace
+
+        def always_denied(src: object, dst: object) -> None:
+            raise PermissionError(5, "Access is denied")
+
+        safe_io.os.replace = always_denied  # type: ignore[attr-defined]
+        self.addCleanup(setattr, safe_io.os, "replace", real_replace)
+        with self.assertRaises(PermissionError):
+            safe_io.atomic_write_json(target, {"lost": True})
+        # The temp file must not be left lying beside the destination.
+        self.assertEqual(list(target.parent.glob(".*tmp")), [])
+
+
+class SourcesAreCleanUtf8(unittest.TestCase):
+    def test_no_byte_order_marks_or_mojibake(self) -> None:
+        """A stray BOM makes a file unparseable to tools that read it as plain UTF-8."""
+        root = Path(__file__).resolve().parents[1]
+        # Built rather than written literally: spelling the replacement character out
+        # would put it in this very file and make the check fail on itself.
+        replacement = chr(0xFFFD)
+        damaged: list[str] = []
+        for folder in ("bikini_scanner", "tests", "scripts"):
+            for path in sorted((root / folder).rglob("*.py")):
+                raw = path.read_bytes()
+                if raw.startswith(b"\xef\xbb\xbf"):
+                    damaged.append(f"{path.name}: BOM")
+                if replacement in raw.decode("utf-8", errors="replace"):
+                    damaged.append(f"{path.name}: mojibake")
+        self.assertEqual(damaged, [])
 
 
 def _cleanup() -> None:

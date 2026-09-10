@@ -1,4 +1,4 @@
-﻿"""The PyTorch CLIP backend, plus the registry that maps a config to a backend.
+"""The PyTorch CLIP backend, plus the registry that maps a config to a backend.
 
 `ImageEmbeddingBackend` and `ClipBackendBase` live in `backend_utils` (which does not
 import torch) and are re-exported here so existing imports keep working.

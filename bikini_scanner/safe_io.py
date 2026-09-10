@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
@@ -32,6 +33,14 @@ def resolved_str(path: Path) -> str:
     return _resolve_cached(str(path))
 
 
+# os.replace onto an existing file fails on Windows if anything else has it open even
+# momentarily - a second writer, an indexer, an antivirus scan. The window is tiny, so a
+# few short retries turn a spurious PermissionError into a successful write rather than
+# a lost label.
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_SECONDS = 0.05
+
+
 def _fsync_and_replace(tmp_path: Path, destination: Path) -> None:
     """Flush the temporary file to disk, then atomically move it into place."""
     try:
@@ -39,7 +48,14 @@ def _fsync_and_replace(tmp_path: Path, destination: Path) -> None:
             os.fsync(handle.fileno())
     except OSError:
         pass
-    os.replace(tmp_path, destination)
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp_path, destination)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SECONDS * (attempt + 1))
 
 
 def atomic_write_text(path: str | Path, text: str, encoding: str = "utf-8") -> None:

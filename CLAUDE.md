@@ -17,7 +17,7 @@ Run these before committing to `main`:
 
 Expected outcomes:
 
-- 199 functional tests pass.
+- 211 functional tests pass.
 - Ruff reports `All checks passed!`.
 - Mypy reports `Success: no issues found in ... source files`.
 - Baseline reports `Baseline matches ...`.
@@ -57,6 +57,37 @@ and both are constrained on purpose:
 
 The age gate is not a property of the cascade pipeline: `pipeline="legacy"` runs it too.
 `exclude_minors` must mean the same thing in both pipelines.
+
+## "Age Unknown" Is Not "Adult"
+
+The per-subject age gate reads an age from a subject's **face crop**, and a subject can
+exist without one: `plan_regions` drops any crop that clamps below `_MIN_CROP_PX`, so a
+face under about 28px yields waist and torso crops and no face crop at all. Such a
+subject is `present` but can never be `minor`.
+
+`all_minor` is therefore taken over `readable = present & has_face`, not over `present`.
+Counting an unaged subject on the not-a-minor side let a photo whose only readable
+subject was a child surface on the unaged subject's body crops, scoring exactly as if a
+confirmed adult were in frame. And when *no* subject has a readable face
+(`has_readable_subjects` is False), `evaluate` leaves the whole-frame gate in charge
+rather than handing the decision to a per-subject verdict with nothing behind it —
+excluding those outright would bin every distant subject in a folder.
+
+## The Cache Is Read From Two Threads
+
+`SQLiteCache` shares one connection, and the scan worker writes to it while the main
+thread reads: Tools > Duplicate groups and Tools > Clear cached scan data are both
+reachable during a scan.
+
+So reads go through `_fetchall`/`_fetchone`, which hold the lock across execute **and**
+fetch. `_execute` released it as soon as the statement was issued and handed back a
+cursor, so the caller's `.fetchall()` ran unguarded — that returned truncated blobs
+(`np.load` raising "No data left in file") and silently dropped writes. The lock is an
+`RLock` so `clear()` can hold it across purge, close, unlink and schema rebuild; doing
+the rebuild outside it left a window where a reader saw a database with no tables.
+
+`GlobalLearningStore._load_index` hands back the live cache dict, so anything iterating
+it must snapshot first — `record()` mutates it in place.
 
 ## Two Kinds of Folder State
 

@@ -20,3 +20,5 @@ models/
 *.pt
 *.bin
 *.safetensors
+
+bikini_scanner.egg-info/
