@@ -1542,6 +1542,80 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(trashed, [], "files were binned after the prompt was declined")
         self.assertTrue(all(labels.get(path) is None for path in targets))
 
+    def test_a_decision_in_the_all_results_view_does_not_resort_the_folder(self) -> None:
+        """Re-sorting the whole folder on every click is the cost that scales.
+
+        The bands are cut off the score and a decided photo keeps its place, so a
+        decision provably cannot change the displayed list or its order. Doing the
+        filter-and-sort pass anyway cost about 400 ms per Accept at 80 000 photos —
+        on the main thread, on a job that is already 80 000 photos long.
+        """
+        self._spread_scores()
+        self.app.show_all_results()
+        calls: list[int] = []
+        original = self.app._apply_display_filters
+        self.app._apply_display_filters = lambda samples: (  # type: ignore[method-assign]
+            calls.append(1),
+            original(samples),
+        )[1]
+        before = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.set_label(before[0], 0)
+        self.assertEqual(calls, [], "one decision re-filtered and re-sorted the whole folder")
+        self.assertEqual([str(s["path"]) for s in self.app.page_samples], before)
+        # The card itself still had to be repainted.
+        self.assertEqual(self.app.cards[before[0]].style, "DimCard.TFrame")
+
+    def test_a_decision_in_a_view_that_hides_it_still_refreshes(self) -> None:
+        """The shortcut above must not leak into the views that do drop the photo."""
+        self.app.review_samples = [
+            {"path": path, "score": 0.9, "bucket": "Likely match"} for path in self.paths
+        ]
+        self.app.hide_decided_var.set(True)
+        self.app.restore_review_view()
+        target = str(self.app.page_samples[0]["path"])
+        self.app.set_label(target, 0)
+        self.assertNotIn(
+            target,
+            [str(sample["path"]) for sample in self.app.page_samples],
+            "a decided photo stayed in a view that is meant to hide it",
+        )
+
+    def test_the_page_plan_is_built_once_per_refresh(self) -> None:
+        """One refresh asked for it three times, each a pass over the whole folder."""
+        self._spread_scores()
+        self.app.show_all_results()
+        built: list[int] = []
+        original = self.app._band_quotas
+        self.app._band_quotas = lambda totals, size: (  # type: ignore[method-assign]
+            built.append(1),
+            original(totals, size),
+        )[1]
+        self.app._page_count()
+        self.app._page_slice()
+        self.app._sync_pager()
+        self.assertEqual(built, [], "the cached page plan was rebuilt")
+        # A new displayed list must invalidate it.
+        self.app._refresh_displayed_results(reset_page=False)
+        self.app._page_count()
+        self.assertEqual(len(built), 1, "the page plan survived a rebuild of the displayed list")
+
+    def test_the_headline_counts_are_batched_not_recomputed_per_click(self) -> None:
+        """They walk every label in the folder and cannot move by more than one."""
+        self._spread_scores()
+        self.app.show_all_results()
+        counted: list[int] = []
+        original = self.app._outcome_counts
+        self.app._outcome_counts = lambda labels=None: (  # type: ignore[method-assign]
+            counted.append(1),
+            original(labels),
+        )[1]
+        self.app.set_label(str(self.app.page_samples[0]["path"]), 0)
+        self.assertEqual(counted, [], "the stats line was recomputed inline on a decision")
+        # Queued, not dropped: flushing gives the real numbers.
+        self.app._flush_summary_refresh()
+        self.assertEqual(len(counted), 1)
+        self.assertIn("You:", self.app.stats_var.get())
+
     def test_the_three_views_can_be_switched_from_the_keyboard(self) -> None:
         """Every other step of the review loop has a key; switching view did not."""
         self._decide_one_of_each()

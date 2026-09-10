@@ -192,6 +192,10 @@ RETRAIN_LABEL_BURST = 25
 # keeps a fast reviewer off the disk; labels.json is written synchronously regardless,
 # so nothing a reviewer decided depends on this landing.
 SESSION_SAVE_IDLE_MS = 1200
+# The headline counts are O(the whole folder) and cannot move by more than one
+# between two clicks, so they are recomputed once the reviewer pauses rather than
+# on every decision. Shorter than the retrain pause: these are only numbers.
+SUMMARY_IDLE_MS = 400
 
 
 def triage_band(score: float, threshold: float, margin: float = TRIAGE_MARGIN) -> str:
@@ -348,6 +352,10 @@ class BikiniScannerApp:
         self._path_index: dict[str, int] = {}
         self._path_index_state: ScoreState | None = None
         self.displayed_samples: list[dict[str, object]] = []
+        # Bumped whenever `displayed_samples` is rebuilt, so anything derived from
+        # that list can cache against it instead of walking the folder again.
+        self._display_generation = 0
+        self._triage_plan: tuple[tuple[int, int], dict[str, int], dict[str, list[dict[str, object]]]] | None = None
         # One page of `displayed_samples`. The grid builds a Tk frame plus a decoded
         # thumbnail per card, so rendering a few thousand detected files at once wedges
         # the main loop for minutes. Everything that acts on a selection still uses
@@ -425,6 +433,7 @@ class BikiniScannerApp:
         self._labels_since_retrain = 0
         self._retrain_after_id: str | None = None
         self._session_save_after_id: str | None = None
+        self._summary_refresh_after_id: str | None = None
         self._scroll_after_id: str | None = None
         self._pending_scroll_path: str | None = None
         self._reflow_after_id: str | None = None
@@ -934,12 +943,23 @@ class BikiniScannerApp:
         return quotas
 
     def _triage_page_plan(self) -> tuple[dict[str, int], dict[str, list[dict[str, object]]]]:
-        """This page's per-band allowance, and the displayed samples grouped by band."""
+        """This page's per-band allowance, and the displayed samples grouped by band.
+
+        Cached against the displayed list, because grouping it is O(n) in the whole
+        folder and one refresh asks for the plan at least three times — `_page_count`
+        twice, by way of `_sync_pager`, and `_page_slice` once. At 80 000 photos that
+        was three passes over 80 000 samples to draw one page of 120.
+        """
+        key = (self._display_generation, self._page_size())
+        if self._triage_plan is not None and self._triage_plan[0] == key:
+            return self._triage_plan[1], self._triage_plan[2]
         bands: dict[str, list[dict[str, object]]] = {}
         for sample in self.displayed_samples:
             bands.setdefault(str(sample.get("bucket", "")), []).append(sample)
         totals = {name: len(items) for name, items in bands.items()}
-        return self._band_quotas(totals, self._page_size()), bands
+        quotas = self._band_quotas(totals, self._page_size())
+        self._triage_plan = (key, quotas, bands)
+        return quotas, bands
 
     def _page_slice(self) -> list[dict[str, object]]:
         """The samples belonging on the current page."""
@@ -2534,6 +2554,33 @@ class BikiniScannerApp:
             "quality_history": list(self.quality_history),
         }
 
+    def _schedule_summary_refresh(self) -> None:
+        """Queue the headline counts; recompute them once the clicking stops.
+
+        The summary counts matches across the whole folder and the stats line walks
+        every label in it, working out for each one whether the scanner agreed. Both
+        are O(the whole folder) and neither can change by more than one between two
+        clicks, so running them inline cost more per decision than everything else on
+        the labelling path put together — about 65 ms of a 113 ms Accept once 40 000
+        photos had been judged, and it grows with every label added.
+
+        The per-click feedback a reviewer actually reads is the status line, which is
+        written synchronously either way. These are the slower, quieter numbers.
+        """
+        if self._summary_refresh_after_id is not None:
+            try:
+                self.root.after_cancel(self._summary_refresh_after_id)
+            except Exception:  # noqa: BLE001
+                pass
+            self._summary_refresh_after_id = None
+        self._summary_refresh_after_id = self._after(SUMMARY_IDLE_MS, self._flush_summary_refresh)
+
+    def _flush_summary_refresh(self) -> None:
+        self._summary_refresh_after_id = None
+        if self.current_state is None:
+            return
+        self._refresh_summary()
+
     def _save_review_session(self) -> None:
         """Queue a session snapshot; the write itself happens once things go quiet.
 
@@ -2883,6 +2930,7 @@ class BikiniScannerApp:
             self._hardware_after_id,
             self._retrain_after_id,
             self._session_save_after_id,
+            self._summary_refresh_after_id,
             self._scroll_after_id,
             self._reflow_after_id,
             self._sash_clamp_after_id,
@@ -2898,6 +2946,7 @@ class BikiniScannerApp:
         self._hardware_after_id = None
         self._retrain_after_id = None
         self._session_save_after_id = None
+        self._summary_refresh_after_id = None
         self._scroll_after_id = None
         self._reflow_after_id = None
         self._sash_clamp_after_id = None
@@ -3355,6 +3404,7 @@ class BikiniScannerApp:
 
     def _refresh_displayed_results(self, reset_page: bool = True, keep_focus: bool = True) -> None:
         self.displayed_samples = self._apply_display_filters(self.current_samples)
+        self._display_generation += 1
         if reset_page:
             # A new result set starts at the top; paging through one does not. It also
             # means the reviewer asked for a different order, so the pinned one goes.
@@ -7825,10 +7875,23 @@ class BikiniScannerApp:
         # grid still showed every photo the reviewer had just decided — the click
         # looked like it had done nothing at all.
         if self.current_state is not None:
-            if self.view_mode == "decided":
-                # A changed decision changes which group the photo belongs in.
-                self.current_samples = self._decided_samples()
-            self._refresh_displayed_results(reset_page=False)
+            if self.view_mode == "triage":
+                # Nothing to re-decide: the bands are cut off the score, and a decided
+                # photo keeps its place and fades. So the displayed list and its order
+                # are provably unchanged, and the cards were repainted above.
+                #
+                # This is worth the special case. Re-filtering and re-sorting is O(n)
+                # in the whole folder and it ran on the main thread on every single
+                # click: at 80 000 photos one Accept cost ~400 ms of sorting a list
+                # back into the order it was already in, which is most of a second
+                # per photo of a job that is already 80 000 photos long.
+                self._schedule_summary_refresh()
+                self._save_review_session()
+            else:
+                if self.view_mode == "decided":
+                    # A changed decision changes which group the photo belongs in.
+                    self.current_samples = self._decided_samples()
+                self._refresh_displayed_results(reset_page=False)
         # Always say how much is actually left. Without this the queue refilling after
         # every retrain looks infinite, because nothing on screen ever counts down.
         self.status_var.set(f"{status} {self._progress_note()}".strip())

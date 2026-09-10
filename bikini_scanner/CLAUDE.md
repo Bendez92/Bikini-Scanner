@@ -25,6 +25,26 @@ are load-bearing; re-check them before changing anything in this area.
 Image decoding is prefetched on a worker thread (`_prefetch_upcoming`); only PIL work
 happens off the main thread, and `ImageTk.PhotoImage` construction stays on it.
 
+At 80 000 photos the cost that mattered was not any one pass but how often the
+labelling path ran them. Measured per Accept, main thread, before and after:
+
+- **A decision in the all-results view does not re-filter or re-sort.** The bands are
+  cut off the score and a decided photo keeps its place and fades, so the displayed
+  list and its order provably cannot change; only the card is repainted. Doing the
+  pass anyway was ~400 ms per click at 80 000 photos.
+- **`_triage_page_plan` is cached against `_display_generation`.** One refresh asks for
+  it three times (`_page_count`, twice via `_sync_pager`, plus `_page_slice`), and each
+  build groups the whole folder.
+- **The summary and stats line are debounced** (`SUMMARY_IDLE_MS`). Both are O(the whole
+  folder) — the stats line walks every label working out whether the scanner agreed —
+  and neither can move by more than one between two clicks. Inline, they were ~65 ms of
+  a 113 ms Accept once 40 000 photos had been judged, and they grew with every label.
+  The status line, which is the per-click feedback anyone actually reads, is still
+  written synchronously.
+
+Net: ~400 ms -> ~45 ms per decision, and flat in the number of labels rather than
+growing with it.
+
 A filter/sort pass over the results is the other hot path, and it was ~937 ms for 5 000
 samples until four things were hoisted out of the per-sample loop. All four matter:
 
