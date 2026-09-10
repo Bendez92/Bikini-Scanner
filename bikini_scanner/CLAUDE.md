@@ -95,6 +95,44 @@ Vertical space is the scarce resource; several things exist only to defend it.
   for judging a photo.
 
 
+## A Modal In A Test Blocks Forever
+
+`_scan_completed(full_rescan=True)` ends with a "Scan complete" `messagebox.showinfo`,
+and `show_decisions`, `show_detected_files` and the band actions raise their own. In a
+test there is nobody to press OK, so the call sits there: one test that drove a full
+scan without stubbing it took the suite from 61 s to 1 490 s, and its own runtime varied
+between 21 s and 877 s depending on what else was running. Any test that reaches a code
+path with a dialog has to stub `gui.messagebox` for the duration and restore it after.
+
+## The Scanner Decides The Easy Ones
+
+The point of the app is that a person does not look at 80 000 photos. Bands, bursts and
+bulk actions all reduce the count; `autodecide.py` is the part that removes the majority
+outright, by finding the score above which the model has demonstrably been right and the
+score below which it has demonstrably been wrong, and deciding everything past them.
+
+Three things make this safe, and all three are load-bearing:
+
+- **The accuracy is measured out-of-fold.** `_out_of_fold_scores` re-scores the labelled
+  photos with `cross_val_scores`, so every number comes from a model that had not seen
+  that photo. Scoring a photo with the model it helped fit gives a flattering answer,
+  and here that answer decides whether tens of thousands of images get labelled unseen.
+- **The score calibrated on must be the score applied.** `state.scores` is
+  `blend(zero_shot, learned, weight)`, so the out-of-fold figure is blended the same way
+  with the same weight before any cut is taken from it. Calibrating on one scale and
+  cutting on another silently produces confident nonsense — measured at 36% error while
+  reporting 9%.
+- **A cut is judged on `wilson_lower_bound`, not the raw fraction.** Twenty right out of
+  twenty is evidence of about 83% accuracy, not 100%. Using the observed rate let a cut
+  resting on a couple of hundred labels promise nobody would ever be wrong: measured, it
+  claimed 0 mistakes and made 356. The bound also makes `expected_mistakes` pessimistic,
+  which is the right direction for a number someone is deciding on.
+
+`MIN_SUPPORT` is the floor under any cut, and refusing is a normal outcome — at 400
+labels a 99.9% target is simply not supportable and the dialog says so rather than
+approximating it. The dialog previews counts and expected mistakes before anything is
+written, and the whole batch is one `_apply_label_batch`, so Ctrl+Z takes it all back.
+
 ## Deciding More Than One Photo At Once
 
 80 000 photos cannot be reviewed one at a time, so there are three widths of decision

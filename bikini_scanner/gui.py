@@ -42,8 +42,9 @@ from typing import cast
 import numpy as np
 from PIL import Image, ImageTk
 
-from . import cascade, vision_analysis
+from . import autodecide, cascade, vision_analysis
 from .__version__ import __version__
+from .autodecide import AutoDecidePlan  # noqa: F401  (re-exported for tests)
 from .backend_utils import ImageEmbeddingBackend
 from .config import HIGH_ACCURACY_MODEL, ScannerConfig, filter_folder_override
 from .config_profiles import (
@@ -57,6 +58,7 @@ from .config_profiles import (
 from .duplicates import near_duplicate_groups
 from .global_store import GlobalLearningStore
 from .image_formats import heif_supported, open_oriented, oriented_size
+from .linear_model import cross_val_scores
 from .logging_setup import configure_logging, log_path, read_log_tail
 from .output_ops import (
     OutputOptions,
@@ -2193,6 +2195,9 @@ class BikiniScannerApp:
         tools_menu.add_command(label="Settings profiles", command=self.open_profiles_dialog)
         tools_menu.add_command(label="Output options", command=self.open_output_options_dialog)
         tools_menu.add_separator()
+        tools_menu.add_command(
+            label="Decide the easy ones…", command=self.open_auto_decide_dialog
+        )
         tools_menu.add_command(label="Update rankings", command=self.update_algorithm)
         tools_menu.add_cascade(label="Inspect", menu=inspect_menu)
         tools_menu.add_cascade(label="Export", menu=export_menu)
@@ -6425,6 +6430,193 @@ class BikiniScannerApp:
             return
         self.focused_path = path
         self._apply_focus_visuals()
+
+    # --- deciding the easy ones automatically --------------------------------
+    def _out_of_fold_scores(self) -> tuple[list[float], list[int]] | None:
+        """Each labelled photo's score, from a model that had not seen that photo.
+
+        This is the whole basis of auto-deciding, so it is measured the honest way.
+        Scoring a labelled photo with the model it helped fit gives a number that is
+        far too good, and here that number decides whether tens of thousands of images
+        get labelled without anyone looking at them.
+
+        The score blended here is the same quantity the grid sorts on — prompts and
+        cascade mixed with the learned model at its earned weight — because that is
+        what the cut will be applied to.
+        """
+        state = self.current_state
+        scorer = self.scorer
+        if state is None or scorer is None or state.features is None:
+            return None
+        labels = self._label_map()
+        rows = [
+            index for index, path in enumerate(state.paths) if labels.get(str(path)) in (0, 1)
+        ]
+        if len(rows) < autodecide.MIN_SUPPORT:
+            return None
+        truth = [int(labels[str(state.paths[index])]) for index in rows]
+        counts = np.bincount(np.asarray(truth, dtype=np.int64), minlength=2)
+        folds = int(min(5, counts.min()))
+        if folds < 3:
+            return None
+        features = np.asarray(state.features, dtype=np.float32)[rows]
+        outcome = scorer.learning_outcome
+        try:
+            learned = cross_val_scores(
+                features, np.asarray(truth, dtype=np.int64), float(outcome.chosen_c or 1.0), folds
+            )
+        except Exception:
+            LOGGER.exception("Could not measure held-out accuracy for auto-decide")
+            return None
+        weight = float(outcome.weight)
+        zero_shot = np.asarray(state.zero_shot_scores, dtype=np.float64)[rows]
+        blended = (1.0 - weight) * zero_shot + weight * np.asarray(learned, dtype=np.float64)
+        return [float(value) for value in blended], truth
+
+    def auto_decide_plan(self, target: float) -> autodecide.AutoDecidePlan:
+        """What the scanner could decide alone at this confidence, and at what cost."""
+        state = self.current_state
+        if state is None:
+            return autodecide.AutoDecidePlan(target=target, reason="Run a scan first.")
+        measured = self._out_of_fold_scores()
+        if measured is None:
+            return autodecide.AutoDecidePlan(
+                target=target,
+                reason=(
+                    f"Judge about {autodecide.MIN_SUPPORT} photos first, with some of each "
+                    "verdict. Until then there is no measured accuracy to trust."
+                ),
+            )
+        labelled_scores, truth = measured
+        labels = self._label_map()
+        mask = self._result_visibility_mask()
+        paths: list[str] = []
+        scores: list[float] = []
+        for index, path in enumerate(state.paths):
+            if index >= len(mask) or not mask[index]:
+                continue
+            if labels.get(str(path)) is not None:
+                continue
+            paths.append(str(path))
+            scores.append(float(state.scores[index]))
+        return autodecide.plan_auto_decisions(paths, scores, labelled_scores, truth, target=target)
+
+    def open_auto_decide_dialog(self) -> None:
+        """Show what the scanner can take off the reviewer's hands, then do it.
+
+        Deliberately a preview rather than a button that just runs: this writes tens of
+        thousands of labels, those labels train the model, and one of the band actions
+        deletes what it rejects. The reviewer gets the counts and the expected number of
+        mistakes *before* any of that, and picks the confidence themselves.
+        """
+        if self.current_state is None:
+            messagebox.showinfo("No results", "Run a scan first.")
+            return
+        dialog, outer = self._create_modal("Decide the easy ones", padding=12, resizable=(True, False))
+        ttk.Label(
+            outer,
+            text="The scanner decides what it is sure about; you judge the rest.",
+        ).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=(
+                "Accuracy is measured against your own labels, on photos the model was not\n"
+                "fitted to — so these are the rates it achieves on photos it has not seen."
+            ),
+            style="FormMuted.TLabel",
+            justify="left",
+        ).pack(anchor="w", pady=(2, 10))
+
+        target_var = StringVar(value=f"{autodecide.DEFAULT_TARGET:.3f}")
+        summary_var = StringVar(value="Measuring…")
+        detail_var = StringVar(value="")
+        row = ttk.Frame(outer)
+        row.pack(fill="x")
+        ttk.Label(row, text="Confidence", width=12, anchor="w").pack(side=LEFT)
+        picker = ttk.Combobox(
+            row,
+            textvariable=target_var,
+            values=[f"{value:.3f}" for value in autodecide.TARGETS],
+            state="readonly",
+            width=10,
+        )
+        picker.pack(side=LEFT)
+        ttk.Label(row, text="of auto-decisions correct", style="FormMuted.TLabel").pack(
+            side=LEFT, padx=(8, 0)
+        )
+        ttk.Label(outer, textvariable=summary_var, justify="left").pack(anchor="w", pady=(12, 2))
+        ttk.Label(outer, textvariable=detail_var, style="FormMuted.TLabel", justify="left").pack(
+            anchor="w"
+        )
+        buttons = self._modal_button_row(outer)
+        apply_button = ttk.Button(buttons, text="Decide them", style="Accent.TButton")
+        apply_button.pack(side=RIGHT)
+        ttk.Button(buttons, text="Close", command=dialog._safe_close).pack(  # type: ignore[attr-defined]
+            side=RIGHT, padx=(0, 8)
+        )
+
+        current: dict[str, autodecide.AutoDecidePlan] = {}
+
+        def recompute(*_args: object) -> None:
+            try:
+                target = float(target_var.get())
+            except ValueError:
+                target = autodecide.DEFAULT_TARGET
+            plan = self.auto_decide_plan(target)
+            current["plan"] = plan
+            if not plan.usable:
+                summary_var.set(plan.reason or "Nothing can be decided automatically yet.")
+                detail_var.set("")
+                apply_button.configure(state="disabled")
+                return
+            summary_var.set(
+                f"Accept {len(plan.accept_paths)} · Reject {len(plan.reject_paths)} · "
+                f"leaving you {plan.remaining} to judge."
+            )
+            lines = [f"Measured on your {plan.measured_on} labelled photos."]
+            if plan.accept.found:
+                lines.append(
+                    f"Auto-accept at {plan.accept.threshold:.3f} and above — right "
+                    f"{(plan.accept.precision or 0.0) * 100:.1f}% of {plan.accept.support} held-out photos."
+                )
+            if plan.reject.found:
+                lines.append(
+                    f"Auto-reject at {plan.reject.threshold:.3f} and below — right "
+                    f"{(plan.reject.precision or 0.0) * 100:.1f}% of {plan.reject.support} held-out photos."
+                )
+            lines.append(f"Expect roughly {plan.expected_mistakes:.0f} of them to be wrong.")
+            lines.append("Ctrl+Z takes the whole batch back.")
+            detail_var.set("\n".join(lines))
+            apply_button.configure(state="normal")
+
+        def apply() -> None:
+            plan = current.get("plan")
+            if plan is None or not plan.usable:
+                return
+            if not messagebox.askyesno(
+                "Decide the easy ones",
+                f"Accept {len(plan.accept_paths)} photos and reject {len(plan.reject_paths)}, "
+                f"leaving {plan.remaining} for you?\n\n"
+                f"About {plan.expected_mistakes:.0f} of these are expected to be wrong. "
+                "They train the scanner like any other decision, and Ctrl+Z undoes the batch.",
+                parent=dialog,
+            ):
+                return
+            changes: dict[str, int | None] = dict.fromkeys(plan.accept_paths, 1)
+            changes.update(dict.fromkeys(plan.reject_paths, 0))
+            dialog._safe_close()  # type: ignore[attr-defined]
+            self._apply_label_batch(
+                changes,
+                status=(
+                    f"Auto-decided {len(changes)} photos at {plan.target * 100:.1f}% confidence — "
+                    f"{plan.remaining} left for you."
+                ),
+                retrain=True,
+            )
+
+        apply_button.configure(command=apply)
+        picker.bind("<<ComboboxSelected>>", recompute)
+        self._after(0, recompute)
 
     # --- near-duplicate bursts ----------------------------------------------
     def _toggle_near_duplicates(self) -> None:

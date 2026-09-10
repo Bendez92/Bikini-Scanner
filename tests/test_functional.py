@@ -50,6 +50,7 @@ os.environ["HOME"] = str(_STATE_DIR)
 os.environ["USERPROFILE"] = str(_STATE_DIR)
 
 from bikini_scanner import (
+    autodecide,
     cascade,
     config_profiles,
     duplicates,
@@ -1393,10 +1394,20 @@ class GuiReviewQueue(unittest.TestCase):
 
     def test_a_finished_scan_lands_on_all_results(self) -> None:
         """The landing view has to be the one that shows the whole folder."""
+        from bikini_scanner import gui as gui_module
+
         state = self.app.current_state
         assert state is not None
         self.app.view_mode = "review"
-        self.app._scan_completed(self.app._refresh_generation, state, [], full_rescan=True)
+        # A finished full scan reports itself with a modal, which in a test blocks on
+        # an OK button nobody is going to press. Left unstubbed this one test sat on
+        # the suite for a quarter of an hour.
+        original = gui_module.messagebox.showinfo
+        gui_module.messagebox.showinfo = lambda *a, **k: None
+        try:
+            self.app._scan_completed(self.app._refresh_generation, state, [], full_rescan=True)
+        finally:
+            gui_module.messagebox.showinfo = original
         self.assertEqual(self.app.view_mode, "triage")
         self.assertEqual(
             len(self.app.page_samples), len(self.paths), "the landing view did not show the whole folder"
@@ -1725,6 +1736,25 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertIn(f"1 of {len(group)} near-identical", details)
         self.assertNotIn("not linked", details)
 
+    def test_auto_decide_needs_labels_before_it_will_decide_anything(self) -> None:
+        """It writes labels in bulk, so it may not guess from nothing."""
+        self._spread_scores()
+        self.app.show_all_results()
+        plan = self.app.auto_decide_plan(0.99)
+        self.assertFalse(plan.usable)
+        self.assertEqual(plan.accept_paths, [])
+        self.assertEqual(plan.reject_paths, [])
+        self.assertTrue(plan.reason, "the refusal gave no reason")
+
+    def test_auto_decide_declines_when_the_state_carries_no_features(self) -> None:
+        """An older cached state has no feature matrix, so nothing can be measured."""
+        self._spread_scores()
+        state = self.app.current_state
+        assert state is not None
+        state.features = None
+        self.assertIsNone(self.app._out_of_fold_scores())
+        self.assertFalse(self.app.auto_decide_plan(0.95).usable)
+
     def test_the_three_views_can_be_switched_from_the_keyboard(self) -> None:
         """Every other step of the review loop has a key; switching view did not."""
         self._decide_one_of_each()
@@ -1762,6 +1792,96 @@ class GuiReviewQueue(unittest.TestCase):
         buckets = {str(sample["path"]): str(sample["bucket"]) for sample in self.app.page_samples}
         self.assertEqual(buckets[self.paths[2]], "True positives")
         self.assertEqual(buckets[self.paths[3]], "False positives")
+
+
+class AutoDecideCalibration(unittest.TestCase):
+    """The scanner may only decide alone where it has earned the right to."""
+
+    def test_a_perfect_run_of_twenty_does_not_prove_a_perfect_model(self) -> None:
+        """The bound is what stops a small sample promising nobody will be wrong."""
+        self.assertLess(autodecide.wilson_lower_bound(20, 20), 0.9)
+        self.assertLess(autodecide.wilson_lower_bound(200, 200), 0.99)
+        # Evidence still moves it the right way as it accumulates.
+        self.assertGreater(
+            autodecide.wilson_lower_bound(2000, 2000), autodecide.wilson_lower_bound(200, 200)
+        )
+        self.assertEqual(autodecide.wilson_lower_bound(0, 0), 0.0)
+        self.assertLess(autodecide.wilson_lower_bound(90, 100), 0.9)
+
+    def _separated(self, count: int = 400, noise: float = 0.0) -> tuple[list[float], list[int]]:
+        rng = np.random.default_rng(21)
+        truth = (rng.random(count) < 0.5).astype(np.int64)
+        scores = np.where(truth == 1, 0.9, 0.1) + rng.normal(0, noise, count) if noise else np.where(
+            truth == 1, 0.9, 0.1
+        )
+        return [float(value) for value in scores], [int(value) for value in truth]
+
+    def test_a_clean_separation_hands_back_both_cuts(self) -> None:
+        scores, truth = self._separated()
+        plan = autodecide.plan_auto_decisions(
+            ["hi.jpg", "lo.jpg", "mid.jpg"], [0.95, 0.05, 0.5], scores, truth, target=0.95
+        )
+        self.assertTrue(plan.usable)
+        self.assertEqual(plan.accept_paths, ["hi.jpg"])
+        self.assertEqual(plan.reject_paths, ["lo.jpg"])
+        self.assertEqual(plan.remaining, 1, "the uncertain photo was decided anyway")
+
+    def test_too_few_labels_decides_nothing_and_says_why(self) -> None:
+        plan = autodecide.plan_auto_decisions(["a.jpg"], [0.9], [0.9, 0.1], [1, 0])
+        self.assertFalse(plan.usable)
+        self.assertIn("too few", plan.reason)
+        self.assertEqual(plan.accept_paths, [])
+        self.assertEqual(plan.reject_paths, [])
+
+    def test_labels_that_are_all_one_verdict_decide_nothing(self) -> None:
+        scores = [0.5 + index / 1000 for index in range(60)]
+        plan = autodecide.plan_auto_decisions(["a.jpg"], [0.9], scores, [1] * 60)
+        self.assertFalse(plan.usable)
+        self.assertIn("same verdict", plan.reason)
+
+    def test_an_unreachable_target_is_refused_rather_than_approximated(self) -> None:
+        scores, truth = self._separated()
+        plan = autodecide.plan_auto_decisions(["a.jpg"], [0.95], scores, truth, target=0.99999)
+        self.assertFalse(plan.usable)
+        self.assertIn("right", plan.reason)
+
+    def test_the_mistake_estimate_is_pessimistic_not_optimistic(self) -> None:
+        """It is the number the reviewer decides on; it must not flatter the model."""
+        scores, truth = self._separated()
+        plan = autodecide.plan_auto_decisions(
+            [f"p{i}.jpg" for i in range(100)], [0.95] * 100, scores, truth, target=0.95
+        )
+        self.assertTrue(plan.usable)
+        self.assertIsNotNone(plan.accept.confident_precision)
+        self.assertLess(
+            plan.accept.confident_precision or 1.0,
+            plan.accept.precision or 0.0,
+            "the bound was not below the raw observation",
+        )
+        self.assertGreater(plan.expected_mistakes, 0.0, "a perfect record was promised")
+
+    def test_no_photo_is_both_accepted_and_rejected(self) -> None:
+        """Contradictory labels can make the two cuts cross; a photo still gets one."""
+        rng = np.random.default_rng(22)
+        scores = [float(value) for value in rng.random(300)]
+        truth = [int(value) for value in (rng.random(300) < 0.5)]
+        for target in (0.5, 0.6):
+            plan = autodecide.plan_auto_decisions(
+                [f"p{i}.jpg" for i in range(50)],
+                [float(value) for value in rng.random(50)],
+                scores,
+                truth,
+                target=target,
+            )
+            self.assertEqual(
+                set(plan.accept_paths) & set(plan.reject_paths), set(), "a photo got both verdicts"
+            )
+            self.assertEqual(plan.decided + plan.remaining, 50)
+
+    def test_the_inputs_must_line_up(self) -> None:
+        scores, truth = self._separated()
+        with self.assertRaises(ValueError):
+            autodecide.plan_auto_decisions(["a.jpg", "b.jpg"], [0.9], scores, truth)
 
 
 class NearDuplicateGrouping(unittest.TestCase):
