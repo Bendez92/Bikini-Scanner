@@ -955,8 +955,16 @@ def _embedding_namespace(config: ScannerConfig) -> str:
 
 
 def _region_namespace(config: ScannerConfig) -> str:
+    """Identity of the crop layout cached region embeddings belong to.
+
+    max_faces is part of it because it decides how many people get crops planned for
+    them. Without it, lowering max_faces left the extra subjects' crops in the cache and
+    they were loaded and scored exactly as before, so the setting appeared to do nothing
+    on any folder that had already been scanned — and it is a key a folder override may
+    set.
+    """
     slug = re.sub(r"[^A-Za-z0-9]+", "_", str(config.model_name or "default")).strip("_").lower()
-    return f"{slug}__g{REGION_GEOMETRY_VERSION}"
+    return f"{slug}__g{REGION_GEOMETRY_VERSION}__f{int(config.max_faces)}"
 
 
 def _candidate_mask(
@@ -1029,7 +1037,15 @@ def run_deep_pass(
     # Crops that need embedding are gathered across images so the backend is invoked once
     # per batch instead of once per candidate. Cached crops skip this list entirely.
     pending_crops: list[tuple[int, str, Image.Image]] = []
-    pending_meta: list[tuple[int, str, str]] = []  # (index, content_hash, key)
+    # Parallel to pending_crops, one entry per crop, content_hash None when the file
+    # could not be hashed. It used to be built with a filter on content_hash while
+    # pending_crops was not, so a single unhashable image shifted the zip against the
+    # embedding vectors and every later crop was cached under another image's key.
+    pending_meta: list[str | None] = []
+    # Only the VLM pass ever reads these back, and they are full-resolution frames:
+    # retaining one per candidate held thousands of decoded images for the whole scan
+    # when the pass was not even going to run.
+    keep_decoded = bool(scorer.config.vlm_enabled)
     decoded_images: dict[int, Image.Image] = {}
     processed = 0
 
@@ -1056,7 +1072,8 @@ def run_deep_pass(
                 # anything, so a scaled decode would throw away the very detail the
                 # crops exist to recover.
                 image = open_oriented(path)
-                decoded_images[index] = image
+                if keep_decoded:
+                    decoded_images[index] = image
                 faces = detect_face_boxes(image)
                 updated_faces[index] = len(faces)
                 planned = [
@@ -1066,11 +1083,7 @@ def run_deep_pass(
                 ]
                 materialised = crop_regions(image, planned)
                 pending_crops.extend((index, key, crop) for key, crop in materialised)
-                pending_meta.extend(
-                    (index, str(content_hash), key)
-                    for key, _ in materialised
-                    if content_hash
-                )
+                pending_meta.extend(str(content_hash) if content_hash else None for _key, _ in materialised)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Deep pass skipped %s: %s", path, exc)
 
@@ -1098,8 +1111,17 @@ def run_deep_pass(
             if region_kind(key) != KIND_FACE:
                 detail_rows.setdefault(index, []).append(len(row_embeddings) - 1)
         if store is not None:
-            for (index, content_hash, key), vector in zip(pending_meta, vectors, strict=False):
-                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(vector, dtype=np.float32)
+            # pending_crops, pending_meta and vectors are all the same length and in the
+            # same order; images with no content hash are skipped here rather than being
+            # left out of one of the three lists.
+            for (index, key, _crop), content_hash, vector in zip(
+                pending_crops, pending_meta, vectors, strict=False
+            ):
+                if not content_hash:
+                    continue
+                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(
+                    vector, dtype=np.float32
+                )
                 pending_cache[store.region_cache_key(content_hash, namespace, "__faces__")] = np.asarray(
                     [max(int(updated_faces[index]), 0)], dtype=np.float32
                 )
@@ -1236,8 +1258,6 @@ def compute_vlm_scores(
             LOGGER.warning("VLM pass skipped %s: %s", state.paths[index], exc)
     if not ranked:
         return None
-    if not ranked:
-        return None
     cached: dict[int, dict[str, float]] = {}
     pending: dict[str, dict[str, float]] = {}
     uncached_images: list[list[Image.Image]] = []
@@ -1252,7 +1272,10 @@ def compute_vlm_scores(
         if content_hash and store is not None:
             key = store.vlm_cache_key(content_hash, scorer.config.vlm_model, VLM_PROMPT_VERSION)
             verdict = store.lookup_vlm_verdict(key)
-            if verdict is not None:
+            # `not verdict` rather than `is not None`: an empty verdict is not a
+            # judgment, and older builds cached those. Treating one as real scored the
+            # image 0.0 off the back of a reply that named no axes.
+            if verdict:
                 cached[position] = verdict
                 continue
         uncached_images.append(views)
@@ -1264,7 +1287,7 @@ def compute_vlm_scores(
             # A cancellation is the user's own signal, not an error worth chaining.
             raise ScanCancelled from None
         for position, response in zip(uncached_positions, responses, strict=False):
-            if response is None:
+            if not response:
                 continue
             cached[position] = response
             content_hash = position_hashes.get(position)
@@ -1280,7 +1303,7 @@ def compute_vlm_scores(
     config = scorer.config
     for position, (_, index, _views) in enumerate(ranked):
         values = cached.get(position)
-        if values is None:
+        if not values:
             continue
         matrix: np.ndarray = np.asarray([[values.get(axis, 0.5) for axis in VLM_AXES]], dtype=np.float32)
         axis_scores = {axis: matrix[:, offset] for offset, axis in enumerate(VLM_AXES)}
@@ -1778,6 +1801,14 @@ def _scan_and_score_folder_impl(
         for record in decoded_images:
             processed += 1
             if record.image is None:
+                # A file listed at the start of the scan and gone by the time it was
+                # read is not a damaged image, and "[Errno 2] No such file or directory"
+                # sitting in the "Files that could not be read" list next to genuinely
+                # corrupt photos invited the wrong conclusion about both.
+                if not record.path.exists():
+                    _record_vanished(record.path)
+                    _notify()
+                    continue
                 LOGGER.warning("Skipped unreadable image %s: %s", record.path, record.error)
                 skipped_records.append(
                     {

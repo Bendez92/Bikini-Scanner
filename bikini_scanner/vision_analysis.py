@@ -55,6 +55,12 @@ _MIN_FACE_PX = 16
 _LOCK = threading.Lock()
 _DETECTOR: Any | None = None
 _DETECTOR_PATH: Path | None = None
+# resolve_model() stats two candidate paths, and it used to run two to four times per
+# image: face_detection_available() called it, then detect_face_boxes() -> _detector()
+# called it again. On a 20 000-image scan with face counting on that is ~80 000 syscalls
+# for an answer that only changes when the model is installed or removed.
+_RESOLVED: Path | None = None
+_RESOLVED_KNOWN = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +92,7 @@ def bundled_model_path() -> Path:
     return Path(__file__).resolve().parent.parent / "assets" / MODEL_FILENAME
 
 
-def resolve_model() -> Path | None:
+def _locate_model() -> Path | None:
     for candidate in (model_path(), bundled_model_path()):
         try:
             if candidate.is_file() and candidate.stat().st_size > 1024:
@@ -94,6 +100,31 @@ def resolve_model() -> Path | None:
         except OSError:
             continue
     return None
+
+
+def resolve_model() -> Path | None:
+    """Where the face model is, memoised for the life of the process.
+
+    `forget_model_location()` clears it, and installing one calls that, so the app picks
+    up a model it downloaded itself without a restart. A file dropped in by hand while
+    the app is running is the one case that still needs one.
+    """
+    global _RESOLVED, _RESOLVED_KNOWN
+    if _RESOLVED_KNOWN:
+        return _RESOLVED
+    with _LOCK:
+        if not _RESOLVED_KNOWN:
+            _RESOLVED = _locate_model()
+            _RESOLVED_KNOWN = True
+    return _RESOLVED
+
+
+def forget_model_location() -> None:
+    """Re-check where the model is on the next call."""
+    global _RESOLVED, _RESOLVED_KNOWN
+    with _LOCK:
+        _RESOLVED = None
+        _RESOLVED_KNOWN = False
 
 
 def face_detection_available() -> bool:
@@ -164,14 +195,21 @@ def detect_face_boxes(image: Image.Image) -> list[FaceBox]:
     faces: list[FaceBox] = []
     for row in detections:
         x, y, w, h = (float(value) for value in row[:4])
-        if w < _MIN_FACE_PX or h < _MIN_FACE_PX:
+        # Measured against the original frame, not the downscaled copy the detector saw.
+        # Comparing in detector coordinates made the threshold scale with the image: on a
+        # 4000px photo reduced to 640px, a box of 16px there is a 100px face here, and
+        # perfectly usable faces on large photos were being dropped while small photos
+        # kept much smaller ones.
+        full_width = w / scale
+        full_height = h / scale
+        if full_width < _MIN_FACE_PX or full_height < _MIN_FACE_PX:
             continue
         faces.append(
             FaceBox(
                 x=max(0, int(round(x / scale))),
                 y=max(0, int(round(y / scale))),
-                width=int(round(w / scale)),
-                height=int(round(h / scale)),
+                width=int(round(full_width)),
+                height=int(round(full_height)),
                 score=float(row[-1]) if len(row) >= 15 else 1.0,
             )
         )
@@ -198,8 +236,12 @@ def install_model_from_bytes(payload: bytes) -> Path:
     temporary = target.with_suffix(".part")
     temporary.write_bytes(payload)
     temporary.replace(target)
-    global _DETECTOR, _DETECTOR_PATH
+    global _DETECTOR, _DETECTOR_PATH, _RESOLVED, _RESOLVED_KNOWN
+    # One acquisition for all four: forget_model_location() takes the same lock, so
+    # calling it from in here would deadlock.
     with _LOCK:
         _DETECTOR = None
         _DETECTOR_PATH = None
+        _RESOLVED = None
+        _RESOLVED_KNOWN = False
     return target

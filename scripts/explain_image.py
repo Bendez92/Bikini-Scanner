@@ -152,7 +152,8 @@ def main() -> int:
                 (
                     "looks_minor",
                     (c >= config.minor_threshold) and (c > a + config.child_adult_margin),
-                    f"child {c:.3f} >= {config.minor_threshold} and child > adult {a:.3f} + {config.child_adult_margin}",
+                    f"child {c:.3f} >= {config.minor_threshold} and child > adult {a:.3f}"
+                    f" + {config.child_adult_margin}",
                 ),
                 (
                     "strongly_minor",

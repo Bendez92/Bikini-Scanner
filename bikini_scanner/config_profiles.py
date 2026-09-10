@@ -124,12 +124,22 @@ def inert_keys(mapping: Mapping[str, Any]) -> set[str]:
     return {key for key in LEGACY_ONLY_KEYS if key in mapping}
 
 
+# Settings that are credentials rather than configuration. A profile is meant to be
+# saved, copied between machines and shared; a bearer token is none of those things.
+SECRET_KEYS = frozenset({"vlm_api_key"})
+
+
+def without_secrets(mapping: Mapping[str, Any]) -> dict[str, Any]:
+    """A config dict safe to write to a file the user may share or sync."""
+    return {key: ("" if key in SECRET_KEYS else value) for key, value in mapping.items()}
+
+
 def save_profile(name: str, config: ScannerConfig) -> None:
     name = name.strip()
     if not name or name in BUILTIN_PROFILES:
         raise ValueError("Choose a non-empty custom profile name.")
     profiles = load_profiles()
-    profiles[name] = config.to_dict()
+    profiles[name] = without_secrets(config.to_dict())
     save_profiles(profiles)
 
 

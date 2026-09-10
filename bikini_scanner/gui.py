@@ -45,7 +45,14 @@ from . import cascade, vision_analysis
 from .__version__ import __version__
 from .backend_utils import ImageEmbeddingBackend
 from .config import HIGH_ACCURACY_MODEL, ScannerConfig, filter_folder_override
-from .config_profiles import BUILTIN_PROFILES, delete_profile, profile_config, profile_names, save_profile
+from .config_profiles import (
+    BUILTIN_PROFILES,
+    delete_profile,
+    profile_config,
+    profile_names,
+    save_profile,
+    without_secrets,
+)
 from .global_store import GlobalLearningStore
 from .image_formats import heif_supported, open_oriented, oriented_size
 from .logging_setup import configure_logging, log_path, read_log_tail
@@ -1032,7 +1039,10 @@ class BikiniScannerApp:
             return
         try:
             if self.config.vlm_enabled:
-                self.vlm_badge.pack(side=LEFT, padx=(6, 0))
+                # side=RIGHT to match how it is first packed in _build_status_bar;
+                # re-packing it LEFT moved the badge across the indicator cluster every
+                # time the setting was toggled.
+                self.vlm_badge.pack(side=RIGHT, padx=(6, 0))
             else:
                 self.vlm_badge.pack_forget()
         except Exception:  # noqa: BLE001
@@ -1776,8 +1786,25 @@ class BikiniScannerApp:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _persistable_config(self) -> dict[str, object]:
+        """The settings worth writing to the preferences file.
+
+        Everything except the VLM API key. A key is a credential, the preferences file
+        is plain JSON in the user data directory, and the documented setup — a local
+        Ollama or llama.cpp server — needs no key at all. It stays in memory for the
+        session; a remote endpoint has to have it re-entered next launch.
+        """
+        return without_secrets(self.global_config.to_dict())
+
     def _save_user_prefs(self) -> None:
         payload = {
+            # Scanner settings, not just UI state. Without this nothing from Tools >
+            # Settings survived a restart: the model, the age gate, deep-scan mode, the
+            # VLM configuration and the prompts all reverted to their defaults on every
+            # launch, and the only way to keep them was to export a file by hand.
+            # global_config, not config: a folder override is stored with its folder and
+            # must not be promoted into the settings every other folder inherits.
+            "scanner_config": self._persistable_config(),
             "theme": self.theme_var.get().strip(),
             "font_size": int(self.font_size_var.get()),
             "columns": int(self.columns_var.get()),
@@ -2779,11 +2806,23 @@ class BikiniScannerApp:
         self.store = self.store or FolderStore(Path(folder))
         # Only persist what a folder override is allowed to carry, so reopening the
         # folder does not warn about restricted keys this app wrote itself.
-        payload, _refused = filter_folder_override(self.config.to_dict())
+        payload, refused = filter_folder_override(self.config.to_dict())
         self.store.save_config_override(payload)
         self.folder_override_active = True
         self.override_var.set("Folder override active")
         self.status_var.set("Saved settings override for this folder.")
+        if refused:
+            # These are dropped by the trust boundary, not by accident. Saying so is the
+            # difference between a deliberate restriction and a setting that appeared to
+            # save and then quietly came back as the default.
+            messagebox.showinfo(
+                "Folder override saved",
+                f"{len(payload)} setting(s) were pinned to this folder.\n\n"
+                "A folder override cannot carry settings that reach off this machine, run "
+                "code, choose a model or affect the age gate, because the file lives inside "
+                "the folder being scanned. These stayed on your global settings:\n\n"
+                f"{', '.join(refused)}",
+            )
 
     def _reset_folder_override(self) -> None:
         if self.store is None:
@@ -2792,6 +2831,7 @@ class BikiniScannerApp:
         self.folder_override_active = False
         self.config = ScannerConfig.from_mapping(self.global_config.to_dict())
         self.override_var.set("")
+        self._sync_config_controls()
         self.status_var.set("Folder override reset to global settings.")
 
     def show_guide(self) -> None:
@@ -3508,49 +3548,101 @@ class BikiniScannerApp:
         overlay = canvas.create_text(
             10, 10, anchor="nw", text=self._axis_details_text(path), fill=self._palette()["fg"]
         )
-        state = {"zoom": 1.0, "offset_x": 0, "offset_y": 0}
+        # Pan and zoom are tracked in source-image coordinates: (cx, cy) is the point of
+        # the photo sitting under the middle of the canvas. A zoom of 0 means "not
+        # decided yet" and resolves to fit-the-window on the first draw.
+        state: dict[str, float] = {"zoom": 0.0, "cx": image.width / 2.0, "cy": image.height / 2.0}
         photo_ref: list[ImageTk.PhotoImage] = []
+        pan_origin: dict[str, float] = {}
+        MAX_ZOOM = 8.0
+
+        def _canvas_size() -> tuple[int, int]:
+            return max(int(canvas.winfo_width()), 1), max(int(canvas.winfo_height()), 1)
+
+        def _fit_zoom(width: int, height: int) -> float:
+            return min(width / image.width, height / image.height)
+
+        def _clamped_zoom(value: float, width: int, height: int) -> float:
+            # Never smaller than fitting the window, never past MAX_ZOOM. Zooming out
+            # past the fit only adds empty space, and the ceiling is what stops a
+            # 12 MP photo being asked for at 8x.
+            return max(_fit_zoom(width, height), min(float(value), MAX_ZOOM))
 
         def redraw() -> None:
-            width = max(canvas.winfo_width(), 1)
-            height = max(canvas.winfo_height(), 1)
-            zoom = max(0.1, min(8.0, state["zoom"]))
-            size = (max(1, int(image.width * zoom)), max(1, int(image.height * zoom)))
-            resized = image.resize(size, Image.Resampling.LANCZOS)
-            photo = ImageTk.PhotoImage(resized)
+            width, height = _canvas_size()
+            if state["zoom"] <= 0:
+                state["zoom"] = _fit_zoom(width, height)
+            zoom = _clamped_zoom(state["zoom"], width, height)
+            state["zoom"] = zoom
+            # The slice of the source that is actually on screen at this zoom.
+            view_w = min(image.width, max(1, int(round(width / zoom))))
+            view_h = min(image.height, max(1, int(round(height / zoom))))
+            cx = min(max(float(state["cx"]), view_w / 2), image.width - view_w / 2)
+            cy = min(max(float(state["cy"]), view_h / 2), image.height - view_h / 2)
+            state["cx"], state["cy"] = cx, cy
+            left = int(round(cx - view_w / 2))
+            top = int(round(cy - view_h / 2))
+            # Only the visible part is ever resampled, so the cost of a draw is bounded
+            # by the size of the window rather than by the zoom. Resizing the whole
+            # image instead meant 8x on a 12 MP photo allocated a ~750 megapixel
+            # intermediate — gigabytes — and every mouse-move during a pan paid for
+            # another full LANCZOS pass over the original.
+            crop = image.crop((left, top, left + view_w, top + view_h))
+            target = (
+                max(1, min(width, int(round(view_w * zoom)))),
+                max(1, min(height, int(round(view_h * zoom)))),
+            )
+            resample = Image.Resampling.LANCZOS if zoom < 1.0 else Image.Resampling.BILINEAR
+            photo = ImageTk.PhotoImage(crop.resize(target, resample))
             photo_ref[:] = [photo]
             canvas.delete("image")
-            canvas.create_image(state["offset_x"], state["offset_y"], anchor="center", image=photo, tags="image")
+            canvas.create_image(width // 2, height // 2, anchor="center", image=photo, tags="image")
+            canvas.tag_lower("image", overlay)
             canvas.coords(overlay, 10, height - 30)
-            canvas.configure(scrollregion=(0, 0, width, height))
 
-        def zoom(event) -> str:
-            delta = 1.1 if getattr(event, "delta", 0) > 0 else 0.9
-            state["zoom"] *= delta
+        def _zoom_by(delta: float, pointer_x: float, pointer_y: float) -> str:
+            width, height = _canvas_size()
+            old = _clamped_zoom(state["zoom"] or _fit_zoom(width, height), width, height)
+            new = _clamped_zoom(old * (1.1 if delta > 0 else 1 / 1.1), width, height)
+            if new != old:
+                # Keep whatever is under the pointer under the pointer.
+                offset_x = pointer_x - width / 2
+                offset_y = pointer_y - height / 2
+                state["cx"] = float(state["cx"]) + offset_x * (1.0 / old - 1.0 / new)
+                state["cy"] = float(state["cy"]) + offset_y * (1.0 / old - 1.0 / new)
+                state["zoom"] = new
             redraw()
             return "break"
 
         def start_pan(event) -> None:
-            canvas.scan_mark(event.x, event.y)
+            pan_origin.update(
+                {"x": float(event.x), "y": float(event.y), "cx": float(state["cx"]), "cy": float(state["cy"])}
+            )
 
         def move_pan(event) -> None:
-            canvas.scan_dragto(event.x, event.y, gain=1)
-            state["offset_x"] = canvas.canvasx(event.x)
-            state["offset_y"] = canvas.canvasy(event.y)
+            if not pan_origin:
+                return
+            zoom = max(float(state["zoom"]), 1e-6)
+            state["cx"] = pan_origin["cx"] - (float(event.x) - pan_origin["x"]) / zoom
+            state["cy"] = pan_origin["cy"] - (float(event.y) - pan_origin["y"]) / zoom
             redraw()
 
         def close_viewer() -> None:
             image.close()
+            try:
+                viewer.grab_release()
+            except Exception:  # noqa: BLE001
+                pass
             viewer.destroy()
 
-        canvas.bind("<MouseWheel>", zoom)
-        canvas.bind("<Button-4>", lambda event: zoom(type("E", (), {"delta": 120})()))
-        canvas.bind("<Button-5>", lambda event: zoom(type("E", (), {"delta": -120})()))
+        canvas.bind("<MouseWheel>", lambda event: _zoom_by(getattr(event, "delta", 0), event.x, event.y))
+        canvas.bind("<Button-4>", lambda event: _zoom_by(120, event.x, event.y))
+        canvas.bind("<Button-5>", lambda event: _zoom_by(-120, event.x, event.y))
         canvas.bind("<ButtonPress-1>", start_pan)
         canvas.bind("<B1-Motion>", move_pan)
         viewer.protocol("WM_DELETE_WINDOW", close_viewer)
         viewer.bind("<Escape>", lambda _event: close_viewer())
-        viewer.bind("<Configure>", lambda _event: redraw())
+        canvas.bind("<Configure>", lambda _event: redraw())
         redraw()
 
     def _file_info_text(self, path: str) -> str:
@@ -4065,9 +4157,11 @@ class BikiniScannerApp:
         ).grid(row=5, column=0, columnspan=2, sticky="w", padx=(22, 0), pady=(0, 6))
         # The checkbox above decides whether the re-check runs; these decide what it
         # costs. Exposing one without the others left no way to bound a slow scan.
+        # Rows 6-8, immediately under that checkbox: they used to sit at 13-15, which
+        # put them below the Hardware separator and read as hardware settings.
         add_labeled_entry(
             model_tab,
-            13,
+            6,
             "Re-check band around the threshold",
             refine_band_var,
             width=12,
@@ -4076,7 +4170,7 @@ class BikiniScannerApp:
         )
         add_labeled_entry(
             model_tab,
-            14,
+            7,
             "Re-check at most",
             refine_max_images_var,
             width=12,
@@ -4084,7 +4178,7 @@ class BikiniScannerApp:
         )
         add_labeled_entry(
             model_tab,
-            15,
+            8,
             "Re-check influence",
             refine_weight_var,
             width=12,
@@ -4092,10 +4186,10 @@ class BikiniScannerApp:
             "pass, from 0 (ignored) to 1 (it decides). 0.65 by default.",
         )
 
-        add_section(model_tab, 6, "Hardware")
+        add_section(model_tab, 9, "Hardware")
         add_combo(
             model_tab,
-            8,
+            11,
             "Device",
             device_var,
             ("auto", "cpu", "cuda"),
@@ -4104,7 +4198,7 @@ class BikiniScannerApp:
         )
         add_combo(
             model_tab,
-            9,
+            12,
             "Precision",
             precision_var,
             ("auto", "fp32", "fp16"),
@@ -4113,7 +4207,7 @@ class BikiniScannerApp:
         )
         add_labeled_entry(
             model_tab,
-            10,
+            13,
             "Batch size",
             batch_var,
             width=12,
@@ -4122,7 +4216,7 @@ class BikiniScannerApp:
         )
         add_check(
             model_tab,
-            11,
+            14,
             0,
             "Quantize CPU (int8)",
             quantize_cpu_var,
@@ -4131,7 +4225,7 @@ class BikiniScannerApp:
         )
         add_check(
             model_tab,
-            12,
+            15,
             0,
             "Load the model when the app starts",
             preload_backend_var,
@@ -4257,8 +4351,9 @@ class BikiniScannerApp:
             "Maximum images per scan",
             vlm_max_images_var,
             width=12,
-            tip="Hard cap on VLM requests per scan. Skin exposure is only used to prioritize "
-            "images inside the eligible band; it never excludes an eligible image by itself.",
+            tip="Hard cap on VLM requests per scan. When more images qualify than this, the "
+            "ones closest to your sensitivity setting are sent first — those are where the "
+            "second opinion is worth the most.",
         )
         # The server URL was configurable while the credential was not, so any endpoint
         # that needs authentication could be pointed at but never actually reached.
@@ -4623,10 +4718,13 @@ class BikiniScannerApp:
             self._trim_thumbnail_cache()
             if not self.folder_override_active:
                 self.global_config = ScannerConfig.from_mapping(self.config.to_dict())
-            self.threshold_var.set(threshold)
+            self._set_threshold(threshold)
             self.nsfw_only_var.set(self.config.nsfw_filter == "only")
             self._refresh_vlm_badge()
             self._refresh_summary()
+            # Persist immediately rather than at shutdown: a crash between the two used
+            # to lose everything that was just configured.
+            self._save_user_prefs()
 
             if backend_changed:
                 self.backend = None
@@ -4657,6 +4755,15 @@ class BikiniScannerApp:
                 if self.config.preload_backend:
                     self._maybe_preload_backend()
 
+            if self.folder_override_active:
+                # global_config was deliberately not updated above, so these values live
+                # only as long as this folder is open. Saying so beats letting them
+                # revert without explanation the next time a folder is chosen.
+                self.status_var.set(
+                    self.status_var.get()
+                    + " This folder has an override, so these apply to it only — use "
+                    "Save folder override to keep them."
+                )
             close_dialog()
 
         reset_override = ttk.Button(button_row, text="Reset folder override", command=self._reset_folder_override)
@@ -4838,8 +4945,16 @@ class BikiniScannerApp:
         if not target:
             return
         try:
-            Path(target).write_text(json.dumps(self.config.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+            # The VLM API key is left out: an exported settings file is meant to be
+            # copied to another machine or sent to someone, and a bearer token has no
+            # business travelling with it.
+            payload = without_secrets(self.config.to_dict())
+            Path(target).write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
             self.status_var.set(f"Exported settings to {target}")
+            if self.config.vlm_api_key:
+                self.status_var.set(
+                    f"Exported settings to {target} — the VLM API key was left out and must be re-entered."
+                )
         except OSError as exc:
             messagebox.showerror("Export settings failed", str(exc))
 
@@ -4858,6 +4973,11 @@ class BikiniScannerApp:
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("Import settings failed", str(exc))
             return
+        # Settings files no longer carry the API key, so an imported one always has it
+        # empty. Blanking a key the user has already entered would be a silent loss, so
+        # the session's own key is kept unless the file explicitly supplies one.
+        if not imported.vlm_api_key and self.config.vlm_api_key:
+            imported.vlm_api_key = self.config.vlm_api_key
         self.config = imported
         self.global_config = ScannerConfig.from_mapping(imported.to_dict())
         self.folder_override_active = False
@@ -4867,6 +4987,17 @@ class BikiniScannerApp:
         self._sync_config_controls()
         self.status_var.set("Settings imported. Run a scan to apply them.")
 
+    def _set_threshold(self, value: float) -> None:
+        """Move the slider and the number beside it together.
+
+        Tk only invokes a Scale's command for user interaction, so a programmatic
+        `threshold_var.set()` left the entry showing the previous value — which is what
+        happened after saving Settings, importing a file or applying a profile.
+        """
+        value = max(0.0, min(1.0, float(value)))
+        self.threshold_var.set(value)
+        self.threshold_text_var.set(f"{value:.2f}")
+
     def _sync_config_controls(self) -> None:
         """Point the on-screen controls at the config that is actually in force.
 
@@ -4874,9 +5005,11 @@ class BikiniScannerApp:
         a file or a profile has to move it — otherwise an imported threshold of 0.7 is
         quietly overridden by whatever the slider was left on.
         """
-        self.threshold_var.set(float(self.config.threshold))
+        self._set_threshold(float(self.config.threshold))
         self.nsfw_only_var.set(self.config.nsfw_filter == "only")
+        self._refresh_vlm_badge()
         self._refresh_summary()
+        self._save_user_prefs()
 
     def open_profiles_dialog(self) -> None:
         dialog, outer = self._create_modal("Settings profiles")
@@ -4921,6 +5054,10 @@ class BikiniScannerApp:
             selected = profile_config(profile_var.get())
             if selected is None:
                 return
+            # Profiles do not store the API key, so applying one must not wipe the one
+            # the user entered this session.
+            if not selected.vlm_api_key and self.config.vlm_api_key:
+                selected.vlm_api_key = self.config.vlm_api_key
             self.config = selected
             self.global_config = ScannerConfig.from_mapping(selected.to_dict())
             self.backend = None
@@ -4984,11 +5121,29 @@ class BikiniScannerApp:
         if not Path(folder).is_dir():
             messagebox.showerror("No folder", f"This folder does not exist:\n{folder}")
             return
+        # run_scan re-enters itself once for the model load and once for the image
+        # count, so the order of these three steps decides how much work is repeated.
+        #
+        # Binding the folder comes first because _set_folder clears the backend — a
+        # folder override can name a different model. Doing it after the model check
+        # meant the model was loaded, discarded and loaded again; doing it after the
+        # count meant the count was discarded on the way to the second load and the
+        # whole folder tree was walked twice.
+        #
+        # The folder box is editable and callers may set it directly, so the store can
+        # lag behind the path shown. Bind it here rather than assert later.
+        if self.store is None or str(self.store.folder) != str(Path(folder).expanduser().resolve()):
+            self._set_folder(folder)
+        # Loading the model can mean a ~600 MB download. Doing that on the main thread
+        # froze the whole window with no progress and no way out — which is exactly what
+        # a first run looked like. Hand it to a worker and come back when it lands.
+        if self.backend is None:
+            self._load_backend_then_scan(folder)
+            return
         # Pre-scan check: count supported images so we don't run a full scan on an
         # empty folder or one with only unsupported files (e.g. all .txt or .pdf).
         # Counting walks the whole tree, which on a network share or a deep folder is
-        # seconds of frozen window — and then the scan walks it a second time. The
-        # count is done once, off the main thread, and handed back here.
+        # seconds of frozen window, so it happens once, off the main thread.
         if self._pending_scan_count is None:
             self._count_images_then_scan(folder)
             return
@@ -5003,19 +5158,8 @@ class BikiniScannerApp:
             return
         if image_count >= LARGE_SCAN_WARNING and not self._confirm_large_scan(folder, image_count):
             return
-        # The folder box is editable and callers may set it directly, so the store
-        # can lag behind the path shown. Bind it here rather than assert later.
-        if self.store is None or str(self.store.folder) != str(Path(folder).expanduser().resolve()):
-            self._set_folder(folder)
         self._add_recent_folder(folder)
         LOGGER.info("Starting scan requested for %s", folder)
-        if self.backend is None:
-            # Loading the model can mean a ~600 MB download. Doing that here, on the
-            # main thread, froze the whole window with no progress and no way out —
-            # which is exactly what a first run looked like. Hand it to a worker and
-            # come back to run_scan when it lands.
-            self._load_backend_then_scan(folder)
-            return
         self._refresh_hardware_status()
         self.thumbnail_cache.clear()
         self.current_state = None
@@ -5034,14 +5178,16 @@ class BikiniScannerApp:
         """Walk the folder on a worker thread, then re-enter run_scan with the count."""
         self.run_button.configure(state="disabled")
         self.status_var.set("Looking through the folder…")
-        suffixes = {suffix.lower() for suffix in SUPPORTED_IMAGE_SUFFIXES}
         target = Path(folder)
 
         def worker() -> None:
             try:
-                count = sum(
-                    1 for entry in target.rglob("*") if entry.is_file() and entry.suffix.lower() in suffixes
-                )
+                # The same walk the scan itself does, so the two agree. A plain rglob
+                # counted the app's own output back in: after "Copy matches to
+                # subfolder", every copy under bikini_matches/ inflated the count that
+                # drives the large-folder warning and its time estimate, and a folder
+                # holding nothing but those copies looked like it had images to scan.
+                count = len(collect_image_paths(target))
             except OSError:
                 count = 0
             self._after(0, self._image_count_ready, count)
@@ -5158,7 +5304,16 @@ class BikiniScannerApp:
         Called instead of `update_algorithm` after every decision. The decision is
         already saved; this only queues the re-rank, and re-arming the timer on each
         new label means a run of twenty Accepts costs one retrain rather than twenty.
+
+        Browse mode has no model and no embeddings on purpose, so there is nothing to
+        re-rank there. Queueing one anyway loaded the model on the main thread — a
+        ~600 MB download on a cold install — and then failed on the zero-width
+        embeddings, turning the first Accept in a model-free browse into a "Scan
+        failed" dialog. The decision is still written to labels.json either way, which
+        is the whole point of browsing without scanning.
         """
+        if self.view_mode == "browse" or self.current_state is None or self.current_state.embeddings.size == 0:
+            return
         self._retrain_pending = True
         self._labels_since_retrain += max(1, int(labels_added))
         if self._labels_since_retrain >= RETRAIN_LABEL_BURST:
@@ -5192,6 +5347,21 @@ class BikiniScannerApp:
             return
         if self.current_state is None:
             messagebox.showinfo("Not ready", "Run a scan first.")
+            return
+        if self.view_mode == "browse" or self.current_state.embeddings.size == 0:
+            # Browsing without scanning produces a state with no embeddings, so there is
+            # nothing for a re-rank to work from. The decisions are already saved.
+            detail = (
+                "This folder was opened with File > Browse folder without scanning, so no "
+                "image has been scored yet."
+                if self.view_mode == "browse"
+                else "There are no scored images in this folder."
+            )
+            messagebox.showinfo(
+                "Nothing to re-rank",
+                f"{detail}\n\nYour Accept/REJECT decisions are saved and will be used the "
+                "next time you run a scan here.",
+            )
             return
         # Asked for explicitly (Tools > Update rankings) or by the timer: either way
         # the queued labels are being folded in now, so stand the timer down.
@@ -5325,9 +5495,23 @@ class BikiniScannerApp:
         self._labels_since_retrain = 0
         self.status_var.set("Scan failed.")
         LOGGER.error("Scan failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
+        # A failed folder used to leave queue_active set with nothing left to advance it.
+        # That stalled the queue silently, blocked run_queue from restarting it, and —
+        # because _flush_retrain returns early while a queue is active — stopped every
+        # retrain for the rest of the session while labels piled up.
+        queue_note = ""
+        if self.queue_active:
+            self.queue_index += 1
+            if self.queue_index < len(self.scan_queue):
+                remaining = len(self.scan_queue) - self.queue_index
+                queue_note = f"\n\nSkipping this folder; {remaining} left in the queue."
+                self._after(0, self._start_next_queue_item)
+            else:
+                self.queue_active = False
+                queue_note = "\n\nThat was the last folder in the queue."
         # Map common failures to user-friendly text with a suggested action.
         friendly = self._friendly_error(exc)
-        messagebox.showerror("Scan failed", friendly)
+        messagebox.showerror("Scan failed", f"{friendly}{queue_note}")
 
     @staticmethod
     def _friendly_error(exc: Exception) -> str:
@@ -5389,7 +5573,11 @@ class BikiniScannerApp:
         self.current_samples = list(processed_samples)
         self.view_mode = "review"
         self.similar_anchor_path = None
-        self._restore_review_session()
+        if self._resuming_review:
+            # Only Resume last scan wants the recorded view, page and active photo back.
+            # Reading the snapshot on every completion also restored focused_path, so an
+            # ordinary scan landed on whatever photo a previous session had left active.
+            self._restore_review_session()
         threshold = float(self.threshold_var.get())
         visible_mask = self._result_visibility_mask()
         matches = sum(
@@ -5688,7 +5876,11 @@ class BikiniScannerApp:
         paths = [str(sample["path"]) for sample in self.page_samples or self.current_samples]
         if not paths:
             return
-        columns = max(1, int(self.columns_var.get()))
+        # The grid's actual column count, not the raw preference: columns_var is 0 for
+        # "fit to window", which is the default, and reading it directly made Up/Down
+        # step by one card — identical to Left/Right — for anyone who had not pinned a
+        # column count by hand.
+        columns = max(1, self._grid_columns())
         if self.focused_path not in paths:
             self.focused_path = paths[0]
         index = paths.index(self.focused_path)
@@ -7814,7 +8006,9 @@ def launch_gui(
     root = TkinterDnD.Tk() if TkinterDnD is not None else Tk()
     root.geometry("1100x800")
     if config is None:
-        config = ScannerConfig()
+        # Start from the settings the user last saved rather than the built-in
+        # defaults; from_mapping(None) yields the defaults when nothing is stored.
+        config = ScannerConfig.from_mapping(load_user_prefs().get("scanner_config"))
     if initial_threshold is not None:
         config.threshold = float(initial_threshold)
     # The constructor binds initial_folder itself, before the model preload starts.

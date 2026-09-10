@@ -326,25 +326,34 @@ class SQLiteCache:
                     conn,
                 )
 
+    # SQLite caps the number of bound parameters per statement (999 on older builds,
+    # 32766 on current ones). A folder large enough to exceed it — and this app warns
+    # about folders of 20 000 — used to fail the very first cache lookup with
+    # "too many SQL variables" before any work had been done, so the IN clause is
+    # issued in chunks well under the smallest of those limits.
+    _QUERY_CHUNK = 500
+
     def get_cached_image_records(
         self, paths: list[Path]
     ) -> dict[Path, dict[str, object]]:
         if not paths:
             return {}
         path_strings = [resolved_str(path) for path in paths]
-        placeholders = ",".join("?" * len(path_strings))
-        rows = self._execute(
-            f"""
-            SELECT path, content_hash, mtime_ns, size, embedding
-            FROM image_records
-            JOIN embeddings USING (content_hash)
-            WHERE path IN ({placeholders})
-            """,
-            tuple(path_strings),
-        ).fetchall()
-        by_path: dict[str, tuple[str, int, int, np.ndarray]] = {
-            row[0]: (row[1], row[2], row[3], self._blob_to_array(row[4])) for row in rows
-        }
+        by_path: dict[str, tuple[str, int, int, np.ndarray]] = {}
+        for start in range(0, len(path_strings), self._QUERY_CHUNK):
+            chunk = path_strings[start : start + self._QUERY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._execute(
+                f"""
+                SELECT path, content_hash, mtime_ns, size, embedding
+                FROM image_records
+                JOIN embeddings USING (content_hash)
+                WHERE path IN ({placeholders})
+                """,
+                tuple(chunk),
+            ).fetchall()
+            for row in rows:
+                by_path[row[0]] = (row[1], row[2], row[3], self._blob_to_array(row[4]))
         cached: dict[Path, dict[str, object]] = {}
         # Zipped against the strings computed above rather than resolving a second time.
         for path, resolved in zip(paths, path_strings, strict=False):
@@ -463,6 +472,16 @@ class SQLiteCache:
                 LOGGER.warning("Could not empty the cache DB %s: %s", self.db_path, exc)
 
     def clear(self) -> None:
+        """Empty the cache and leave a usable, empty database behind.
+
+        The caller keeps using this object — FolderStore discards derived caches from
+        `ensure_embedding_namespace` in the middle of a live scan. Without the schema
+        rebuild at the end, the next `_connect()` opened a brand-new file that
+        `_ensure_tables` had never run against, and every following query died with
+        "no such table: image_records". Switching model in Settings and rescanning the
+        same folder hit exactly that, and left the folder's cache broken for the rest
+        of the session.
+        """
         self.purge()
         with self._lock:
             try:
@@ -475,6 +494,8 @@ class SQLiteCache:
                 self.db_path.unlink(missing_ok=True)
             except OSError as exc:
                 LOGGER.warning("Could not remove cache DB %s: %s", self.db_path, exc)
+        # Outside the lock: _ensure_tables opens its own transaction, which takes it.
+        self._ensure_tables()
 
     def close(self) -> None:
         with self._lock:

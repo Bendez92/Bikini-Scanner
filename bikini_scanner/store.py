@@ -227,14 +227,25 @@ class FolderStore:
             except OSError as exc:
                 LOGGER.warning("Could not discard stale cache %s: %s", path, exc)
         if self.sqlite_cache is not None:
+            # clear() empties the tables, removes the file and rebuilds the schema, so
+            # this object stays usable — this runs mid-scan from
+            # ensure_embedding_namespace, and the very next call reads the cache again.
+            # Deleting cache.db again afterwards would undo that rebuild and leave every
+            # following query with "no such table", which is exactly what changing the
+            # model and rescanning the same folder used to do.
+            if self.cache_db_path.exists():
+                discarded.append(self.cache_db_path.name)
             self.sqlite_cache.clear()
-        for path in (self.cache_db_path, self.cache_dir / "cache.db-wal", self.cache_dir / "cache.db-shm"):
-            try:
-                if path.exists():
-                    path.unlink(missing_ok=True)
-                    discarded.append(path.name)
-            except OSError as exc:
-                LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
+        else:
+            # Called from __post_init__, before the cache object exists: nothing holds
+            # the file open, so it and its WAL sidecars can simply go.
+            for path in (self.cache_db_path, self.cache_dir / "cache.db-wal", self.cache_dir / "cache.db-shm"):
+                try:
+                    if path.exists():
+                        path.unlink(missing_ok=True)
+                        discarded.append(path.name)
+                except OSError as exc:
+                    LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
         self._embedding_cache = None
         self._path_index_cache = None
         self._face_count_cache = None
@@ -682,17 +693,28 @@ class FolderStore:
     def clear_cache(self, keep_decisions: bool = True) -> None:
         """Delete this folder's derived data.
 
-        `keep_decisions` preserves the three files in here that no amount of rescanning
-        can rebuild: the labels, the notes, and the folder's pinned settings override.
+        `keep_decisions` preserves the files in here that no amount of rescanning can
+        rebuild: the labels, the notes, and the folder's pinned settings override.
         Everything else — embeddings, region scores, face counts, the trained
         classifier, scan metadata — is recomputed from the images themselves.
+
+        The review session is kept too. It only records where the reviewer had got to,
+        so it is not in the same class as a label, but `_discard_derived_caches` already
+        preserves it and there is no reason for the two paths to disagree — clearing a
+        cache should not also lose your place and the quality history behind the
+        plateau notice.
 
         It defaults to True because this used to rmtree the lot, and an action named
         for the recomputable half was quietly taking hours of human decisions with it.
         """
         preserved: dict[str, bytes] = {}
         if keep_decisions:
-            for path in (self.labels_path, self.notes_path, self.config_override_path):
+            for path in (
+                self.labels_path,
+                self.notes_path,
+                self.config_override_path,
+                self.review_session_path,
+            ):
                 try:
                     if path.exists():
                         preserved[path.name] = path.read_bytes()

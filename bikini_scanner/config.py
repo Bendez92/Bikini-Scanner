@@ -494,6 +494,11 @@ def _coerce_weights(value: Any, default: dict[str, float]) -> dict[str, float]:
     A supplied mapping replaces the defaults outright rather than merging into them:
     merging made it impossible to drop an axis from the score, because the default
     weight came straight back.
+
+    A mapping in which nothing is above zero is refused, though. It is not a way of
+    weighting the detail axes, it is a way of switching scoring off: every image comes
+    back at 0.00 and the folder simply looks empty. `detail_weights` is a key a
+    per-folder override may set, so this is also reachable from a scanned folder.
     """
     if not isinstance(value, Mapping):
         return dict(default)
@@ -503,9 +508,17 @@ def _coerce_weights(value: Any, default: dict[str, float]) -> dict[str, float]:
             parsed = float(weight)
         except (TypeError, ValueError):
             continue
-        if parsed >= 0:
+        if math.isfinite(parsed) and parsed >= 0:
             weights[str(name)] = parsed
-    return weights or dict(default)
+    if not any(weight > 0 for weight in weights.values()):
+        if weights:
+            LOGGER.warning(
+                "Ignoring detail_weights with no positive weight (%s); using the defaults, "
+                "because nothing would ever score above zero.",
+                ", ".join(sorted(weights)),
+            )
+        return dict(default)
+    return weights
 
 
 def _coerce_int(value: Any, default: int, minimum: int = 0, maximum: int | None = None) -> int:

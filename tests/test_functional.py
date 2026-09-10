@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -55,6 +56,7 @@ from bikini_scanner import (
     output_ops,
     regions,
     safe_io,
+    vision_analysis,
 )
 from bikini_scanner import run as run_module
 from bikini_scanner import scorer as scorer_module
@@ -71,7 +73,6 @@ from bikini_scanner.scorer import (
     compute_vlm_scores,
     scan_and_score_folder,
 )
-from bikini_scanner.skin import skin_fraction
 from bikini_scanner.store import FolderStore, collect_image_paths, content_hash_for_path
 from bikini_scanner.vision_analysis import FaceBox, detect_face_count
 from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, is_local_endpoint, parse_axis_json
@@ -248,12 +249,6 @@ class VLMAdjudication(unittest.TestCase):
         self.assertNotIn("adult", values)
         with self.assertRaises((ValueError, TypeError, json.JSONDecodeError)):
             parse_axis_json("not JSON")
-
-    def test_skin_fraction_is_bounded(self):
-        for color in ((0, 0, 0), (255, 255, 255), (180, 120, 90)):
-            value = skin_fraction(Image.new("RGB", (300, 200), color))
-            self.assertGreaterEqual(value, 0.0)
-            self.assertLessEqual(value, 1.0)
 
     def test_concurrency_and_cancel(self):
         client = VLMClient(self.url, "test", concurrency=2)
@@ -1775,6 +1770,61 @@ class OutputOperations(unittest.TestCase):
         self.assertGreater(working.stat().st_size, 0)
         with Image.open(working) as image:
             image.verify()
+        raw = working.read_bytes()
+        self.assertIn(b"http://ns.adobe.com/xap/1.0/", raw, "the XMP packet was not written")
+        self.assertIn("bikini".encode("utf-16le"), raw, "the EXIF keyword was not written")
+
+    def test_tagging_a_jpeg_does_not_re_encode_it(self) -> None:
+        """Writing a keyword must annotate the photo, not recompress it.
+
+        This used to decode the image, apply its EXIF orientation and save it again at
+        Pillow's default JPEG quality, so an action described as "write keyword tags"
+        permanently degraded every original it touched.
+        """
+        working = Path(tempfile.mkdtemp(prefix="bikini_meta_lossless_")) / "tagged.jpg"
+        shutil.copyfile(self.sources[0], working)
+        with Image.open(working) as before:
+            before_pixels = np.asarray(before.convert("RGB"))
+            before_size = before.size
+        self.assertTrue(output_ops.write_image_metadata(working, "bikini", 0.87))
+        with Image.open(working) as after:
+            after_pixels = np.asarray(after.convert("RGB"))
+            self.assertEqual(after.size, before_size, "the frame was rotated or resized")
+        self.assertTrue(
+            np.array_equal(before_pixels, after_pixels), "the photo was re-encoded rather than tagged"
+        )
+
+    def test_tagging_a_png_keeps_its_existing_text_chunks(self) -> None:
+        from PIL import PngImagePlugin
+
+        working = Path(tempfile.mkdtemp(prefix="bikini_meta_png_")) / "tagged.png"
+        info = PngImagePlugin.PngInfo()
+        info.add_text("Author", "someone else")
+        Image.new("RGB", (32, 24), color=(10, 200, 30)).save(working, pnginfo=info)
+        with Image.open(working) as before:
+            before_pixels = np.asarray(before.convert("RGB"))
+        self.assertTrue(output_ops.write_image_metadata(working, "bikini", 0.5))
+        with Image.open(working) as after:
+            after_pixels = np.asarray(after.convert("RGB"))
+            text = dict(after.text)
+        # PNG is lossless, so a re-save costs nothing — but it must not silently drop
+        # whatever else the file was annotated with.
+        self.assertTrue(np.array_equal(before_pixels, after_pixels))
+        self.assertEqual(text.get("Author"), "someone else")
+        self.assertEqual(text.get("Keywords"), "bikini")
+
+    def test_an_unsupported_format_is_left_alone_rather_than_recompressed(self) -> None:
+        """WebP cannot be tagged losslessly here, so it must not be tagged at all."""
+        working = Path(tempfile.mkdtemp(prefix="bikini_meta_webp_")) / "tagged.webp"
+        Image.new("RGB", (32, 24), color=(200, 40, 40)).save(working, quality=40)
+        original = working.read_bytes()
+        try:
+            import pyexiv2  # noqa: F401
+        except ImportError:
+            self.assertFalse(output_ops.write_image_metadata(working, "bikini", 0.5))
+            self.assertEqual(working.read_bytes(), original, "the file was rewritten anyway")
+        else:
+            self.skipTest("pyexiv2 is installed, so WebP is tagged in place")
 
 
 class Configuration(unittest.TestCase):
@@ -2379,6 +2429,720 @@ class EmbeddingCacheIsolation(unittest.TestCase):
         payload = json.loads(store.cache_meta_path.read_text(encoding="utf-8"))
         self.assertEqual(payload.get("embedding_namespace"), "model_a")
         self.assertIn("decode_version", payload)
+
+
+class RegionCacheAlignment(unittest.TestCase):
+    """An image the scan could not hash must not shift anyone else's cache entries."""
+
+    def setUp(self) -> None:
+        self.config = ScannerConfig(deep_scan="always", enable_face_detection=False)
+        self.backend = _build_backend(self.config)
+        self.scorer = BikiniScorer(self.backend, self.config)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_regioncache_"))
+        self.paths = [str(path) for path in _make_images(self.folder, count=3)]
+        self.hashes = [content_hash_for_path(path) for path in self.paths]
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def _cached_regions(self, content_hashes: list[str | None]) -> dict[str, dict[str, np.ndarray]]:
+        cache_dir = Path(tempfile.mkdtemp(prefix="bikini_regionstore_"))
+        store = FolderStore(cache_dir)
+        embeddings = np.vstack(
+            [self.backend.embed_pil_images([Image.open(path).convert("RGB")])[0] for path in self.paths]
+        ).astype(np.float32)
+        scorer_module.run_deep_pass(
+            self.backend,
+            self.scorer,
+            store,
+            self.paths,
+            embeddings,
+            content_hashes=content_hashes,
+        )
+        namespace = scorer_module._region_namespace(self.config)
+        saved = {
+            str(content_hash): store.lookup_region_embeddings(str(content_hash), namespace)
+            for content_hash in self.hashes
+            if content_hash
+        }
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        return saved
+
+    def test_an_unhashable_image_does_not_corrupt_the_others(self) -> None:
+        """pending_meta used to be filtered while pending_crops was not.
+
+        The two were zipped against the embedding vectors, so one image with no content
+        hash shifted the alignment and every later crop was written to the cache under
+        another image's key — persisted, and reused by every later scan.
+        """
+        everything = self._cached_regions(list(self.hashes))
+        with_a_gap = self._cached_regions([None, *self.hashes[1:]])
+        self.assertTrue(everything, "the deep pass cached nothing to compare")
+        # The first image is unhashable in the second run, so it is expected to be
+        # absent. Every other image must be cached exactly as it was before.
+        for content_hash in self.hashes[1:]:
+            assert content_hash is not None
+            expected = everything[str(content_hash)]
+            actual = with_a_gap[str(content_hash)]
+            self.assertEqual(sorted(expected), sorted(actual), f"{content_hash} lost or gained regions")
+            for key, vector in expected.items():
+                self.assertTrue(
+                    np.allclose(vector, actual[key]),
+                    f"{content_hash}/{key} was cached with another image's embedding",
+                )
+
+    def test_the_decoded_frames_are_only_retained_for_the_vlm_pass(self) -> None:
+        """They are full-resolution images; holding one per candidate is the whole scan."""
+        embeddings = np.vstack(
+            [self.backend.embed_pil_images([Image.open(path).convert("RGB")])[0] for path in self.paths]
+        ).astype(np.float32)
+
+        def deep_pass(config: ScannerConfig) -> scorer_module.DeepPassResult:
+            # A fresh store each time: a warm region cache skips the decode entirely,
+            # which is exactly the path that populates decoded_images.
+            cache_dir = Path(tempfile.mkdtemp(prefix="bikini_decoded_"))
+            try:
+                return scorer_module.run_deep_pass(
+                    self.backend,
+                    BikiniScorer(self.backend, config),
+                    FolderStore(cache_dir),
+                    self.paths,
+                    embeddings,
+                    content_hashes=list(self.hashes),
+                )
+            finally:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+
+        without_vlm = deep_pass(ScannerConfig(deep_scan="always", enable_face_detection=False))
+        self.assertEqual(without_vlm.decoded_images, {}, "frames retained with the VLM pass switched off")
+        with_vlm = deep_pass(
+            ScannerConfig(deep_scan="always", enable_face_detection=False, vlm_enabled=True)
+        )
+        self.assertTrue(with_vlm.decoded_images, "the VLM pass needs the frames it was going to judge")
+
+
+class SQLiteParameterLimits(unittest.TestCase):
+    """SQLite caps bound parameters per statement; a big folder must not trip it."""
+
+    def test_the_chunk_stays_under_the_oldest_sqlite_limit(self) -> None:
+        from bikini_scanner.sqlite_cache import SQLiteCache
+
+        # 999 is the limit on pre-3.32 builds. Anything at or above it fails there with
+        # "too many SQL variables" before a single image has been read.
+        self.assertLess(SQLiteCache._QUERY_CHUNK, 999)
+
+    def test_more_paths_than_one_chunk_are_all_returned(self) -> None:
+        from bikini_scanner.sqlite_cache import SQLiteCache
+
+        folder = Path(tempfile.mkdtemp(prefix="bikini_sqlchunk_"))
+        cache = SQLiteCache(folder / "cache.db")
+        count = SQLiteCache._QUERY_CHUNK * 2 + 7
+        paths: list[Path] = []
+        records: dict[Path, dict[str, int | str]] = {}
+        embeddings: dict[str, np.ndarray] = {}
+        for index in range(count):
+            path = folder / f"image_{index:05d}.jpg"
+            path.write_bytes(b"x" * (index % 7 + 1))
+            stat = path.stat()
+            content_hash = f"hash{index:05d}"
+            paths.append(path)
+            embeddings[content_hash] = np.full(4, index, dtype=np.float32)
+            records[path] = {"content_hash": content_hash, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size}
+        cache.save_scan_cache(embeddings, records)
+        found = cache.get_cached_image_records(paths)
+        self.assertEqual(len(found), count, "the chunked IN clause lost rows at a boundary")
+        # Spot-check that each path kept its own embedding across the chunk boundaries.
+        for index in (0, SQLiteCache._QUERY_CHUNK - 1, SQLiteCache._QUERY_CHUNK, count - 1):
+            record = found[paths[index]]
+            self.assertEqual(record["content_hash"], f"hash{index:05d}")
+            self.assertTrue(np.allclose(record["embedding"], float(index)))  # type: ignore[arg-type]
+        cache.close()
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+class SettingsPersistence(unittest.TestCase):
+    """Settings changed in the app have to still be there next time it opens."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+
+    def test_the_scanner_settings_are_written_to_the_preferences_file(self) -> None:
+        from bikini_scanner.user_prefs import load_user_prefs
+
+        self.app.global_config.model_name = "openai/clip-vit-large-patch14"
+        self.app.global_config.deep_scan = "always"
+        self.app.global_config.minor_threshold = 0.22
+        self.app._save_user_prefs()
+        stored = load_user_prefs().get("scanner_config")
+        self.assertIsInstance(stored, dict, "nothing from Tools > Settings was persisted")
+        restored = ScannerConfig.from_mapping(stored)
+        # The whole config round-trips, not just the few fields touched above.
+        self.assertEqual(restored.to_dict(), self.app.global_config.to_dict())
+
+    def test_a_folder_override_is_not_promoted_into_the_global_settings(self) -> None:
+        from bikini_scanner.user_prefs import load_user_prefs
+
+        self.app.global_config.threshold = 0.4
+        self.app.config.threshold = 0.9  # as a folder override would leave it
+        self.app.folder_override_active = True
+        self.app._save_user_prefs()
+        restored = ScannerConfig.from_mapping(load_user_prefs().get("scanner_config"))
+        self.assertAlmostEqual(restored.threshold, 0.4)
+
+    def test_the_vlm_api_key_is_not_written_to_the_preferences_file(self) -> None:
+        from bikini_scanner.user_prefs import load_user_prefs, prefs_path
+
+        self.app.global_config.vlm_api_key = "sk-SECRET-do-not-store"
+        self.app._save_user_prefs()
+        self.assertNotIn("sk-SECRET-do-not-store", prefs_path().read_text(encoding="utf-8"))
+        restored = ScannerConfig.from_mapping(load_user_prefs().get("scanner_config"))
+        self.assertEqual(restored.vlm_api_key, "")
+
+    def test_the_number_beside_the_slider_follows_the_slider(self) -> None:
+        # Tk only fires a Scale's command for user interaction, so a programmatic set
+        # used to leave the entry showing the previous value after Save, Import or a
+        # profile change.
+        self.app._set_threshold(0.72)
+        self.assertAlmostEqual(float(self.app.threshold_var.get()), 0.72)
+        self.assertEqual(self.app.threshold_text_var.get(), "0.72")
+
+
+class ScanFailureRecovery(unittest.TestCase):
+    """A folder that fails must not take the queue, or every later retrain, with it."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.gui_module = gui_module
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.errors: list[str] = []
+        gui_module.messagebox.showerror = lambda title, message, **kwargs: self.errors.append(str(message))
+        self.started: list[str] = []
+        self.app._start_next_queue_item = lambda: self.started.append("next")  # type: ignore[method-assign]
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+
+    def test_a_failed_folder_moves_the_queue_on(self) -> None:
+        self.app.scan_queue = ["/one", "/two"]
+        self.app.queue_active = True
+        self.app.queue_index = 0
+        self.app._scan_failed(RuntimeError("boom"), self.app._refresh_generation)
+        self.root.update()
+        self.assertEqual(self.app.queue_index, 1)
+        self.assertTrue(self.app.queue_active, "there was another folder to scan")
+        self.assertEqual(self.started, ["next"])
+        self.assertIn("1 left in the queue", self.errors[0])
+
+    def test_the_last_folder_failing_ends_the_queue(self) -> None:
+        self.app.scan_queue = ["/only"]
+        self.app.queue_active = True
+        self.app.queue_index = 0
+        self.app._scan_failed(RuntimeError("boom"), self.app._refresh_generation)
+        self.root.update()
+        # queue_active left set was what stalled everything: run_queue refused to start
+        # again, and _flush_retrain returns early while a queue is running, so no label
+        # was ever folded into the model for the rest of the session.
+        self.assertFalse(self.app.queue_active)
+        self.assertEqual(self.started, [])
+
+
+class BrowseModeIsModelFree(unittest.TestCase):
+    """Browsing without scanning must never pull the model in behind the user's back."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_browse_"))
+        _make_images(self.folder, count=4)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app.label_filter_var.set("all")
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_a_decision_does_not_queue_a_retrain(self) -> None:
+        """The state here has no embeddings, so a re-rank has nothing to work from.
+
+        Queueing one anyway loaded the model on the main thread — a ~600 MB download on
+        a cold install — and then failed on the zero-width embeddings, so the first
+        Accept in a model-free browse ended in a "Scan failed" dialog.
+        """
+        self.app.browse_without_scanning(str(self.folder))
+        self.root.update()
+        target = str(self.app.page_samples[0]["path"])
+        self.app.set_label(target, 1)
+        self.root.update()
+        assert self.app.store is not None
+        self.assertEqual(self.app.store.load_labels().get(target), 1, "the decision must still be saved")
+        self.assertFalse(self.app._retrain_pending)
+        self.assertIsNone(self.app._retrain_after_id)
+        self.assertIsNone(self.app.scorer, "browsing loaded a model it was supposed to avoid")
+
+
+class GridArrowNavigation(unittest.TestCase):
+    """Up and Down move by a row, including on the default 'fit to window' setting."""
+
+    def setUp(self) -> None:
+        tkinter = __import__("tkinter")
+        try:
+            self.root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app._apply_focus_visuals = lambda: None  # type: ignore[method-assign]
+        self.app.page_samples = [{"path": f"/photo_{index}.jpg", "score": 0.5} for index in range(9)]
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self.root.destroy()
+
+    def test_down_steps_a_whole_row_on_auto_columns(self) -> None:
+        # columns_var is 0 for "fit to window", which is the default. Reading it
+        # directly gave a column count of 1, so Down behaved exactly like Right.
+        self.app.columns_var.set(0)
+        self.app._grid_columns = lambda: 3  # type: ignore[method-assign]
+        self.app.focused_path = "/photo_0.jpg"
+        self.app.move_focus_grid(1, 0)
+        self.assertEqual(self.app.focused_path, "/photo_3.jpg")
+        self.app.move_focus_grid(-1, 0)
+        self.assertEqual(self.app.focused_path, "/photo_0.jpg")
+
+    def test_an_explicit_column_count_is_still_honoured(self) -> None:
+        self.app.columns_var.set(4)
+        self.app.focused_path = "/photo_0.jpg"
+        self.app.move_focus_grid(1, 0)
+        self.assertEqual(self.app.focused_path, "/photo_4.jpg")
+
+
+class LiveStoreModelSwitch(unittest.TestCase):
+    """Changing the model mid-session must not break the folder's cache database.
+
+    The GUI only builds a new FolderStore when the *folder* changes. Changing the model
+    in Settings clears the backend and the scorer and keeps the store, so the next scan
+    calls ensure_embedding_namespace on a store whose SQLite connection is already open.
+    """
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_liveswitch_"))
+        self.addCleanup(shutil.rmtree, self.folder, True)
+        self.image = self.folder / "one.jpg"
+        self.image.write_bytes(_make_image_bytes())
+
+    def test_the_cache_survives_a_switch_on_a_live_store(self) -> None:
+        store = FolderStore(self.folder)  # the one instance the GUI keeps for this folder
+        store.ensure_embedding_namespace("clip_torch-model_a")
+        store.save_embeddings({self.image: np.ones(512, dtype=np.float32)})
+        self.assertEqual(len(store.get_cached_image_records([self.image])), 1)
+
+        # clear() used to delete cache.db and leave the object pointing at a file that
+        # _ensure_tables had never run against, so this raised
+        # "no such table: image_records" and every later query in the session did too.
+        store.ensure_embedding_namespace("clip_torch-model_b")
+        self.assertEqual(store.get_cached_image_records([self.image]), {})
+
+        # And it must still be usable: the scan that triggered the switch carries on.
+        store.save_embeddings({self.image: np.ones(512, dtype=np.float32)})
+        self.assertEqual(len(store.get_cached_image_records([self.image])), 1)
+        self.assertEqual(len(FolderStore(self.folder).get_cached_image_records([self.image])), 1)
+
+    def test_a_full_scan_survives_a_model_switch(self) -> None:
+        shared = _shared()
+        backend = shared["backend"]
+        store = FolderStore(self.folder)
+        for model in ("model-a", "model-b", "model-a"):
+            config = ScannerConfig(model_name=model, preload_backend=False)
+            state, _ = scan_and_score_folder(backend, store, BikiniScorer(backend, config), threshold=0.35)
+            self.assertEqual(len(state.paths), 1, f"scan with {model} produced no results")
+
+
+class RegionCacheNamespace(unittest.TestCase):
+    def test_max_faces_is_part_of_the_crop_layout_identity(self) -> None:
+        """Otherwise lowering it silently reuses the extra subjects' cached crops.
+
+        max_faces is also a key a folder override may set, so a folder that had already
+        been scanned would ignore the new value entirely.
+        """
+        one = scorer_module._region_namespace(ScannerConfig(max_faces=1))
+        three = scorer_module._region_namespace(ScannerConfig(max_faces=3))
+        self.assertNotEqual(one, three)
+
+    def test_the_model_still_separates_namespaces(self) -> None:
+        a = scorer_module._region_namespace(ScannerConfig(model_name="a", max_faces=2))
+        b = scorer_module._region_namespace(ScannerConfig(model_name="b", max_faces=2))
+        self.assertNotEqual(a, b)
+
+
+class VLMUnusableVerdicts(unittest.TestCase):
+    """A reply that names none of the axes is not a judgment of zero."""
+
+    def test_a_reply_with_no_axes_is_refused_by_the_parser(self) -> None:
+        self.assertEqual(parse_axis_json('{"nudity": 0.9, "note": "high"}'), {})
+
+    def test_an_empty_verdict_is_not_scored_as_a_confident_zero(self) -> None:
+        # Every axis defaulting to 0.5 is "no evidence either way", which the cascade
+        # scores 0.0 - and that used to be blended in at vlm_weight, pushing a genuine
+        # match down on the strength of a reply the model never made.
+        from bikini_scanner.regions import KIND_FULL
+        from bikini_scanner.vlm_backend import VLM_AXES
+
+        neutral = np.asarray([[0.5] * len(VLM_AXES)], dtype=np.float32)
+        table = cascade.RegionScoreTable(
+            owner=np.array([0], dtype=np.int64),
+            kinds=np.array([KIND_FULL], dtype=object),
+            axis_scores={axis: neutral[:, i] for i, axis in enumerate(VLM_AXES)},
+            image_count=1,
+            full_row=np.array([0], dtype=np.int64),
+        )
+        self.assertAlmostEqual(float(cascade.evaluate(table, ScannerConfig(), None).score[0]), 0.0)
+
+    def test_the_client_returns_none_for_an_axis_free_reply(self) -> None:
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"data": []}')
+
+            def do_POST(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"choices":[{"message":{"content":"{\\"unrelated\\": 1}"}}]}')
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        client = VLMClient(f"http://127.0.0.1:{server.server_address[1]}/v1", "m", timeout=5.0, concurrency=1)
+        results = client.score_images([[Image.new("RGB", (32, 32))]])
+        # None, not {}: the caller skips None and would have cached and scored {}.
+        self.assertEqual(results, [None])
+
+
+class VLMCancellationIsPrompt(unittest.TestCase):
+    def test_stop_does_not_wait_out_the_request_timeout(self) -> None:
+        """Every worker sitting in a slow request must not hide the cancel flag.
+
+        as_completed only comes back when a request finishes, so Stop used to do nothing
+        for a full timeout period - a minute on the default setting - with the button
+        already greyed out.
+        """
+
+        class SlowHandler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"data": []}')
+
+            def do_POST(self) -> None:
+                time.sleep(20)
+
+            def log_message(self, *args: object) -> None:
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        client = VLMClient(f"http://127.0.0.1:{server.server_address[1]}/v1", "m", timeout=20.0, concurrency=2)
+        cancel = threading.Event()
+        threading.Timer(0.5, cancel.set).start()
+        started = time.monotonic()
+        with self.assertRaises(VLMCancelled):
+            client.score_images([[Image.new("RGB", (32, 32))] for _ in range(4)], cancel_event=cancel)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 8.0, f"cancelling took {elapsed:.1f}s")
+
+
+class BoundedBackendCache(unittest.TestCase):
+    """A CLIP model is 600 MB and the large one 1.7 GB; the cache has to have a lid."""
+
+    def test_the_least_recently_used_backend_is_evicted(self) -> None:
+        from collections import OrderedDict
+
+        from bikini_scanner.backend_utils import remember_bounded
+
+        cache: OrderedDict[str, str] = OrderedDict()
+        for name in ("a", "b", "c"):
+            remember_bounded(cache, name, f"model-{name}", limit=2)
+        self.assertEqual(list(cache), ["b", "c"], "the cache grew past its limit")
+
+    def test_a_hit_keeps_a_backend_alive(self) -> None:
+        from collections import OrderedDict
+
+        from bikini_scanner.backend_utils import remember_bounded
+
+        cache: OrderedDict[str, str] = OrderedDict()
+        remember_bounded(cache, "scan", "m1", limit=2)
+        remember_bounded(cache, "refine", "m2", limit=2)
+        cache.move_to_end("scan")  # what a cache hit does
+        remember_bounded(cache, "third", "m3", limit=2)
+        self.assertEqual(list(cache), ["scan", "third"], "the recently used backend was evicted")
+
+    def test_the_limit_is_never_zero(self) -> None:
+        from collections import OrderedDict
+
+        from bikini_scanner.backend_utils import remember_bounded
+
+        cache: OrderedDict[str, str] = OrderedDict()
+        remember_bounded(cache, "only", "m", limit=0)
+        self.assertEqual(list(cache), ["only"], "a zero limit would evict the model being loaded")
+
+
+class CredentialsStayOutOfSharedFiles(unittest.TestCase):
+    """A settings file or a profile is meant to be copied around; a bearer token is not."""
+
+    def setUp(self) -> None:
+        self.config = ScannerConfig()
+        self.config.vlm_api_key = "sk-SECRET-do-not-store"
+        self.config.vlm_base_url = "https://vision.example.com/v1"
+
+    def test_a_saved_profile_omits_the_api_key(self) -> None:
+        config_profiles.save_profile("secret carrier", self.config)
+        self.addCleanup(config_profiles.delete_profile, "secret carrier")
+        raw = config_profiles.profiles_path().read_text(encoding="utf-8")
+        self.assertNotIn("sk-SECRET-do-not-store", raw)
+        restored = config_profiles.profile_config("secret carrier")
+        assert restored is not None
+        self.assertEqual(restored.vlm_api_key, "")
+        # Everything that is not a credential still round-trips.
+        self.assertEqual(restored.vlm_base_url, "https://vision.example.com/v1")
+
+    def test_without_secrets_leaves_the_rest_alone(self) -> None:
+        stripped = config_profiles.without_secrets(self.config.to_dict())
+        self.assertEqual(stripped["vlm_api_key"], "")
+        self.assertEqual(stripped["vlm_base_url"], "https://vision.example.com/v1")
+        self.assertEqual(stripped["threshold"], self.config.threshold)
+
+
+class DetailWeightsMustScoreSomething(unittest.TestCase):
+    def test_an_all_zero_mapping_is_refused(self) -> None:
+        """It is not a weighting, it is an off switch, and a folder override may set it."""
+        defaults = ScannerConfig().detail_weights
+        config = ScannerConfig.from_mapping(
+            {"detail_weights": dict.fromkeys(defaults, 0.0)}
+        )
+        self.assertEqual(config.detail_weights, defaults)
+
+    def test_a_hostile_folder_override_cannot_switch_scoring_off(self) -> None:
+        accepted, _refused = filter_folder_override({"detail_weights": {"bikini": 0, "cleavage": 0}})
+        merged = ScannerConfig.from_mapping({**ScannerConfig().to_dict(), **accepted})
+        self.assertTrue(any(weight > 0 for weight in merged.detail_weights.values()))
+
+    def test_dropping_one_axis_is_still_allowed(self) -> None:
+        config = ScannerConfig.from_mapping({"detail_weights": {"bikini": 1.0, "cleavage": 0.0}})
+        self.assertEqual(config.detail_weights, {"bikini": 1.0, "cleavage": 0.0})
+
+    def test_a_non_finite_weight_is_dropped(self) -> None:
+        config = ScannerConfig.from_mapping({"detail_weights": {"bikini": float("nan"), "midriff": 0.5}})
+        self.assertEqual(config.detail_weights, {"midriff": 0.5})
+
+
+class PluginReturnValues(unittest.TestCase):
+    """Everything downstream indexes sample["path"]; a plugin must not break that."""
+
+    def setUp(self) -> None:
+        from bikini_scanner import plugins
+
+        self.plugins = plugins
+        self.good = [{"path": "/a.jpg", "score": 0.5}, {"path": "/b.jpg", "score": 0.4}]
+
+    def test_a_list_of_strings_is_rejected(self) -> None:
+        self.assertIsNone(self.plugins._usable_samples(["/a.jpg", "/b.jpg"], "bad.py"))
+
+    def test_dicts_without_a_path_are_rejected(self) -> None:
+        self.assertIsNone(self.plugins._usable_samples([{"score": 0.5}], "bad.py"))
+
+    def test_a_non_iterable_return_is_rejected(self) -> None:
+        self.assertIsNone(self.plugins._usable_samples(42, "bad.py"))
+
+    def test_none_means_leave_the_list_alone(self) -> None:
+        self.assertIsNone(self.plugins._usable_samples(None, "quiet.py"))
+
+    def test_a_well_formed_return_is_accepted(self) -> None:
+        self.assertEqual(self.plugins._usable_samples(self.good, "good.py"), self.good)
+
+    def test_a_bad_plugin_does_not_replace_the_samples(self) -> None:
+        directory = self.plugins.plugins_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        script = directory / "breaks_the_grid.py"
+        script.write_text("def process_results(state, samples):\n    return ['not a dict']\n", encoding="utf-8")
+        self.addCleanup(script.unlink, True)
+        result = self.plugins.apply_plugins(None, list(self.good), enabled=True)
+        self.assertEqual(result, self.good, "the malformed return reached the grid")
+
+
+class FaceModelLocationIsMemoised(unittest.TestCase):
+    def setUp(self) -> None:
+        vision_analysis.forget_model_location()
+        self.addCleanup(vision_analysis.forget_model_location)
+
+    def test_the_answer_is_reused_rather_than_re_stated(self) -> None:
+        calls: list[int] = []
+        original = vision_analysis._locate_model
+
+        def counting() -> object:
+            calls.append(1)
+            return original()
+
+        vision_analysis._locate_model = counting  # type: ignore[assignment]
+        self.addCleanup(setattr, vision_analysis, "_locate_model", original)
+        for _ in range(20):
+            vision_analysis.resolve_model()
+            vision_analysis.face_detection_available()
+        self.assertEqual(len(calls), 1, f"the model path was looked up {len(calls)} times")
+
+    def test_forgetting_re_checks(self) -> None:
+        vision_analysis.resolve_model()
+        vision_analysis.forget_model_location()
+        original = vision_analysis._locate_model
+        calls: list[int] = []
+
+        def counting() -> object:
+            calls.append(1)
+            return original()
+
+        vision_analysis._locate_model = counting  # type: ignore[assignment]
+        self.addCleanup(setattr, vision_analysis, "_locate_model", original)
+        vision_analysis.resolve_model()
+        self.assertEqual(len(calls), 1)
+
+
+class ClearCacheKeepsYourPlace(unittest.TestCase):
+    def test_the_review_session_survives_clearing_the_cache(self) -> None:
+        """_discard_derived_caches already keeps it; the two paths must not disagree."""
+        folder = Path(tempfile.mkdtemp(prefix="bikini_place_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        (folder / "one.jpg").write_bytes(_make_image_bytes())
+        store = FolderStore(folder)
+        store.save_labels({str(folder / "one.jpg"): 1})
+        store.save_review_session({"page_index": 7, "view_mode": "detected"})
+        store.clear_cache(keep_decisions=True)
+        restored = store.load_review_session()
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertEqual(restored.get("page_index"), 7)
+        self.assertEqual(store.load_labels().get(str(folder / "one.jpg")), 1)
+
+
+class ReportNamesWhatItLeftOut(unittest.TestCase):
+    def test_missing_images_are_counted_in_the_report(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_report_missing_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        present = folder / "here.jpg"
+        present.write_bytes(_make_image_bytes())
+        gone = folder / "moved_after_the_scan.jpg"
+        destination = folder / "report.html"
+        output_ops.build_html_report(
+            destination,
+            [
+                {"path": str(present), "score": 0.9, "bucket": "Bikini"},
+                {"path": str(gone), "score": 0.8, "bucket": "Bikini"},
+            ],
+            {},
+            {},
+        )
+        text = destination.read_text(encoding="utf-8")
+        self.assertIn("no longer exist", text)
+        self.assertIn("1 image(s)", text)
+
+    def test_a_complete_report_says_nothing_about_missing_files(self) -> None:
+        folder = Path(tempfile.mkdtemp(prefix="bikini_report_ok_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        present = folder / "here.jpg"
+        present.write_bytes(_make_image_bytes())
+        destination = folder / "report.html"
+        output_ops.build_html_report(
+            destination, [{"path": str(present), "score": 0.9, "bucket": "Bikini"}], {}, {}
+        )
+        self.assertNotIn("no longer exist", destination.read_text(encoding="utf-8"))
+
+
+class LogFileStaysReadable(unittest.TestCase):
+    """The log viewer is offered to the user, so it must not be third-party INFO noise."""
+
+    def setUp(self) -> None:
+        from bikini_scanner import logging_setup
+
+        self.filter = logging_setup._OwnInfoOthersWarnings()
+
+    def _record(self, name: str, level: int) -> logging.LogRecord:
+        return logging.LogRecord(name, level, __file__, 1, "msg", None, None)
+
+    def test_our_own_info_is_kept(self) -> None:
+        self.assertTrue(self.filter.filter(self._record("bikini_scanner.scorer", logging.INFO)))
+        self.assertTrue(self.filter.filter(self._record("bikini_scanner", logging.INFO)))
+
+    def test_third_party_info_is_dropped(self) -> None:
+        for name in ("transformers.modeling_utils", "urllib3.connectionpool", "PIL.Image"):
+            self.assertFalse(self.filter.filter(self._record(name, logging.INFO)))
+
+    def test_third_party_warnings_and_errors_are_kept(self) -> None:
+        self.assertTrue(self.filter.filter(self._record("torch", logging.WARNING)))
+        self.assertTrue(self.filter.filter(self._record("torch", logging.ERROR)))
+
+    def test_a_lookalike_package_is_not_treated_as_ours(self) -> None:
+        self.assertFalse(self.filter.filter(self._record("bikini_scanner_plugin_x", logging.INFO)))
+
+
+class VanishedFilesReadAsVanished(unittest.TestCase):
+    def test_a_file_removed_mid_scan_is_not_listed_as_unreadable(self) -> None:
+        """"[Errno 2] No such file" next to genuinely corrupt photos misleads about both."""
+        shared = _shared()
+        backend = shared["backend"]
+        folder = Path(tempfile.mkdtemp(prefix="bikini_vanish_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        _make_images(folder, count=3)
+        doomed = sorted(folder.glob("*.jpg"))[0]
+        original = scorer_module.collect_image_paths
+
+        def collect_then_delete(target: Path) -> list[Path]:
+            paths = original(target)
+            doomed.unlink()
+            return paths
+
+        scorer_module.collect_image_paths = collect_then_delete
+        self.addCleanup(setattr, scorer_module, "collect_image_paths", original)
+        store = FolderStore(folder)
+        scan_and_score_folder(backend, store, BikiniScorer(backend, ScannerConfig()), threshold=0.35)
+        metadata = json.loads(store.metadata_path.read_text(encoding="utf-8"))
+        skipped = metadata["skipped"]
+        self.assertEqual(len(skipped), 1)
+        self.assertEqual(skipped[0]["error"], "file disappeared during the scan")
 
 
 def _cleanup() -> None:

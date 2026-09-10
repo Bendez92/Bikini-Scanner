@@ -73,7 +73,10 @@ ignore = [
 # The suite must redirect user-state environment variables before importing anything
 # that reads them, so its imports cannot come first.
 "tests/*" = ["E402"]
+# Both scripts are run directly from a checkout, so they put the repo root on
+# sys.path before they can import the package they are testing.
 "scripts/score_baseline.py" = ["E402"]
+"scripts/explain_image.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

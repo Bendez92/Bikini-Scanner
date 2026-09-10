@@ -24,6 +24,7 @@ from .plugins import apply_plugins
 from .safe_io import atomic_write_json
 from .scorer import BikiniScorer, ScanCancelled, scan_and_score_folder
 from .store import FolderStore, collect_image_paths
+from .user_prefs import load_user_prefs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -96,9 +97,18 @@ def main(
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = profile_config(args.profile) if args.profile else (config_override or ScannerConfig())
-    if config is None:
-        parser.error(f"Unknown profile: {args.profile}")
+    if args.profile:
+        config = profile_config(args.profile)
+        if config is None:
+            parser.error(f"Unknown profile: {args.profile}")
+    elif config_override is not None:
+        config = config_override
+    else:
+        # Settings changed in the GUI are stored in the preferences file. Reading them
+        # back here is what makes them stick: without it every launch — GUI or headless
+        # — started from the built-in defaults, so a changed model, age gate or set of
+        # prompts silently reverted. from_mapping(None) gives the defaults.
+        config = ScannerConfig.from_mapping(load_user_prefs().get("scanner_config"))
     if args.threshold is not None:
         config.threshold = float(args.threshold)
     if enforced_backend is not None:
