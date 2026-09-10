@@ -1696,6 +1696,89 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(self.app.selected_paths, set(), "a one-card selection survived its decision")
         self.assertEqual(self.app.cards[order[2]].style, "DimCard.TFrame")
 
+    def test_deciding_a_selected_card_keeps_the_progress_count_on_screen(self) -> None:
+        """The counts are the per-click feedback; "Selection cleared." replaced them."""
+        self._spread_scores()
+        self.app.show_all_results()
+        order = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.click_card(order[2], toggle=True)
+        self.app.label_selection(0)
+        status = self.app.status_var.get()
+        self.assertIn("left in folder", status, f"the decision's own status was overwritten: {status!r}")
+        self.assertNotEqual(status, "Selection cleared.")
+        # And a later Escape must not announce a selection nobody still had.
+        self.app.clear_selection()
+        self.assertEqual(self.app.status_var.get(), status, "Escape announced a stale selection")
+
+    def test_a_bulk_decision_also_leaves_its_own_status_standing(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        order = [str(sample["path"]) for sample in self.app.page_samples]
+        self.app.click_card(order[0])
+        self.app.click_card(order[2], extend=True)
+        self.app.label_selection(1)
+        self.assertIn("3 photos", self.app.status_var.get())
+        self.app.clear_selection()
+        self.assertIn("3 photos", self.app.status_var.get(), "Escape overwrote the batch status")
+
+    def test_a_measurement_overtaken_by_a_retrain_measures_the_new_scan(self) -> None:
+        """Handing back a stale answer told a well-labelled folder to go and label.
+
+        The dialog would recompute, find no measurement and nothing in flight, and
+        fall through to the "judge about forty photos first" message.
+        """
+        self._spread_scores()
+        self.app.show_all_results()
+        seen: list[object] = []
+        self.app._measure_out_of_fold = lambda state: seen.append(state) or None  # type: ignore[method-assign]
+        landed: list[int] = []
+        self.app._oof_busy = True
+        self.app.ensure_out_of_fold(lambda: landed.append(1))
+        stale = self.app.current_state
+        assert stale is not None
+        # The retrain lands first and swaps the state under the worker.
+        self.app.current_state = scorer_module.ScoreState(
+            paths=list(stale.paths),
+            embeddings=stale.embeddings,
+            zero_shot_scores=stale.zero_shot_scores,
+            scores=stale.scores,
+            axis_scores=stale.axis_scores,
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=stale.excluded,
+        )
+        self.app._out_of_fold_ready(stale, None)
+        self.assertEqual(landed, [], "a stale answer was handed back as if it were current")
+        self.assertEqual(seen[-1], self.app.current_state, "the replacement scan was not measured")
+
+    def test_the_retry_chase_gives_up_rather_than_spawning_forever(self) -> None:
+        self._spread_scores()
+        self.app.show_all_results()
+        self.app._measure_out_of_fold = lambda state: None  # type: ignore[method-assign]
+        landed: list[int] = []
+        self.app._oof_busy = True
+        self.app.ensure_out_of_fold(lambda: landed.append(1))
+        for _ in range(gui_module._OOF_MAX_RETRIES + 2):
+            stale = self.app.current_state
+            assert stale is not None
+            self.app.current_state = scorer_module.ScoreState(
+                paths=list(stale.paths),
+                embeddings=stale.embeddings,
+                zero_shot_scores=stale.zero_shot_scores,
+                scores=stale.scores,
+                axis_scores=stale.axis_scores,
+                face_counts=None,
+                classifier_trained=False,
+                classifier_label_count=0,
+                excluded=stale.excluded,
+            )
+            self.app._out_of_fold_ready(stale, None)
+            if landed:
+                break
+        self.assertEqual(landed, [1], "the chase never ended")
+        self.assertIn("changed", self.app.auto_decide_plan(0.95).reason)
+
     def test_clearing_the_selection_says_so(self) -> None:
         self._spread_scores()
         self.app.show_all_results()

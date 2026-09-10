@@ -200,6 +200,10 @@ SESSION_SAVE_IDLE_MS = 1200
 # between two clicks, so they are recomputed once the reviewer pauses rather than
 # on every decision. Shorter than the retrain pause: these are only numbers.
 SUMMARY_IDLE_MS = 400
+# How many times a held-out measurement will chase a moving scan before giving up.
+# Each retry is a fresh worker, so an unbounded chase would spawn one per landing
+# retrain for as long as the folder kept changing.
+_OOF_MAX_RETRIES = 2
 
 
 def triage_band(score: float, threshold: float, margin: float = TRIAGE_MARGIN) -> str:
@@ -375,6 +379,10 @@ class BikiniScannerApp:
         self._oof_measurement: tuple[ScoreState, list[float], list[int]] | None = None
         self._oof_busy = False
         self._oof_ready_callbacks: list[Callable[[], None]] = []
+        self._oof_retries = 0
+        # Why the last measurement produced nothing, when the reason is not simply
+        # that there are too few labels yet.
+        self._oof_note = ""
         # Where a Shift-click measures its range from.
         self._selection_anchor: str | None = None
         # Whether the status bar is currently showing a selection count, so clearing
@@ -6495,6 +6503,7 @@ class BikiniScannerApp:
             )
         except Exception:
             LOGGER.exception("Could not measure held-out accuracy for auto-decide")
+            self._oof_note = "The accuracy measurement failed; see Tools > Recent log."
             return None
         weight = float(outcome.weight)
         zero_shot = np.asarray(state.zero_shot_scores, dtype=np.float64)[rows]
@@ -6522,6 +6531,7 @@ class BikiniScannerApp:
             return False
 
         self._oof_busy = True
+        self._oof_note = ""
 
         def worker() -> None:
             try:
@@ -6538,8 +6548,23 @@ class BikiniScannerApp:
         self, state: ScoreState, measured: tuple[list[float], list[int]] | None
     ) -> None:
         self._oof_busy = False
-        if self.current_state is state and measured is not None:
+        if self.current_state is not state and self.current_state is not None:
+            # A retrain landed while this ran, so the answer describes a scan nobody is
+            # looking at any more. Handing it back means the dialog recomputes, finds
+            # no measurement and nothing in flight, and tells a reviewer with thousands
+            # of labels to go and judge forty photos. Measure the state that replaced
+            # it instead; the waiters stay registered for that one.
+            if self._oof_retries < _OOF_MAX_RETRIES:
+                self._oof_retries += 1
+                waiting, self._oof_ready_callbacks = self._oof_ready_callbacks, []
+                for waiter in waiting:
+                    self.ensure_out_of_fold(waiter)
+                return
+            LOGGER.warning("Gave up re-measuring held-out accuracy; the scan kept changing.")
+            self._oof_note = "The scan changed while this was measured. Reopen to try again."
+        elif measured is not None:
             self._oof_measurement = (state, measured[0], measured[1])
+        self._oof_retries = 0
         callbacks, self._oof_ready_callbacks = self._oof_ready_callbacks, []
         for callback in callbacks:
             try:
@@ -6559,7 +6584,8 @@ class BikiniScannerApp:
                 reason=(
                     "Measuring how accurate the scanner has been…"
                     if self._oof_busy
-                    else (
+                    else self._oof_note
+                    or (
                         f"Judge about {autodecide.MIN_SUPPORT} photos first, with some of each "
                         "verdict. Until then there is no measured accuracy to trust."
                     )
@@ -8585,16 +8611,23 @@ class BikiniScannerApp:
             # selection border — and so it does not silently join the next click.
             had_selection = bool(self.selected_paths)
             self.selected_paths = set()
+            # Noted, not announced. A decision writes its own status line — what it
+            # did and how much is left — and that is the line the reviewer reads on
+            # every click; replacing it with "Selection cleared." threw away the
+            # counts to report something the fading card already shows.
+            self._selection_announced = False
             self.set_label(targets[0], label)
             if had_selection:
                 self._apply_focus_visuals()
-                self._announce_selection()
             return
         verb = {1: "Accepted", 0: "REJECTED", 2: "Skipped"}.get(int(label), "Labelled")
         picked = len(self.selected_paths) or 1
         extra = len(targets) - picked
         note = f" (+{extra} near-identical)" if extra > 0 else ""
         self.selected_paths = set()
+        # Same here: the batch's own status line is the useful one, and leaving this
+        # set would make the next Escape announce a selection nobody still had.
+        self._selection_announced = False
         self._apply_label_batch(
             dict.fromkeys(targets, int(label)),
             status=f"{verb} {len(targets)} photos{note}.",

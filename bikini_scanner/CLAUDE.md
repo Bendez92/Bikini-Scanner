@@ -142,6 +142,11 @@ Three things make this safe, and all three are load-bearing:
   claimed 0 mistakes and made 356. The bound also makes `expected_mistakes` pessimistic,
   which is the right direction for a number someone is deciding on.
 
+A measurement overtaken by a retrain is re-run against the state that replaced it
+(`_out_of_fold_ready`, bounded by `_OOF_MAX_RETRIES`). Handing the stale answer back
+instead made the dialog recompute, find no measurement and nothing in flight, and
+tell a reviewer with thousands of labels to go and judge forty photos.
+
 `MIN_SUPPORT` is the floor under any cut, and refusing is a normal outcome — at 400
 labels a 99.9% target is simply not supportable and the dialog says so rather than
 approximating it. The dialog previews counts and expected mistakes before anything is
