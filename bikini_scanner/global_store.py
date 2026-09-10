@@ -97,6 +97,44 @@ class GlobalLearningStore:
     def classifier_path(self) -> Path:
         return self.root / "classifier.pkl"
 
+    @property
+    def retained_path(self) -> Path:
+        return self.root / "retained.json"
+
+    # --- deliberately removed examples --------------------------------------
+    def _load_retained(self) -> set[str]:
+        try:
+            payload = json.loads(self.retained_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Ignoring unreadable retained-label list %s: %s", self.retained_path, exc)
+            return set()
+        return {str(key) for key in payload} if isinstance(payload, list) else set()
+
+    def retain(self, paths: Iterable[str]) -> None:
+        """Keep teaching from these examples after their files are gone.
+
+        `training_set` drops a label whose file has vanished, so that scanning a
+        temporary folder does not train this model forever. Deleting a photo *because*
+        you rejected it is the opposite case: the whole point of "reject and delete"
+        is that the scanner learns what you did not want, and dropping the label on the
+        next pass would quietly undo the training the action was named for.
+
+        Keys are derived from the path, so this can be called before the retrain that
+        records the features — which is what the delete flow does, since the files are
+        gone by the time that retrain runs.
+        """
+        keys = {_key_for(str(path)) for path in paths}
+        if not keys:
+            return
+        with _LOCK:
+            merged = self._load_retained() | keys
+            try:
+                atomic_write_json(self.retained_path, sorted(merged))
+            except Exception:
+                LOGGER.exception("Could not persist the retained-label list")
+
     # --- persistence --------------------------------------------------------
     @staticmethod
     def _stamp(path: Path) -> tuple:
@@ -205,6 +243,14 @@ class GlobalLearningStore:
         if not keys:
             return
         with _LOCK:
+            # Clearing a label retires it completely, retained or not; otherwise the
+            # list would keep growing with keys nothing refers to any more.
+            retained = self._load_retained()
+            if retained & keys:
+                try:
+                    atomic_write_json(self.retained_path, sorted(retained - keys))
+                except Exception:
+                    LOGGER.exception("Could not persist the retained-label list")
             index = self._load_index()
             if not any(key in index for key in keys):
                 return
@@ -244,10 +290,14 @@ class GlobalLearningStore:
         # Building this walks every labelled row and stats every labelled path to drop
         # ones whose file is gone. That answer only changes when the store changes, so
         # it is derived once per (index, features, dim) rather than once per retrain.
-        cache_key = (self._index_stamp, self._features_stamp, expected_dim)
+        # The retained list is part of the answer, so it has to be part of the key:
+        # without it, retaining an example returned the cached set that had just
+        # dropped it.
+        cache_key = (self._index_stamp, self._features_stamp, self._stamp(self.retained_path), expected_dim)
         cached = self._training_cache.get(cache_key)
         if cached is not None:
             return cached
+        retained = self._load_retained()
         rows: list[np.ndarray] = []
         labels: list[int] = []
         paths: list[str] = []
@@ -258,14 +308,16 @@ class GlobalLearningStore:
                 continue
             path = str(entry.get("path", key))
             # A label on a file that no longer exists should stop teaching: otherwise a
-            # scan of a temporary folder trains this model forever.
-            try:
-                if not Path(path).exists():
+            # scan of a temporary folder trains this model forever. A file the reviewer
+            # deleted *because* they rejected it is the exception — see `retain`.
+            if key not in retained:
+                try:
+                    if not Path(path).exists():
+                        vanished.append(path)
+                        continue
+                except OSError:
                     vanished.append(path)
                     continue
-            except OSError:
-                vanished.append(path)
-                continue
             if expected_dim is not None and int(feature.shape[-1]) != int(expected_dim):
                 continue
             rows.append(np.asarray(feature, dtype=np.float32).ravel())

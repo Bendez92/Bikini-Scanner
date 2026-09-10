@@ -115,6 +115,20 @@ Two rules keep that view usable and are easy to undo:
   is the single rule for the frame itself, shared with `_apply_focus_visuals`; when those
   two disagreed, moving the focus repainted a faded card as an undecided one.
 
+Each band carries the one bulk action that belongs to it (`_band_actions`), because
+doing any of them a card at a time is the work the bands exist to avoid: **Detected**
+exports, **Probable reject** rejects the lot and bins the files, and **Possible** gets
+no bulk action at all — it is the band meant to be judged by hand, and a stray click
+there would decide photos the reviewer had not looked at. Band actions operate on
+`_band_paths`, i.e. the whole band across every page, not the page on screen.
+
+"Reject all & delete" writes the labels first, marks them in the global store via
+`retain`, and only then bins the files. That order is load-bearing twice over: the
+retrain that folds the labels in runs off cached embeddings a moment later, when the
+photos are already gone, and `training_set` would otherwise drop those labels for having
+no file — quietly undoing the training the action is named for. Deletion is
+`trash_files`, i.e. the recycle bin, never an unlink.
+
 The `decided` view does **not** fade: every photo in it is decided by definition, so
 dimming them all would grey out the whole screen.
 

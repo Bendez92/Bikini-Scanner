@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -335,7 +336,10 @@ class BikiniScannerApp:
         self.cards: dict[str, ResultCard] = {}
         # Bucket headings are reused across renders alongside the cards; the layout
         # signature says when card geometry changed and a real rebuild is unavoidable.
-        self._bucket_headings: dict[str, ttk.Label] = {}
+        self._bucket_headings: dict[str, ttk.Frame] = {}
+        # The text label inside each heading frame, which also carries the band's
+        # own bulk action; the frame is what gets gridded, the label what gets set.
+        self._bucket_heading_labels: dict[str, ttk.Label] = {}
         # Card context menus are kept alive here; a Menu that only the card references
         # is garbage-collected out from under Tk and posts an empty popup.
         self._card_menus: list[Menu] = []
@@ -6969,6 +6973,7 @@ class BikiniScannerApp:
         self.photo_refs.clear()
         self._card_menus.clear()
         self._bucket_headings.clear()
+        self._bucket_heading_labels.clear()
         self._grid_layout = None
 
     def _grid_columns(self) -> int:
@@ -7081,6 +7086,7 @@ class BikiniScannerApp:
             departing.frame.destroy()
         for name in [name for name in self._bucket_headings if name not in grouped]:
             self._bucket_headings.pop(name).destroy()
+            self._bucket_heading_labels.pop(name, None)
 
         threshold = float(self.threshold_var.get())
         # One copy of the label map for the whole page. Reading it per card meant
@@ -7091,14 +7097,12 @@ class BikiniScannerApp:
             items = grouped[bucket]
             total = totals.get(bucket, len(items))
             heading = f"{bucket} ({len(items)})" if total == len(items) else f"{bucket} ({len(items)} of {total})"
-            label = self._bucket_headings.get(bucket)
-            if label is None:
-                # Bucket headings were the same weight as the card text below them, so
-                # the boundaries between groups vanished while scrolling.
-                label = ttk.Label(self.grid_inner, style="BucketHeading.TLabel")
-                self._bucket_headings[bucket] = label
-            label.configure(text=heading.upper())
-            label.grid(row=row, column=0, columnspan=columns, sticky="w", padx=10, pady=(10, 4))
+            header = self._bucket_headings.get(bucket)
+            if header is None:
+                header = self._build_bucket_heading(bucket)
+                self._bucket_headings[bucket] = header
+            self._bucket_heading_labels[bucket].configure(text=heading.upper())
+            header.grid(row=row, column=0, columnspan=columns, sticky="ew", padx=10, pady=(10, 4))
             row += 1
             for index, sample in enumerate(items):
                 path = str(sample["path"])
@@ -7127,6 +7131,164 @@ class BikiniScannerApp:
                 )
             row += (len(items) + columns - 1) // columns
         self._session_focus()
+
+    def _build_bucket_heading(self, bucket: str) -> ttk.Frame:
+        """The band's title, and the one bulk action that belongs to that band.
+
+        The three all-results bands each want a different thing done to them, and
+        doing any of them a card at a time is the work the reviewer was trying to
+        avoid: the detected band gets exported, the probable rejects get rejected in
+        bulk and deleted, and only the possible band is meant to be judged by hand.
+        Putting each action in its own band header is what stops the other two bands
+        being a scrolling chore.
+        """
+        header = ttk.Frame(self.grid_inner)
+        header.columnconfigure(0, weight=1)
+        # Bucket headings were the same weight as the card text below them, so the
+        # boundaries between groups vanished while scrolling.
+        label = ttk.Label(header, style="BucketHeading.TLabel")
+        label.grid(row=0, column=0, sticky="w")
+        self._bucket_heading_labels[bucket] = label
+        actions = self._band_actions(bucket)
+        for position, (text, command, tooltip) in enumerate(actions, start=1):
+            button = ttk.Button(header, text=text, command=command)
+            button.grid(row=0, column=position, sticky="e", padx=(6, 0))
+            self._tooltip(button, tooltip)
+        return header
+
+    def _band_actions(self, bucket: str) -> list[tuple[str, Callable[[], None], str]]:
+        """Bulk actions offered in one band's header, if any."""
+        if self.view_mode != "triage":
+            return []
+        if bucket == TRIAGE_BANDS[0]:
+            return [
+                (
+                    "Export these…",
+                    lambda: self.export_band(TRIAGE_BANDS[0]),
+                    "Copy every detected photo, across all pages, to a folder you choose",
+                )
+            ]
+        if bucket == TRIAGE_BANDS[2]:
+            return [
+                (
+                    "Reject all & delete…",
+                    lambda: self.reject_and_delete_band(TRIAGE_BANDS[2]),
+                    "REJECT every photo in this band so the scanner learns from them, "
+                    "then move the files to the recycle bin",
+                )
+            ]
+        return []
+
+    def _band_paths(self, band: str) -> list[str]:
+        """Every path in one band, across all pages rather than the page on screen."""
+        return [
+            str(sample["path"])
+            for sample in self.displayed_samples
+            if str(sample.get("bucket", "")) == band
+        ]
+
+    def export_band(self, band: str) -> None:
+        """Export one band's photos, the same way Export matches exports its own set."""
+        if self.current_state is None:
+            messagebox.showinfo("No results", "Run a scan first.")
+            return
+        paths = self._band_paths(band)
+        if not paths:
+            messagebox.showinfo("Nothing to export", f"There are no photos in “{band}”.")
+            return
+        out_dir = self._ask_output_destination("Choose export folder", "export")
+        if not out_dir:
+            return
+        out_path = Path(out_dir)
+        csv_path = out_path / "bikini_matches.csv"
+        transfer_root = out_path / "matches"
+        plan = self._build_transfer_plan(paths, transfer_root)
+        self._preview_transfer_dialog(
+            title=f"Export {band.lower()}",
+            plan=plan,
+            confirm_text="Export",
+            on_confirm=lambda: self._execute_export(plan, csv_path, transfer_root),
+            summary=f"{len(paths)} photos from “{band}”\nCSV: {csv_path}",
+        )
+
+    def reject_and_delete_band(self, band: str) -> None:
+        """REJECT a whole band, teach the scanner from it, then bin the files.
+
+        The two halves are deliberately one action: rejecting without deleting leaves
+        the folder full of photos already dealt with, and deleting without rejecting
+        throws away the clearest negative examples the scanner will ever get.
+        """
+        if self.current_state is None:
+            messagebox.showinfo("No results", "Run a scan first.")
+            return
+        paths = self._band_paths(band)
+        if not paths:
+            messagebox.showinfo("Nothing to delete", f"There are no photos in “{band}”.")
+            return
+        count = len(paths)
+        if not messagebox.askyesno(
+            "Reject and delete",
+            f"REJECT all {count} photo{'s' if count != 1 else ''} in “{band}”, then move "
+            f"{'them' if count != 1 else 'it'} to the recycle bin?\n\n"
+            "The scanner learns from the rejections, and keeps learning from them after "
+            "the files are gone.\n\n"
+            "The files go to the recycle bin, so you can restore them from there. "
+            "Anything you have already decided is not included.",
+            default="no",
+            icon="warning",
+        ):
+            return
+        # Order matters. The labels are written first because they are the training,
+        # and they are marked to survive the files: the retrain that folds them in
+        # runs off cached embeddings a moment later, by which time the photos are gone.
+        self._apply_label_batch(
+            dict.fromkeys(paths, 0),
+            status=f"REJECTED {count} photos in {band.lower()}.",
+            retrain=True,
+        )
+        self._retain_global_labels(paths)
+        self._trash_and_report(paths)
+
+    def _retain_global_labels(self, paths: Sequence[str]) -> None:
+        """Keep these labels teaching once their files no longer exist."""
+        scorer = self.scorer
+        if scorer is None or not self.config.global_learning:
+            return
+        try:
+            store = scorer.global_memory()
+            if store is not None:
+                store.retain(paths)
+        except Exception:
+            # The rejection itself has already been saved; losing only the cross-folder
+            # half of it is not worth interrupting a bulk action over, but it must not
+            # pass in silence either.
+            LOGGER.exception("Could not retain global labels for %d deleted photos", len(paths))
+
+    def _trash_and_report(self, paths: Sequence[str]) -> None:
+        """Move files to the recycle bin and say exactly what happened."""
+        outcome = trash_files(paths)
+        if not outcome.available:
+            messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {outcome.reason}")
+            return
+        self._record_trashed(outcome)
+        # Report what actually happened, and refresh whenever anything moved: a partial
+        # failure still changed the folder, so leaving the grid untouched would show
+        # files that are already in the recycle bin.
+        if outcome.failed_count:
+            LOGGER.warning("Trashed %d of %d files", outcome.trashed_count, len(paths))
+            first = "\n".join(f"{path}: {error}" for path, error in outcome.failures[:5])
+            more = f"\n...and {outcome.failed_count - 5} more." if outcome.failed_count > 5 else ""
+            messagebox.showwarning(
+                "Trash partly complete",
+                f"Moved {outcome.trashed_count} of {len(paths)} files to the recycle bin/trash.\n\n"
+                f"{outcome.failed_count} could not be moved:\n{first}{more}",
+            )
+        else:
+            messagebox.showinfo(
+                "Trash complete", f"Moved {outcome.trashed_count} files to the recycle bin/trash."
+            )
+        if outcome.trashed_count:
+            self._refresh_after_output_change(move=True)
 
     def _render_card(
         self,
@@ -7932,29 +8094,7 @@ class BikiniScannerApp:
             return
         if not messagebox.askyesno("Move to trash", f"Send {scope} to the recycle bin?"):
             return
-        outcome = trash_files(paths)
-        if not outcome.available:
-            messagebox.showinfo("Trash unavailable", f"Recycle-bin support is unavailable: {outcome.reason}")
-            return
-        self._record_trashed(outcome)
-        # Report what actually happened, and refresh whenever anything moved: a partial
-        # failure still changed the folder, so leaving the grid untouched would show
-        # files that are already in the recycle bin.
-        if outcome.failed_count:
-            LOGGER.warning("Trashed %d of %d files", outcome.trashed_count, len(paths))
-            first = "\n".join(f"{path}: {error}" for path, error in outcome.failures[:5])
-            more = f"\n...and {outcome.failed_count - 5} more." if outcome.failed_count > 5 else ""
-            messagebox.showwarning(
-                "Trash partly complete",
-                f"Moved {outcome.trashed_count} of {len(paths)} files to the recycle bin/trash.\n\n"
-                f"{outcome.failed_count} could not be moved:\n{first}{more}",
-            )
-        else:
-            messagebox.showinfo(
-                "Trash complete", f"Moved {outcome.trashed_count} files to the recycle bin/trash."
-            )
-        if outcome.trashed_count:
-            self._refresh_after_output_change(move=True)
+        self._trash_and_report(paths)
 
     def show_log_viewer(self) -> None:
         """The log, with a level filter and a search box.

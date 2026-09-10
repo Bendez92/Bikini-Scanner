@@ -659,6 +659,50 @@ class Learning(unittest.TestCase):
         store.clear()
         self.assertEqual(store.stats()["total"], 0)
 
+    def test_a_retained_label_keeps_teaching_after_its_file_is_deleted(self) -> None:
+        """"Reject and delete" would otherwise undo its own training.
+
+        A label whose file is gone normally stops teaching, so that scanning a
+        temporary folder does not train the model forever. A photo deleted *because*
+        it was rejected is the opposite case: dropping it on the next pass would
+        quietly reverse the very training the action is named for.
+        """
+        store = GlobalLearningStore(model_name="retain-test")
+        store.clear()
+        doomed = Path(tempfile.mkdtemp(prefix="bikini_retain_"))
+        self.addCleanup(shutil.rmtree, doomed, True)
+        kept, dropped = doomed / "kept.jpg", doomed / "dropped.jpg"
+        for path in (kept, dropped):
+            path.write_bytes(b"x")
+        store.record([(str(kept), 0, np.ones(4, dtype=np.float32))], sequence=1)
+        store.record([(str(dropped), 0, np.zeros(4, dtype=np.float32))], sequence=2)
+        # Marked before the files go, which is the order the delete flow uses.
+        store.retain([str(kept)])
+        kept.unlink()
+        dropped.unlink()
+        training = store.training_set(expected_dim=4)
+        self.assertEqual([str(path) for path in training.paths], [str(kept)])
+        self.assertEqual(store.stats()["total"], 1, "the retained label was pruned away")
+        # Clearing the label retires it for good, retained or not.
+        store.forget([str(kept)])
+        self.assertEqual(len(store.training_set(expected_dim=4)), 0)
+        store.clear()
+
+    def test_retaining_is_visible_to_a_training_set_already_cached(self) -> None:
+        store = GlobalLearningStore(model_name="retain-cache-test")
+        store.clear()
+        folder = Path(tempfile.mkdtemp(prefix="bikini_retain_cache_"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        target = folder / "a.jpg"
+        target.write_bytes(b"x")
+        store.record([(str(target), 1, np.ones(4, dtype=np.float32))], sequence=1)
+        self.assertEqual(len(store.training_set(expected_dim=4)), 1)
+        store.retain([str(target)])
+        target.unlink()
+        # Without the retained list in the cache key this returned the stale answer.
+        self.assertEqual(len(store.training_set(expected_dim=4)), 1)
+        store.clear()
+
 
 class ScanProgressReporting(unittest.TestCase):
     """The bar has to move forwards only, and finish, whatever phases actually ran."""
@@ -1381,6 +1425,122 @@ class GuiReviewQueue(unittest.TestCase):
         self.assertEqual(bands[self.paths[2]], "Detected", "0.48 stayed below a 0.30 threshold")
         self.assertEqual(bands[self.paths[4]], "Possible")
         self.assertEqual(bands[self.paths[5]], "Probable reject")
+
+    def _spread_scores(self) -> dict[str, str]:
+        """Score every path across the three bands; return the band each belongs in.
+
+        Every path, not the first six: the folder fixture carries a duplicate as well
+        as the samples, and leaving its score alone silently put an extra photo in a
+        band the test then disagreed with.
+        """
+        state = self.app.current_state
+        assert state is not None
+        self.app.threshold_var.set(0.5)
+        pattern = [0.95, 0.82, 0.48, 0.40, 0.20, 0.05]
+        expected: dict[str, str] = {}
+        for index, path in enumerate(state.paths):
+            score = pattern[index % len(pattern)]
+            state.scores[index] = score
+            expected[str(path)] = (
+                "Detected" if score >= 0.5 else "Possible" if score >= 0.35 else "Probable reject"
+            )
+        return expected
+
+    def _band_buttons(self, band: str) -> list[str]:
+        from bikini_scanner import gui as gui_module
+
+        frame = self.app._bucket_headings[band]
+        return [
+            str(child.cget("text"))
+            for child in frame.winfo_children()
+            if isinstance(child, gui_module.ttk.Button)
+        ]
+
+    def test_each_band_offers_the_bulk_action_that_belongs_to_it(self) -> None:
+        """Doing these a card at a time is the work the bands exist to avoid."""
+        self._spread_scores()
+        self.app.show_all_results()
+        self.assertEqual(self._band_buttons("Detected"), ["Export these…"])
+        self.assertEqual(self._band_buttons("Probable reject"), ["Reject all & delete…"])
+        # The possible band is the one that is meant to be judged by hand, so it gets
+        # no bulk action to fire off by accident.
+        self.assertEqual(self._band_buttons("Possible"), [])
+
+    def test_the_other_views_carry_no_band_actions(self) -> None:
+        self.app.review_samples = [
+            {"path": path, "score": 0.9, "bucket": "Likely match"} for path in self.paths
+        ]
+        self.app.restore_review_view()
+        self.assertEqual(self.app._band_actions("Likely match"), [])
+
+    def test_a_band_action_covers_the_whole_band_not_the_page_on_screen(self) -> None:
+        expected = self._spread_scores()
+        self.app.show_all_results()
+        for band in ("Detected", "Possible", "Probable reject"):
+            self.assertEqual(
+                set(self.app._band_paths(band)),
+                {path for path, name in expected.items() if name == band},
+                f"the {band} band action would not have covered the whole band",
+            )
+        # Between them the three bands account for every photo, exactly once.
+        covered = [path for band in ("Detected", "Possible", "Probable reject") for path in self.app._band_paths(band)]
+        self.assertEqual(sorted(covered), sorted(expected))
+
+    def test_reject_and_delete_labels_retains_and_bins_in_that_order(self) -> None:
+        """The labels are the training, so they are written before the files go.
+
+        The retrain that folds them in runs off cached embeddings a moment later, by
+        which time the photos no longer exist — so the labels are also marked to
+        survive their files, or the delete would undo its own training.
+        """
+        from bikini_scanner import gui as gui_module
+
+        self._spread_scores()
+        self.app.show_all_results()
+        targets = self.app._band_paths("Probable reject")
+        self.assertTrue(targets)
+        order: list[str] = []
+        retained: list[str] = []
+        trashed: list[str] = []
+        self.app._retain_global_labels = lambda paths: (  # type: ignore[method-assign]
+            order.append("retain"),
+            retained.extend(paths),
+        )
+        self.app._trash_and_report = lambda paths: (  # type: ignore[method-assign]
+            order.append("trash"),
+            trashed.extend(paths),
+        )
+        original = gui_module.messagebox.askyesno
+        gui_module.messagebox.askyesno = lambda *a, **k: True
+        try:
+            self.app.reject_and_delete_band("Probable reject")
+        finally:
+            gui_module.messagebox.askyesno = original
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertTrue(all(labels.get(path) == 0 for path in targets), "the band was not rejected")
+        self.assertEqual(sorted(retained), sorted(targets))
+        self.assertEqual(sorted(trashed), sorted(targets))
+        self.assertEqual(order, ["retain", "trash"], "the files went before the labels were secured")
+
+    def test_declining_the_reject_and_delete_prompt_changes_nothing(self) -> None:
+        from bikini_scanner import gui as gui_module
+
+        self._spread_scores()
+        self.app.show_all_results()
+        targets = self.app._band_paths("Probable reject")
+        trashed: list[str] = []
+        self.app._trash_and_report = lambda paths: trashed.extend(paths)  # type: ignore[method-assign]
+        original = gui_module.messagebox.askyesno
+        gui_module.messagebox.askyesno = lambda *a, **k: False
+        try:
+            self.app.reject_and_delete_band("Probable reject")
+        finally:
+            gui_module.messagebox.askyesno = original
+        assert self.app.store is not None
+        labels = self.app.store.load_labels()
+        self.assertEqual(trashed, [], "files were binned after the prompt was declined")
+        self.assertTrue(all(labels.get(path) is None for path in targets))
 
     def test_the_three_views_can_be_switched_from_the_keyboard(self) -> None:
         """Every other step of the review loop has a key; switching view did not."""

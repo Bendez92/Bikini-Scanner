@@ -681,6 +681,10 @@ class BikiniScorer:
         )
         return np.hstack([embeddings, detail, axis_block]).astype(np.float32)
 
+    def global_memory(self) -> GlobalLearningStore | None:
+        """The cross-folder learning store, or None when it is off or unavailable."""
+        return self._global_store()
+
     def _global_store(self) -> GlobalLearningStore | None:
         if not self.config.global_learning:
             return None
