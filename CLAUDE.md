@@ -17,7 +17,7 @@ Run these before committing to `main`:
 
 Expected outcomes:
 
-- 281 functional tests pass (1 skipped without a display).
+- 283 functional tests pass (1 skipped without a display).
 - Ruff reports `All checks passed!`.
 - Mypy reports `Success: no issues found in ... source files`.
 - Baseline reports `Baseline matches ...`.

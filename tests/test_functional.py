@@ -17,6 +17,7 @@ to check that a change behaves the same way against real embeddings.
 from __future__ import annotations
 
 import ast
+import contextlib
 import io
 import json
 import logging
@@ -63,10 +64,78 @@ from bikini_scanner import (
     vision_analysis,
 )
 from bikini_scanner import global_store as global_store_module
+from bikini_scanner import gui as gui_module
 from bikini_scanner import run as run_module
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
 from bikini_scanner.config import ScannerConfig, filter_folder_override
+
+
+class _NonBlockingDialogs:
+    """Stands in for tkinter.messagebox and answers instead of waiting.
+
+    A real message box blocks until somebody presses OK, and in a test nobody ever
+    does. One unstubbed dialog therefore does not fail the run, it stops it: a single
+    test that drove a full scan took this suite from 61 s to 1 490 s, and its own
+    runtime swung between 21 s and 877 s depending on what else happened to be on
+    screen. Stubbing each call site by hand only ever fixed the ones already found.
+
+    So every dialog the app can raise is answered here for the whole suite. Questions
+    answer `answer` (False by default, i.e. decline, which is the safe reply to
+    "delete these?"), and a test that needs otherwise uses `answering(True)`. Every
+    call is recorded, so a test can also assert on what it was asked.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+        self.answer = False
+        for name in ("showinfo", "showwarning", "showerror"):
+            setattr(self, name, self._telling(name))
+        for name in ("askyesno", "askokcancel", "askretrycancel"):
+            setattr(self, name, self._asking(name))
+
+    def _telling(self, kind: str):
+        def call(title: str = "", message: str = "", **_kwargs: object) -> None:
+            self.calls.append((kind, str(title), str(message)))
+            return None
+
+        return call
+
+    def _asking(self, kind: str):
+        def call(title: str = "", message: str = "", **_kwargs: object) -> bool:
+            self.calls.append((kind, str(title), str(message)))
+            return bool(self.answer)
+
+        return call
+
+    @contextlib.contextmanager
+    def answering(self, answer: bool):
+        """Answer every question with `answer` for the duration."""
+        previous, self.answer = self.answer, bool(answer)
+        try:
+            yield self
+        finally:
+            self.answer = previous
+
+    @contextlib.contextmanager
+    def recording(self):
+        """Watch only the dialogs raised inside the block."""
+        start = len(self.calls)
+        try:
+            yield self
+        finally:
+            self.seen = self.calls[start:]
+
+    def titles(self) -> list[str]:
+        return [title for _kind, title, _message in self.calls]
+
+
+# Installed once, for every test in the file. gui.py does `from tkinter import
+# messagebox`, so this replaces the name it actually calls through.
+DIALOGS = _NonBlockingDialogs()
+gui_module.messagebox = DIALOGS  # type: ignore[assignment]
+
+
 from bikini_scanner.config_profiles import BUILTIN_PROFILES, profile_config, profile_names
 from bikini_scanner.global_store import GlobalLearningStore
 from bikini_scanner.regions import plan_regions
@@ -1298,16 +1367,9 @@ class GuiReviewQueue(unittest.TestCase):
         """The empty-state panel already says it; a modal on top was one more click."""
         assert self.app.store is not None
         self.app.store.save_labels({})
-        from bikini_scanner import gui as gui_module
-
-        raised: list[tuple[str, str]] = []
-        original = gui_module.messagebox.showinfo
-        gui_module.messagebox.showinfo = lambda title, message, **kw: raised.append((title, message))
-        try:
+        with DIALOGS.recording() as dialogs:
             self.app.show_decisions()
-        finally:
-            gui_module.messagebox.showinfo = original
-        self.assertEqual(raised, [], "opening an empty Decisions view raised a dialog")
+        self.assertEqual(dialogs.seen, [], "opening an empty Decisions view raised a dialog")
         self.assertEqual(self.app.view_mode, "decided")
         self.assertEqual(self.app.page_samples, [])
         self.assertIn("Nothing decided yet", self.app.status_var.get())
@@ -1425,20 +1487,12 @@ class GuiReviewQueue(unittest.TestCase):
 
     def test_a_finished_scan_lands_on_all_results(self) -> None:
         """The landing view has to be the one that shows the whole folder."""
-        from bikini_scanner import gui as gui_module
 
         state = self.app.current_state
         assert state is not None
         self.app.view_mode = "review"
-        # A finished full scan reports itself with a modal, which in a test blocks on
-        # an OK button nobody is going to press. Left unstubbed this one test sat on
-        # the suite for a quarter of an hour.
-        original = gui_module.messagebox.showinfo
-        gui_module.messagebox.showinfo = lambda *a, **k: None
-        try:
-            self.app._scan_completed(self.app._refresh_generation, state, [], full_rescan=True)
-        finally:
-            gui_module.messagebox.showinfo = original
+        # A finished full scan reports itself with a modal; DIALOGS answers it.
+        self.app._scan_completed(self.app._refresh_generation, state, [], full_rescan=True)
         self.assertEqual(self.app.view_mode, "triage")
         self.assertEqual(
             len(self.app.page_samples), len(self.paths), "the landing view did not show the whole folder"
@@ -1489,6 +1543,18 @@ class GuiReviewQueue(unittest.TestCase):
             )
         return expected
 
+    @contextlib.contextmanager
+    def _bin_available(self, available: bool = True):
+        """Pin whether the recycle bin can be used, whatever this machine has."""
+        original = gui_module.trash_available
+        gui_module.trash_available = lambda: (  # type: ignore[assignment]
+            (True, "") if available else (False, "send2trash is not installed")
+        )
+        try:
+            yield
+        finally:
+            gui_module.trash_available = original  # type: ignore[assignment]
+
     def _band_buttons(self, band: str) -> list[str]:
         from bikini_scanner import gui as gui_module
 
@@ -1536,7 +1602,6 @@ class GuiReviewQueue(unittest.TestCase):
         which time the photos no longer exist — so the labels are also marked to
         survive their files, or the delete would undo its own training.
         """
-        from bikini_scanner import gui as gui_module
 
         self._spread_scores()
         self.app.show_all_results()
@@ -1553,17 +1618,8 @@ class GuiReviewQueue(unittest.TestCase):
             order.append("trash"),
             trashed.extend(paths),
         )
-        original = gui_module.messagebox.askyesno
-        original_available = gui_module.trash_available
-        gui_module.messagebox.askyesno = lambda *a, **k: True
-        # Not every machine has send2trash; without this the action would refuse
-        # with a modal and the test would hang on it.
-        gui_module.trash_available = lambda: (True, "")
-        try:
+        with self._bin_available(), DIALOGS.answering(True):
             self.app.reject_and_delete_band("Probable reject")
-        finally:
-            gui_module.messagebox.askyesno = original
-            gui_module.trash_available = original_available
         assert self.app.store is not None
         labels = self.app.store.load_labels()
         self.assertTrue(all(labels.get(path) == 0 for path in targets), "the band was not rejected")
@@ -1578,7 +1634,6 @@ class GuiReviewQueue(unittest.TestCase):
         action reached everything the reviewer had already judged — including a photo
         they had rescued from the reject band by accepting it.
         """
-        from bikini_scanner import gui as gui_module
 
         self._spread_scores()
         self.app.show_all_results()
@@ -1591,18 +1646,8 @@ class GuiReviewQueue(unittest.TestCase):
         trashed: list[str] = []
         self.app._trash_and_report = lambda paths: trashed.extend(paths)  # type: ignore[method-assign]
         self.app._retain_global_labels = lambda paths: None  # type: ignore[method-assign]
-        original = gui_module.messagebox.askyesno
-        original_info = gui_module.messagebox.showinfo
-        original_available = gui_module.trash_available
-        gui_module.messagebox.askyesno = lambda *a, **k: True
-        gui_module.messagebox.showinfo = lambda *a, **k: None
-        gui_module.trash_available = lambda: (True, "")
-        try:
+        with self._bin_available(), DIALOGS.answering(True):
             self.app.reject_and_delete_band("Probable reject")
-        finally:
-            gui_module.messagebox.askyesno = original
-            gui_module.messagebox.showinfo = original_info
-            gui_module.trash_available = original_available
         labels = self.app.store.load_labels()
         self.assertEqual(labels.get(rescued), 1, "an accepted photo was re-labelled REJECT")
         self.assertEqual(labels.get(skipped), 2, "a skipped photo was re-labelled REJECT")
@@ -1611,26 +1656,14 @@ class GuiReviewQueue(unittest.TestCase):
 
     def test_reject_and_delete_writes_nothing_when_the_bin_is_unavailable(self) -> None:
         """Both halves or neither: the labels are permanent and keep training."""
-        from bikini_scanner import gui as gui_module
 
         self._spread_scores()
         self.app.show_all_results()
         band = self.app._band_paths("Probable reject")
         retained: list[str] = []
         self.app._retain_global_labels = lambda paths: retained.extend(paths)  # type: ignore[method-assign]
-        original_available = gui_module.trash_available
-        original_ask = gui_module.messagebox.askyesno
-        original_info = gui_module.messagebox.showinfo
-        gui_module.trash_available = lambda: (False, "send2trash is not installed")
-        gui_module.messagebox.askyesno = lambda *a, **k: True
-        # The refusal is itself a modal, and in a test nobody presses OK.
-        gui_module.messagebox.showinfo = lambda *a, **k: None
-        try:
+        with self._bin_available(False), DIALOGS.answering(True):
             self.app.reject_and_delete_band("Probable reject")
-        finally:
-            gui_module.trash_available = original_available
-            gui_module.messagebox.askyesno = original_ask
-            gui_module.messagebox.showinfo = original_info
         assert self.app.store is not None
         labels = self.app.store.load_labels()
         self.assertTrue(
@@ -1699,25 +1732,14 @@ class GuiReviewQueue(unittest.TestCase):
         )
 
     def test_declining_the_reject_and_delete_prompt_changes_nothing(self) -> None:
-        from bikini_scanner import gui as gui_module
 
         self._spread_scores()
         self.app.show_all_results()
         targets = self.app._band_paths("Probable reject")
         trashed: list[str] = []
         self.app._trash_and_report = lambda paths: trashed.extend(paths)  # type: ignore[method-assign]
-        original = gui_module.messagebox.askyesno
-        original_info = gui_module.messagebox.showinfo
-        original_available = gui_module.trash_available
-        gui_module.messagebox.askyesno = lambda *a, **k: False
-        gui_module.messagebox.showinfo = lambda *a, **k: None
-        gui_module.trash_available = lambda: (True, "")
-        try:
+        with self._bin_available(), DIALOGS.answering(False):
             self.app.reject_and_delete_band("Probable reject")
-        finally:
-            gui_module.messagebox.askyesno = original
-            gui_module.messagebox.showinfo = original_info
-            gui_module.trash_available = original_available
         assert self.app.store is not None
         labels = self.app.store.load_labels()
         self.assertEqual(trashed, [], "files were binned after the prompt was declined")
@@ -1904,6 +1926,39 @@ class GuiReviewQueue(unittest.TestCase):
         details = self.app._axis_details_text(group[0])
         self.assertIn(f"1 of {len(group)} near-identical", details)
         self.assertNotIn("not linked", details)
+
+    def test_no_dialog_can_stall_the_suite(self) -> None:
+        """The safety net itself, because forgetting it is what cost the time.
+
+        Every message box blocks until someone presses OK. Stubbing them one call
+        site at a time only ever covered the ones already discovered, and the one that
+        was missed took the suite from 61 s to 1 490 s. This drives three dialogs with
+        nothing stubbed locally and expects to come straight back.
+        """
+        started = time.perf_counter()
+        with DIALOGS.recording() as dialogs:
+            # Info, from a view with nothing to show.
+            self.app.current_state = None
+            self.app.show_all_results()
+            # A question, declined by default, so nothing destructive follows.
+            self.app.mark_all_shown(0)
+        self.assertLess(time.perf_counter() - started, 5.0, "a dialog blocked the test")
+        self.assertTrue(dialogs.seen, "the dialogs were never raised, so nothing was proved")
+        self.assertIn("No results", [title for _kind, title, _message in dialogs.seen])
+
+    def test_a_question_is_declined_unless_a_test_says_otherwise(self) -> None:
+        """False is the safe default: it is the answer to 'delete these?'."""
+        self._spread_scores()
+        self.app.show_all_results()
+        band = self.app._band_paths("Probable reject")
+        trashed: list[str] = []
+        self.app._trash_and_report = lambda paths: trashed.extend(paths)  # type: ignore[method-assign]
+        self.app._retain_global_labels = lambda paths: None  # type: ignore[method-assign]
+        with self._bin_available():
+            self.app.reject_and_delete_band("Probable reject")
+        assert self.app.store is not None
+        self.assertEqual(trashed, [], "an unanswered question was taken as yes")
+        self.assertTrue(all(self.app.store.load_labels().get(path) is None for path in band))
 
     def test_auto_decide_needs_labels_before_it_will_decide_anything(self) -> None:
         """It writes labels in bulk, so it may not guess from nothing."""

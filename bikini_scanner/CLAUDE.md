@@ -97,12 +97,26 @@ Vertical space is the scarce resource; several things exist only to defend it.
 
 ## A Modal In A Test Blocks Forever
 
-`_scan_completed(full_rescan=True)` ends with a "Scan complete" `messagebox.showinfo`,
-and `show_decisions`, `show_detected_files` and the band actions raise their own. In a
-test there is nobody to press OK, so the call sits there: one test that drove a full
-scan without stubbing it took the suite from 61 s to 1 490 s, and its own runtime varied
-between 21 s and 877 s depending on what else was running. Any test that reaches a code
-path with a dialog has to stub `gui.messagebox` for the duration and restore it after.
+`messagebox` waits for someone to press OK, and in a test nobody ever does, so an
+unstubbed dialog does not fail the run — it stops it. One test that drove a full scan
+took the suite from 61 s to 1 490 s, and its own runtime swung between 21 s and 877 s
+depending on what else was on screen.
+
+Stubbing each call site by hand only ever covered the ones already found, so
+`tests/test_functional.py` replaces `gui.messagebox` **once, for the whole file**, with
+`_NonBlockingDialogs` (the module-level `DIALOGS`). Every dialog is answered rather than
+waited on, and every call is recorded.
+
+- Questions return `DIALOGS.answer`, **False** by default — the safe reply to "delete
+  these?". A test that needs yes wraps the call in `with DIALOGS.answering(True):`.
+- `with DIALOGS.recording() as dialogs:` captures just the dialogs raised in the block,
+  which is how a test asserts one *was not* shown.
+- Anything that must not depend on the machine, such as whether send2trash exists, gets
+  its own helper (`_bin_available`).
+
+`GuiReviewQueue.test_no_dialog_can_stall_the_suite` guards the net itself: it drives
+several dialogs with nothing stubbed locally and fails if the call does not return
+promptly. Do not go back to per-test stubbing.
 
 ## The Scanner Decides The Easy Ones
 
