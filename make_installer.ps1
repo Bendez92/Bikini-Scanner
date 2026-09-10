@@ -92,7 +92,17 @@ if (-not (Test-Path $VenvPython)) {
 # because this run just created it, or PyInstaller is missing - install anyway.
 # Honouring the flag there guarantees a confusing "PyInstaller failed" several
 # minutes later instead of a clear message now.
-& $VenvPython -c "import PyInstaller" 2>$null
+# find_spec rather than a bare import, and no stderr redirection. Two reasons, and the
+# second one broke this script outright:
+#   * importing PyInstaller to ask whether it exists is slow and has side effects;
+#     find_spec answers the same question by looking.
+#   * `... 2>$null` on a *native* executable makes Windows PowerShell wrap each stderr
+#     line in an ErrorRecord, and with $ErrorActionPreference = "Stop" (set at the top
+#     of this script) that is a terminating error. So the probe for "is PyInstaller
+#     missing?" killed the build whenever it was missing - precisely the fresh-venv
+#     case the block below exists to handle. This version writes nothing to stderr at
+#     all and carries its answer in the exit code.
+& $VenvPython -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)"
 $HasPyInstaller = $LASTEXITCODE -eq 0
 if ($SkipDeps -and ($FreshVenv -or -not $HasPyInstaller)) {
     Write-Host ""
