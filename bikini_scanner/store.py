@@ -23,7 +23,7 @@ except Exception:  # noqa: BLE001
     _FILELOCK_AVAILABLE = False
 
 from .image_formats import DECODE_VERSION
-from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file
+from .safe_io import atomic_replace, atomic_write_json, quarantine_broken_file, resolved_str
 from .sqlite_cache import SQLiteCache
 
 # Pickle is used only for the classifier cache. A restricted unpickler limits what can
@@ -143,6 +143,7 @@ class FolderStore:
     embeddings_path: Path = field(init=False)
     index_path: Path = field(init=False)
     labels_path: Path = field(init=False)
+    notes_path: Path = field(init=False)
     metadata_path: Path = field(init=False)
     face_counts_path: Path = field(init=False)
     classifier_path: Path = field(init=False)
@@ -155,6 +156,7 @@ class FolderStore:
     lock_path: Path = field(init=False)
     sqlite_cache: SQLiteCache | None = field(init=False, default=None, repr=False)
     _labels_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
+    _notes_cache: dict[str, str] | None = field(init=False, default=None, repr=False)
     _path_index_cache: dict[str, dict[str, int | str]] | None = field(init=False, default=None, repr=False)
     _embedding_cache: dict[str, np.ndarray] | None = field(init=False, default=None, repr=False)
     _face_count_cache: dict[str, int] | None = field(init=False, default=None, repr=False)
@@ -169,6 +171,7 @@ class FolderStore:
         self.embeddings_path = self.cache_dir / "embeddings.npz"
         self.index_path = self.cache_dir / "embeddings_index.json"
         self.labels_path = self.cache_dir / "labels.json"
+        self.notes_path = self.cache_dir / "notes.json"
         self.metadata_path = self.cache_dir / SCAN_METADATA_FILENAME
         self.face_counts_path = self.cache_dir / FACE_COUNTS_FILENAME
         self.classifier_path = self.cache_dir / CLASSIFIER_FILENAME
@@ -242,14 +245,25 @@ class FolderStore:
             except OSError as exc:
                 LOGGER.warning("Could not discard stale cache %s: %s", path, exc)
         if self.sqlite_cache is not None:
+            # clear() empties the tables, removes the file and rebuilds the schema, so
+            # this object stays usable — this runs mid-scan from
+            # ensure_embedding_namespace, and the very next call reads the cache again.
+            # Deleting cache.db again afterwards would undo that rebuild and leave every
+            # following query with "no such table", which is exactly what changing the
+            # model and rescanning the same folder used to do.
+            if self.cache_db_path.exists():
+                discarded.append(self.cache_db_path.name)
             self.sqlite_cache.clear()
-        for path in (self.cache_db_path, self.cache_dir / "cache.db-wal", self.cache_dir / "cache.db-shm"):
-            try:
-                if path.exists():
-                    path.unlink(missing_ok=True)
-                    discarded.append(path.name)
-            except OSError as exc:
-                LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
+        else:
+            # Called from __post_init__, before the cache object exists: nothing holds
+            # the file open, so it and its WAL sidecars can simply go.
+            for path in (self.cache_db_path, self.cache_dir / "cache.db-wal", self.cache_dir / "cache.db-shm"):
+                try:
+                    if path.exists():
+                        path.unlink(missing_ok=True)
+                        discarded.append(path.name)
+                except OSError as exc:
+                    LOGGER.warning("Could not discard stale cache file %s: %s", path, exc)
         self._embedding_cache = None
         self._path_index_cache = None
         self._face_count_cache = None
@@ -354,6 +368,29 @@ class FolderStore:
             cache[str(key)] = {str(axis): float(score) for axis, score in value.items()}
         atomic_write_json(self.vlm_verdicts_path, cache)
 
+    def load_notes(self) -> dict[str, str]:
+        """Free-text note per image. Accept/REJECT records the decision; this records why."""
+        if self._notes_cache is None:
+            if not self.notes_path.exists():
+                self._notes_cache = {}
+            else:
+                try:
+                    payload = json.loads(self.notes_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        raise TypeError("invalid payload type")
+                    self._notes_cache = {str(path): str(note) for path, note in payload.items()}
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    LOGGER.warning("Ignoring unreadable notes %s: %s", self.notes_path, exc)
+                    quarantine_broken_file(self.notes_path, LOGGER, "invalid JSON")
+                    self._notes_cache = {}
+        return dict(self._notes_cache)
+
+    def save_notes(self, notes: dict[str, str]) -> None:
+        """Persist notes, then adopt them, in that order — same rule as save_labels."""
+        normalized = {str(path): str(note) for path, note in notes.items() if str(note).strip()}
+        atomic_write_json(self.notes_path, dict(sorted(normalized.items())))
+        self._notes_cache = normalized
+
     def load_labels(self) -> dict[str, int]:
         if self._labels_cache is None:
             if not self.labels_path.exists():
@@ -406,6 +443,15 @@ class FolderStore:
             self.config_override_path.unlink()
         except FileNotFoundError:
             pass
+
+    def cached_path_count(self, paths: Iterable[Path]) -> int:
+        """How many of these images already have an embedding on file.
+
+        Public so a caller can report what a scan would cost without reaching into the
+        index itself, and without starting the scan to find out.
+        """
+        known = self._load_path_index()
+        return sum(1 for path in paths if str(path) in known)
 
     def _load_path_index(self) -> dict[str, dict[str, int | str]]:
         if self._path_index_cache is None:
@@ -514,7 +560,7 @@ class FolderStore:
         if self._path_index_cache is None:
             self._path_index_cache = {}
         for path, record in path_records.items():
-            key = str(path.resolve())
+            key = resolved_str(path)
             self._path_index_cache[key] = {
                 "path": key,
                 "content_hash": str(record["content_hash"]),
@@ -553,8 +599,9 @@ class FolderStore:
         if self._path_index_cache is None:
             self._path_index_cache = {}
         for path, record in normalized_records.items():
-            self._path_index_cache[str(path.resolve())] = {
-                "path": str(path.resolve()),
+            resolved = resolved_str(path)
+            self._path_index_cache[resolved] = {
+                "path": resolved,
                 "content_hash": record["content_hash"],
                 "mtime_ns": record["mtime_ns"],
                 "size": record["size"],
@@ -599,7 +646,20 @@ class FolderStore:
         try:
             with self.classifier_path.open("rb") as handle:
                 payload = RestrictedUnpickler(handle).load()
-        except Exception:  # noqa: BLE001
+        except pickle.UnpicklingError as exc:
+            # RestrictedUnpickler refusing a class is a trust-boundary event: this file
+            # lives inside the scanned folder, so a refusal means something in there
+            # tried to have us import it. It was being discarded in complete silence,
+            # which is the one case that should leave a trace.
+            LOGGER.warning(
+                "Refused to load the classifier cache in %s: %s. The folder is scanned "
+                "normally; the model is retrained from your labels instead.",
+                self.cache_dir,
+                exc,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.info("Ignoring an unreadable classifier cache in %s: %s", self.cache_dir, exc)
             return None
         if not isinstance(payload, dict):
             return None
@@ -639,7 +699,7 @@ class FolderStore:
 
     def duplicate_groups(self, paths: Iterable[Path] | None = None) -> dict[str, list[str]]:
         index = self._load_path_index()
-        allowed = {str(path.resolve()) for path in paths} if paths is not None else None
+        allowed = {resolved_str(path) for path in paths} if paths is not None else None
         groups: dict[str, list[str]] = {}
         for path, record in index.items():
             if allowed is not None and path not in allowed:
@@ -661,16 +721,70 @@ class FolderStore:
                     continue
         return total
 
-    def clear_cache(self) -> None:
+    def clear_cache(self, keep_decisions: bool = True) -> None:
+        """Delete this folder's derived data.
+
+        `keep_decisions` preserves the files in here that no amount of rescanning can
+        rebuild: the labels, the notes, and the folder's pinned settings override.
+        Everything else — embeddings, region scores, face counts, the trained
+        classifier, scan metadata — is recomputed from the images themselves.
+
+        The review session is kept too. It only records where the reviewer had got to,
+        so it is not in the same class as a label, but `_discard_derived_caches` already
+        preserves it and there is no reason for the two paths to disagree — clearing a
+        cache should not also lose your place and the quality history behind the
+        plateau notice.
+
+        It defaults to True because this used to rmtree the lot, and an action named
+        for the recomputable half was quietly taking hours of human decisions with it.
+        """
+        keep: frozenset[str] = frozenset()
+        if keep_decisions:
+            keep = frozenset(
+                path.name
+                for path in (
+                    self.labels_path,
+                    self.notes_path,
+                    self.config_override_path,
+                    self.review_session_path,
+                )
+            )
+        self._clear_cache_dir(keep_names=keep)
+
+    def _clear_cache_dir(self, keep_names: frozenset[str] = frozenset()) -> None:
+        """Delete the cache directory's contents, except the names in `keep_names`.
+
+        The files named there are never read, moved or deleted — they are simply
+        skipped, so no failure anywhere in this method can lose them.
+
+        It used to rmtree the directory and carry the irreplaceable files across in
+        memory. Both halves of that could lose hours of review and only log it:
+        `labels.json` momentarily unreadable (antivirus, OneDrive, Dropbox all hold
+        files open on Windows) was logged at WARNING and then deleted anyway, and a
+        failed write-back afterwards had nothing left to restore from. Measured on 500
+        labels, either fault left zero behind while `notes.json` survived, so the loss
+        was silent and partial.
+        """
         if self.sqlite_cache is not None:
             try:
                 self.sqlite_cache.close()
             except Exception as exc:  # noqa: BLE001
-                # rmtree below is what actually matters; a close failure only risks a
-                # locked file on Windows, and knowing that is why it is logged.
+                # Deleting the file below is what actually matters; a close failure only
+                # risks a locked file on Windows, and knowing that is why it is logged.
                 LOGGER.warning("Could not close the SQLite cache before clearing it: %s", exc)
         if self.cache_dir.exists():
-            shutil.rmtree(self.cache_dir)
+            for entry in self.cache_dir.iterdir():
+                if entry.name in keep_names:
+                    continue
+                try:
+                    if entry.is_dir() and not entry.is_symlink():
+                        shutil.rmtree(entry)
+                    else:
+                        entry.unlink()
+                except OSError as exc:
+                    # Everything reachable here is recomputable, so one stubborn file is
+                    # not worth abandoning the clear — but it must not pass in silence.
+                    LOGGER.warning("Could not remove %s while clearing the cache: %s", entry, exc)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.embeddings_path = self.cache_dir / "embeddings.npz"
         self.index_path = self.cache_dir / "embeddings_index.json"
@@ -679,16 +793,28 @@ class FolderStore:
         self.face_counts_path = self.cache_dir / FACE_COUNTS_FILENAME
         self.classifier_path = self.cache_dir / CLASSIFIER_FILENAME
         self.config_override_path = self.cache_dir / CONFIG_OVERRIDE_FILENAME
+        self.notes_path = self.cache_dir / "notes.json"
         self.review_session_path = self.cache_dir / "review_session.json"
         self.region_embeddings_path = self.cache_dir / REGION_EMBEDDINGS_FILENAME
         self.cache_db_path = self.cache_dir / "cache.db"
         self.sqlite_cache = SQLiteCache(self.cache_db_path)
         self._labels_cache = None
+        self._notes_cache = None
         self._path_index_cache = None
         self._embedding_cache = None
         self._face_count_cache = None
         self._region_cache = None
         self._vlm_cache = None
+
+    def delete_decisions(self) -> None:
+        """Delete the labels and notes for this folder. Nothing else touches these."""
+        for path in (self.labels_path, self.notes_path):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                LOGGER.exception("Could not delete %s: %s", path, exc)
+        self._labels_cache = None
+        self._notes_cache = None
 
     def build_scan_metadata(
         self,

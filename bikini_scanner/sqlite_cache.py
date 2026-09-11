@@ -23,13 +23,17 @@ from typing import Any
 
 import numpy as np
 
+from .safe_io import resolved_str
+
 LOGGER = logging.getLogger(__name__)
 
 
 class _SQLiteTransaction:
     """Hold the cache lock across a BEGIN ... COMMIT/ROLLBACK sequence."""
 
-    def __init__(self, lock: threading.Lock, connection_factory: Any) -> None:
+    # `lock` is the cache's re-entrant lock; typed loosely because threading.RLock is a
+    # factory, so its instance type is private in typeshed.
+    def __init__(self, lock: Any, connection_factory: Any) -> None:
         self._lock = lock
         self._connection_factory = connection_factory
         self._connection: sqlite3.Connection | None = None
@@ -57,7 +61,11 @@ class SQLiteCache:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.Lock()
+        # Re-entrant: clear() has to hold the lock across purge + close + unlink +
+        # schema rebuild, and both purge() and _transaction() take it themselves.
+        # With a plain Lock the schema rebuild happened *outside* the lock, so a
+        # concurrent reader could connect to a database that had no tables yet.
+        self._lock = threading.RLock()
         self._connection: sqlite3.Connection | None = None
         self._ensure_tables()
 
@@ -79,16 +87,25 @@ class SQLiteCache:
     def _transaction(self) -> _SQLiteTransaction:
         return _SQLiteTransaction(self._lock, self._connect)
 
-    def _execute(
-        self,
-        sql: str,
-        parameters: tuple[Any, ...] | list[Any] = (),
-        conn: sqlite3.Connection | None = None,
-    ) -> sqlite3.Cursor:
-        if conn is not None:
-            return conn.execute(sql, parameters)
+    # Reads must fetch inside the lock. There used to be an `_execute` here that
+    # released it as soon as the statement was issued and handed the cursor back, so
+    # the caller's .fetchall() ran unguarded on a connection another thread could be
+    # using — the scan worker writes while the main thread answers Tools > Duplicate
+    # groups, which shares one connection. That interleaving returned truncated rows
+    # (np.load raising "No data left in file") and dropped writes. Its callers were
+    # moved to the two helpers below; the method itself is gone rather than left as a
+    # loaded gun for the next query somebody adds.
+    def _fetchall(
+        self, sql: str, parameters: tuple[Any, ...] | list[Any] = ()
+    ) -> list[tuple[Any, ...]]:
         with self._lock:
-            return self._connect().execute(sql, parameters)
+            return self._connect().execute(sql, parameters).fetchall()
+
+    def _fetchone(
+        self, sql: str, parameters: tuple[Any, ...] | list[Any] = ()
+    ) -> tuple[Any, ...] | None:
+        with self._lock:
+            return self._connect().execute(sql, parameters).fetchone()
 
     def _executemany(
         self,
@@ -159,7 +176,7 @@ class SQLiteCache:
 
     def _has_data(self) -> bool:
         for table in ("embeddings", "image_records", "face_counts", "region_embeddings"):
-            row = self._execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+            row = self._fetchone(f"SELECT COUNT(*) FROM {table}")
             if row is not None and row[0]:
                 return True
         return False
@@ -298,7 +315,7 @@ class SQLiteCache:
             if path_records:
                 rows = [
                     (
-                        str(path.resolve()),
+                        resolved_str(path),
                         str(record["content_hash"]),
                         int(record["mtime_ns"]),
                         int(record["size"]),
@@ -324,28 +341,38 @@ class SQLiteCache:
                     conn,
                 )
 
+    # SQLite caps the number of bound parameters per statement (999 on older builds,
+    # 32766 on current ones). A folder large enough to exceed it — and this app warns
+    # about folders of 20 000 — used to fail the very first cache lookup with
+    # "too many SQL variables" before any work had been done, so the IN clause is
+    # issued in chunks well under the smallest of those limits.
+    _QUERY_CHUNK = 500
+
     def get_cached_image_records(
         self, paths: list[Path]
     ) -> dict[Path, dict[str, object]]:
         if not paths:
             return {}
-        path_strings = [str(path.resolve()) for path in paths]
-        placeholders = ",".join("?" * len(path_strings))
-        rows = self._execute(
-            f"""
-            SELECT path, content_hash, mtime_ns, size, embedding
-            FROM image_records
-            JOIN embeddings USING (content_hash)
-            WHERE path IN ({placeholders})
-            """,
-            tuple(path_strings),
-        ).fetchall()
-        by_path: dict[str, tuple[str, int, int, np.ndarray]] = {
-            row[0]: (row[1], row[2], row[3], self._blob_to_array(row[4])) for row in rows
-        }
+        path_strings = [resolved_str(path) for path in paths]
+        by_path: dict[str, tuple[str, int, int, np.ndarray]] = {}
+        for start in range(0, len(path_strings), self._QUERY_CHUNK):
+            chunk = path_strings[start : start + self._QUERY_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self._fetchall(
+                f"""
+                SELECT path, content_hash, mtime_ns, size, embedding
+                FROM image_records
+                JOIN embeddings USING (content_hash)
+                WHERE path IN ({placeholders})
+                """,
+                tuple(chunk),
+            )
+            for row in rows:
+                by_path[row[0]] = (row[1], row[2], row[3], self._blob_to_array(row[4]))
         cached: dict[Path, dict[str, object]] = {}
-        for path in paths:
-            entry = by_path.get(str(path.resolve()))
+        # Zipped against the strings computed above rather than resolving a second time.
+        for path, resolved in zip(paths, path_strings, strict=True):
+            entry = by_path.get(resolved)
             if entry is None:
                 continue
             content_hash, mtime_ns, size, embedding = entry
@@ -365,11 +392,11 @@ class SQLiteCache:
         return cached
 
     def _load_all_embeddings(self) -> dict[str, np.ndarray]:
-        rows = self._execute("SELECT content_hash, embedding FROM embeddings").fetchall()
+        rows = self._fetchall("SELECT content_hash, embedding FROM embeddings")
         return {str(row[0]): self._blob_to_array(row[1]) for row in rows}
 
     def _load_all_image_records(self) -> dict[Path, dict[str, int | str]]:
-        rows = self._execute("SELECT path, content_hash, mtime_ns, size FROM image_records").fetchall()
+        rows = self._fetchall("SELECT path, content_hash, mtime_ns, size FROM image_records")
         return {
             Path(str(row[0])): {
                 "path": str(row[0]),
@@ -381,25 +408,25 @@ class SQLiteCache:
         }
 
     def lookup_content_embedding(self, content_hash: str) -> np.ndarray | None:
-        row = self._execute(
+        row = self._fetchone(
             "SELECT embedding FROM embeddings WHERE content_hash = ?",
             (str(content_hash),),
-        ).fetchone()
+        )
         if row is None:
             return None
         return self._blob_to_array(row[0])
 
     def lookup_face_count(self, content_hash: str) -> int | None:
-        row = self._execute(
+        row = self._fetchone(
             "SELECT face_count FROM face_counts WHERE content_hash = ?",
             (str(content_hash),),
-        ).fetchone()
+        )
         if row is None:
             return None
         return int(row[0])
 
     def load_face_counts(self) -> dict[str, int]:
-        rows = self._execute("SELECT content_hash, face_count FROM face_counts").fetchall()
+        rows = self._fetchall("SELECT content_hash, face_count FROM face_counts")
         return {str(row[0]): int(row[1]) for row in rows}
 
     def save_region_embeddings(self, entries: dict[str, np.ndarray]) -> None:
@@ -432,13 +459,13 @@ class SQLiteCache:
             )
 
     def lookup_region_embeddings(self, content_hash: str, namespace: str) -> dict[str, np.ndarray]:
-        rows = self._execute(
+        rows = self._fetchall(
             """
             SELECT region_key, embedding FROM region_embeddings
             WHERE content_hash = ? AND namespace = ?
             """,
             (str(content_hash), str(namespace)),
-        ).fetchall()
+        )
         return {str(row[0]): self._blob_to_array(row[1]) for row in rows}
 
     def purge(self) -> None:
@@ -460,8 +487,23 @@ class SQLiteCache:
                 LOGGER.warning("Could not empty the cache DB %s: %s", self.db_path, exc)
 
     def clear(self) -> None:
-        self.purge()
+        """Empty the cache and leave a usable, empty database behind.
+
+        The caller keeps using this object — FolderStore discards derived caches from
+        `ensure_embedding_namespace` in the middle of a live scan. Without the schema
+        rebuild at the end, the next `_connect()` opened a brand-new file that
+        `_ensure_tables` had never run against, and every following query died with
+        "no such table: image_records". Switching model in Settings and rescanning the
+        same folder hit exactly that, and left the folder's cache broken for the rest
+        of the session.
+
+        The whole sequence is held under the lock. Rebuilding the schema outside it left
+        a window in which a reader on another thread could connect to a database with no
+        tables in it - reachable because Tools > Clear cached scan data is not blocked
+        while a scan is running.
+        """
         with self._lock:
+            self.purge()
             try:
                 if self._connection is not None:
                     self._connection.close()
@@ -472,6 +514,8 @@ class SQLiteCache:
                 self.db_path.unlink(missing_ok=True)
             except OSError as exc:
                 LOGGER.warning("Could not remove cache DB %s: %s", self.db_path, exc)
+            # Safe under the lock: it is re-entrant, and purge()/_transaction() take it.
+            self._ensure_tables()
 
     def close(self) -> None:
         with self._lock:

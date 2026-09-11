@@ -8,7 +8,7 @@ import re
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from io import BytesIO
 from threading import Event
 from typing import Any
@@ -37,6 +37,8 @@ VLM_MAX_IMAGE_SIDE = 512
 # Hard ceiling on VLM workers. Config/GUI already validates user input, but this
 # protects against runaway concurrency if the setting is set programmatically.
 VLM_MAX_CONCURRENCY = 16
+# How often the adjudication loop looks at the cancel flag while requests are in flight.
+_CANCEL_POLL_SECONDS = 0.25
 
 
 class VLMCancelled(Exception):
@@ -227,7 +229,16 @@ class VLMClient:
                 if isinstance(message, Mapping):
                     content = message.get("content", "")
                     text = content if isinstance(content, str) else json.dumps(content)
-            return parse_axis_json(text)
+            verdict = parse_axis_json(text)
+            if not verdict:
+                # Valid JSON that names none of the axes is not a judgment. Returning it
+                # anyway meant every axis defaulted to 0.5, the cascade read that as "no
+                # evidence at all", and the image was scored 0.0 and blended in at
+                # vlm_weight — pushing a genuine match down on the strength of a reply
+                # the model never actually made. It was cached in that state too.
+                LOGGER.warning("VLM reply contained none of the expected axes; ignoring it")
+                return None
+            return verdict
         except urllib.error.HTTPError as exc:
             # A 401/403 (bad API key) or 429 (rate limited) is a configuration or
             # capacity problem, not a transient blip. Log it at ERROR with the status so
@@ -254,18 +265,31 @@ class VLMClient:
             raise VLMCancelled
         self._cancel_event = cancel_event
         completed = 0
+        # Not a `with` block: its __exit__ calls shutdown(wait=True), which blocks until
+        # every in-flight request finishes. A request already inside urlopen cannot be
+        # interrupted, so pressing Stop during a VLM pass sat there for up to
+        # `timeout` seconds — a minute on the default setting — with the button already
+        # greyed out and nothing else to look at.
+        executor = ThreadPoolExecutor(max_workers=self.concurrency)
         try:
-            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-                futures = {executor.submit(self._request, image): index for index, image in enumerate(images)}
-                for future in as_completed(futures):
-                    if cancel_event is not None and cancel_event.is_set():
-                        for pending in futures:
-                            pending.cancel()
-                        raise VLMCancelled
+            futures = {executor.submit(self._request, image): index for index, image in enumerate(images)}
+            pending = set(futures)
+            # Polled rather than `for future in as_completed(...)`: that only comes back
+            # when a request finishes, so with every worker sitting in a slow request the
+            # cancel flag was not read for a full timeout period.
+            while pending:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise VLMCancelled
+                done, pending = wait(pending, timeout=_CANCEL_POLL_SECONDS, return_when=FIRST_COMPLETED)
+                for future in done:
                     results[futures[future]] = future.result()
                     completed += 1
                     if on_progress is not None:
                         on_progress(completed, len(images))
         finally:
             self._cancel_event = None
+            # cancel_futures drops everything not yet started; the handful already in
+            # flight are abandoned rather than waited on. _request re-checks the cancel
+            # event on entry, so nothing new begins either way.
+            executor.shutdown(wait=False, cancel_futures=True)
         return results

@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections import OrderedDict
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from PIL import Image
 
-from .backend_utils import DecodedImage, iter_decoded_image_batches
+from .backend_utils import DecodedImage, iter_decoded_image_batches, remember_bounded
 from .config import DEFAULT_MODEL_NAME, REPO_ROOT, ScannerConfig
 from .image_formats import register_heif_support
 
@@ -140,10 +140,24 @@ class ClipOnnxBackend:
         return (array / norms).astype(np.float32)
 
 
-@cache
+_ONNX_SESSIONS: OrderedDict[str, ClipOnnxBackend] = OrderedDict()
+
+
 def load_onnx_backend(model_name: str) -> ClipOnnxBackend:
+    """Load (or reuse) the ONNX sessions for one model.
+
+    Bounded rather than @cache. functools.cache never evicts, so it held every set of
+    sessions the process had ever loaded — and it sat *underneath* the LRU that
+    clip_backend keeps, which meant evicting from that cache freed nothing at all.
+    """
+    cached = _ONNX_SESSIONS.get(model_name)
+    if cached is not None:
+        _ONNX_SESSIONS.move_to_end(model_name)
+        return cached
     config = ScannerConfig(backend="clip-onnx", model_name=model_name)
-    return ClipOnnxBackend.from_config(config)
+    backend = ClipOnnxBackend.from_config(config)
+    remember_bounded(_ONNX_SESSIONS, model_name, backend)
+    return backend
 
 
 def get_backend(config: ScannerConfig | None = None) -> ClipOnnxBackend:

@@ -21,6 +21,8 @@ models/
 *.bin
 *.safetensors
 
+bikini_scanner.egg-info/
+
 # Coverage measurement output (see [tool.coverage] in pyproject.toml).
 .coverage
 .coverage.*

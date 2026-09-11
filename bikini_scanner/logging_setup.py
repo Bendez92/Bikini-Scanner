@@ -8,6 +8,8 @@ from pathlib import Path
 
 APP_NAME = "bikini-scanner"
 LOG_FILENAME = "bikini_scanner.log"
+# Root package name, used to tell this app's log records from its dependencies'.
+APP_LOGGER = "bikini_scanner"
 
 
 class RedactingFormatter(logging.Formatter):
@@ -39,6 +41,21 @@ class RedactingFormatter(logging.Formatter):
         return message
 
 
+class _OwnInfoOthersWarnings(logging.Filter):
+    """Keep this app's INFO, but only WARNING and above from everything else.
+
+    The handler is attached to the root logger so an unexpected failure anywhere is
+    still captured. Left unfiltered, that also captured every INFO line from
+    transformers, urllib3, PIL and friends, which buried the app's own messages in a
+    log the user is invited to read from Help > Log viewer.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.name == APP_LOGGER or record.name.startswith(f"{APP_LOGGER}."):
+            return True
+        return record.levelno >= logging.WARNING
+
+
 def user_data_dir() -> Path:
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
@@ -64,6 +81,7 @@ def configure_logging() -> Path:
             return path
     handler = RotatingFileHandler(path, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
     handler.setFormatter(RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    handler.addFilter(_OwnInfoOthersWarnings())
     root.addHandler(handler)
     return path
 

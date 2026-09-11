@@ -21,8 +21,10 @@ from .output_ops import (
     write_image_metadata,
 )
 from .plugins import apply_plugins
+from .safe_io import atomic_write_json
 from .scorer import BikiniScorer, ScanCancelled, scan_and_score_folder
-from .store import FolderStore
+from .store import FolderStore, collect_image_paths
+from .user_prefs import load_user_prefs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -64,6 +66,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--write-metadata", action="store_true", help="Write bikini keyword metadata into matched images"
     )
     parser.add_argument("--profile", default="", help="Saved or built-in profile name")
+    # Headless and interactive review could not previously feed each other: a scan run
+    # from a script had no way to take the decisions someone made in the GUI, and
+    # decisions made headlessly had no way out. These two make them compose.
+    parser.add_argument(
+        "--import-labels",
+        default="",
+        help="Merge a JSON map of {image path: 0|1|2} into this folder's labels before scoring",
+    )
+    parser.add_argument(
+        "--export-labels", default="", help="Write this folder's labels to a JSON file after scoring"
+    )
+    parser.add_argument(
+        "--rerank",
+        action="store_true",
+        help="Re-rank using cached embeddings only; fail rather than embed images that are not cached yet",
+    )
+    parser.add_argument(
+        "--estimate",
+        action="store_true",
+        help="Report what a scan of this folder would involve, then exit without scanning",
+    )
     return parser
 
 
@@ -74,9 +97,18 @@ def main(
 ) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    config = profile_config(args.profile) if args.profile else (config_override or ScannerConfig())
-    if config is None:
-        parser.error(f"Unknown profile: {args.profile}")
+    if args.profile:
+        config = profile_config(args.profile)
+        if config is None:
+            parser.error(f"Unknown profile: {args.profile}")
+    elif config_override is not None:
+        config = config_override
+    else:
+        # Settings changed in the GUI are stored in the preferences file. Reading them
+        # back here is what makes them stick: without it every launch — GUI or headless
+        # — started from the built-in defaults, so a changed model, age gate or set of
+        # prompts silently reverted. from_mapping(None) gives the defaults.
+        config = ScannerConfig.from_mapping(load_user_prefs().get("scanner_config"))
     if args.threshold is not None:
         config.threshold = float(args.threshold)
     if enforced_backend is not None:
@@ -113,6 +145,65 @@ def main_onnx(argv: list[str] | None = None, config_override: ScannerConfig | No
     return 0
 
 
+def _merge_labels(store: FolderStore, source: Path) -> int:
+    """Fold an external label map into the folder's own, newest wins.
+
+    Only 0/1/2 are accepted and every key is resolved against this folder, so a file
+    exported from one machine still applies on another where the paths differ.
+    """
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("expected a JSON object of {path: 0|1|2}")
+    labels = store.load_labels()
+    merged = 0
+    for raw_path, raw_label in payload.items():
+        try:
+            value = int(raw_label)
+        except (TypeError, ValueError):
+            continue
+        if value not in (0, 1, 2):
+            continue
+        candidate = Path(str(raw_path))
+        # Accept a bare filename or a path from another machine: what identifies the
+        # image here is its location in the folder being scanned.
+        resolved = candidate if candidate.is_absolute() and candidate.exists() else store.folder / candidate.name
+        if not resolved.exists():
+            continue
+        labels[str(resolved.resolve())] = value
+        merged += 1
+    if merged:
+        store.save_labels(labels)
+    return merged
+
+
+def _estimate_scan(folder: Path, store: FolderStore) -> int:
+    """Say what a scan would involve without doing any of it.
+
+    --dry-run already covered transfers; there was no equivalent for the scan itself,
+    so the only way to find out how long a folder would take was to start it.
+    """
+    paths = collect_image_paths(folder)
+    if not paths:
+        emit(f"No supported images found in {folder}")
+        return 0
+    cached = 0
+    try:
+        cached = store.cached_path_count(paths)
+    except Exception:  # noqa: BLE001
+        cached = 0
+    labels = store.load_labels()
+    emit(f"Folder:            {folder}")
+    emit(f"Images found:      {len(paths):,}")
+    emit(f"Already embedded:  {cached:,}  (these are read from the cache)")
+    emit(f"Need embedding:    {len(paths) - cached:,}")
+    emit(f"Decisions on file: {len(labels):,}")
+    if cached >= len(paths):
+        emit("Everything is cached, so a scan would only re-rank — expect seconds, not minutes.")
+    else:
+        emit("Embedding is the slow part; the rest of the scan is comparatively quick.")
+    return 0
+
+
 def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
     configure_logging()
     folder = Path(args.folder).expanduser().resolve()
@@ -120,6 +211,18 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         emit(f"Folder does not exist: {folder}")
         return 2
     store = FolderStore(folder)
+    if args.import_labels:
+        try:
+            merged = _merge_labels(store, Path(args.import_labels).expanduser())
+        except (OSError, ValueError) as exc:
+            emit(f"Could not import labels from {args.import_labels}: {exc}")
+            return 2
+        emit(f"Imported {merged} label(s) from {args.import_labels}")
+    if args.estimate:
+        return _estimate_scan(folder, store)
+    if args.rerank and not store.cache_db_path.exists():
+        emit(f"--rerank needs an existing scan cache in {folder}; run a scan first.")
+        return 2
     from .clip_backend import get_backend
     backend = get_backend(config)
     scorer = BikiniScorer(backend, config)
@@ -150,12 +253,21 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
     visible_mask = scorer.state_visibility(state)
     visible_matches = [
         path
-        for path, score, include in zip(state.paths, state.scores, visible_mask, strict=False)
+        for path, score, include in zip(state.paths, state.scores, visible_mask, strict=True)
         if include and float(score) >= threshold
     ]
     visible_match_set = set(visible_matches)
     output = Path(args.output).expanduser() if args.output else folder / f"bikini_results.{args.format}"
     labels = store.load_labels()
+    if args.export_labels:
+        destination = Path(args.export_labels).expanduser()
+        try:
+            atomic_write_json(destination, dict(sorted(labels.items())))
+            emit(f"Wrote {len(labels)} label(s) to {destination}")
+        except OSError as exc:
+            emit(f"Could not write labels to {destination}: {exc}")
+            return 2
+    notes = store.load_notes()
     path_index = {path: index for index, path in enumerate(state.paths)}
     records = []
     for sample in samples:
@@ -174,6 +286,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
                 "zero_shot_score": float(state.zero_shot_scores[state_index] if state_index >= 0 else 0.0),
                 "axis_scores": axes,
                 "label": labels.get(path),
+                "note": notes.get(path, ""),
                 "matched": path in visible_match_set,
                 "bucket": str(sample.get("bucket", "")),
             }
@@ -183,11 +296,13 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         output.write_text(json.dumps({"folder": str(folder), "images": records}, indent=2), encoding="utf-8")
     else:
         with output.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=("path", "filename", "score", "matched", "label"))
+            # "note" travels with the row here for the same reason it does in the GUI
+            # export: a record of the decision without the reasoning is half the answer.
+            writer = csv.DictWriter(handle, fieldnames=("path", "filename", "score", "matched", "label", "note"))
             writer.writeheader()
             for record in records:
                 writer.writerow({key: record[key] for key in writer.fieldnames})
-    scores = {path: float(score) for path, score in zip(state.paths, state.scores, strict=False)}
+    scores = {path: float(score) for path, score in zip(state.paths, state.scores, strict=True)}
     if args.html_report:
         axis_scores = {
             path: {
@@ -204,6 +319,7 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
             scores,
             axis_scores=axis_scores,
             title="Bikini Scanner report",
+            match_threshold=threshold,
         )
         emit(f"HTML report written to {report_path}")
     if args.write_metadata:

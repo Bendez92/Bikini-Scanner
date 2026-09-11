@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import cast
@@ -20,7 +21,7 @@ from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
 from transformers.utils import logging as hf_logging
 
-from .backend_utils import ClipBackendBase, DecodedImage, ImageEmbeddingBackend
+from .backend_utils import ClipBackendBase, DecodedImage, ImageEmbeddingBackend, remember_bounded
 from .config import ScannerConfig
 from .image_formats import register_heif_support
 from .onnx_backend import ClipOnnxBackend
@@ -39,8 +40,10 @@ register_heif_support()
 LOGGER = logging.getLogger(__name__)
 hf_logging.set_verbosity_error()
 _BACKEND_LOAD_LOCK = threading.Lock()
-_TORCH_BACKEND_CACHE: dict[tuple[str, str, str, bool], ClipTorchBackend] = {}
-_ONNX_BACKEND_CACHE: dict[str, ClipOnnxBackend] = {}
+# Bounded, so switching model in Settings and running a high-accuracy refine pass does
+# not leave three CLIP models resident and unreachable for the life of the process.
+_TORCH_BACKEND_CACHE: OrderedDict[tuple[str, str, str, bool], ClipTorchBackend] = OrderedDict()
+_ONNX_BACKEND_CACHE: OrderedDict[str, ClipOnnxBackend] = OrderedDict()
 
 
 @dataclass(slots=True)
@@ -101,6 +104,7 @@ def _load_clip_torch_backend(
     with _BACKEND_LOAD_LOCK:
         cached = _TORCH_BACKEND_CACHE.get(cache_key)
         if cached is not None:
+            _TORCH_BACKEND_CACHE.move_to_end(cache_key)
             return cached
         device_config = ScannerConfig(
             model_name=model_name, device=device_mode, precision=precision_mode, quantize_cpu=quantize_cpu
@@ -135,7 +139,7 @@ def _load_clip_torch_backend(
             active_device_value=device.type,
             active_precision_value=precision,
         )
-        _TORCH_BACKEND_CACHE[cache_key] = backend
+        remember_bounded(_TORCH_BACKEND_CACHE, cache_key, backend)
         return backend
 
 
@@ -143,11 +147,12 @@ def _load_clip_onnx_backend(model_name: str) -> ClipOnnxBackend:
     with _BACKEND_LOAD_LOCK:
         cached = _ONNX_BACKEND_CACHE.get(model_name)
         if cached is not None:
+            _ONNX_BACKEND_CACHE.move_to_end(model_name)
             return cached
         from .onnx_backend import load_onnx_backend
 
         backend = load_onnx_backend(model_name)
-        _ONNX_BACKEND_CACHE[model_name] = backend
+        remember_bounded(_ONNX_BACKEND_CACHE, model_name, backend)
         return backend
 
 
