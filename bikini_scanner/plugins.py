@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +60,17 @@ def apply_plugins(
             if spec is None or spec.loader is None:
                 continue
             module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
+            # Registered before exec_module, and removed again if the module fails to
+            # import. dataclasses, pickle and typing.get_type_hints all resolve a class
+            # back to its module through sys.modules[cls.__module__]; without this a
+            # plugin that used any of them failed with an opaque KeyError that read as
+            # the plugin's own bug.
+            sys.modules[spec.name] = module
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                sys.modules.pop(spec.name, None)
+                raise
             hook = getattr(module, "process_results", None)
             if not callable(hook):
                 LOGGER.warning("Plugin %s has no process_results(state, samples) hook", path)
@@ -68,6 +79,13 @@ def apply_plugins(
             if usable is not None:
                 result = usable
             LOGGER.info("Applied plugin %s", path.name)
+        except SystemExit:
+            # sys.exit() in a plugin is a plugin failure, not a request to end the
+            # program. apply_plugins runs after the scan has finished but before any
+            # results are written, so letting SystemExit through discarded a completed
+            # scan of the whole folder. KeyboardInterrupt is deliberately not caught
+            # here: that one really is the user asking to stop.
+            LOGGER.exception("Plugin %s called sys.exit(); skipping it", path)
         except Exception:
             LOGGER.exception("Skipping failed plugin %s", path)
     return result

@@ -56,8 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="", help="CSV/JSON output file or transfer destination")
     parser.add_argument("--format", choices=("csv", "json"), default="csv", help="Headless result format")
     parser.add_argument("--organization", choices=("flat", "score_band", "label", "score_band_label"), default="flat")
-    parser.add_argument("--copy", action="store_true", help="Copy matches to the output destination")
-    parser.add_argument("--move", action="store_true", help="Move matches to the output destination")
+    # Mutually exclusive at the parser, not at the transfer step. The conflict used to
+    # be caught inside the transfer block, which runs *after* --write-metadata has
+    # already written keyword tags into the user's originals -- so an invocation that
+    # was rejected as a usage error had still modified their files on the way to
+    # exiting 2.
+    transfer_mode = parser.add_mutually_exclusive_group()
+    transfer_mode.add_argument("--copy", action="store_true", help="Copy matches to the output destination")
+    transfer_mode.add_argument("--move", action="store_true", help="Move matches to the output destination")
     parser.add_argument("--html-report", default="", help="Write an HTML report to this path")
     parser.add_argument(
         "--dry-run", action="store_true", help="Print the transfer plan without copying or moving files"
@@ -129,16 +135,14 @@ def main_onnx(argv: list[str] | None = None, config_override: ScannerConfig | No
     config.backend = "clip-onnx"
     if "--headless" in args:
         return main(args, config_override=config, enforced_backend="clip-onnx")
-    folder = ""
-    threshold = None
-    if "--folder" in args:
-        index = args.index("--folder")
-        if index + 1 < len(args):
-            folder = args[index + 1]
-    if "--threshold" in args:
-        index = args.index("--threshold")
-        if index + 1 < len(args):
-            threshold = float(args[index + 1])
+    # Parsed by build_parser rather than by hand. Scanning argv for "--folder" and
+    # taking the next token treated a following flag as the value, so
+    # `--folder --threshold 0.5` opened a folder literally named "--threshold" and
+    # dropped the threshold, and the bare float() turned a typo into a traceback
+    # instead of argparse's usage message.
+    parsed = build_parser().parse_args(args)
+    folder = parsed.folder
+    threshold = parsed.threshold
     from .gui import launch_gui
 
     launch_gui(config=config, initial_folder=folder, initial_threshold=threshold)
@@ -326,9 +330,6 @@ def run_headless(args: argparse.Namespace, config: ScannerConfig) -> int:
         written = sum(1 for path in visible_matches if write_image_metadata(path, "bikini", score=scores.get(path)))
         emit(f"Metadata written to {written}/{len(visible_matches)} matched files.")
     if args.copy or args.move or args.dry_run:
-        if args.copy and args.move:
-            emit("Choose only one of --copy or --move")
-            return 2
         options = OutputOptions(organization=args.organization)
         plan = build_transfer_plan(visible_matches, output.parent / "matches", scores, labels, options, move=args.move)
         if args.dry_run:

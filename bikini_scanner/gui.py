@@ -86,7 +86,13 @@ from .scorer import (
     scan_and_score_folder,
     state_disagreement,
 )
-from .store import MATCHES_DIR_NAME, SUPPORTED_IMAGE_SUFFIXES, FolderStore, collect_image_paths
+from .store import (
+    MATCHES_DIR_NAME,
+    SUPPORTED_IMAGE_SUFFIXES,
+    FolderStore,
+    collect_image_paths,
+    is_scanner_owned_directory,
+)
 from .update_checker import check_for_update
 from .user_prefs import load_user_prefs, prefs_path, save_user_prefs
 from .vlm_backend import is_local_endpoint
@@ -442,6 +448,11 @@ class BikiniScannerApp:
         self._watch_notice_var = StringVar(value="")
         self._watch_snapshot: dict[str, tuple[int, int]] = {}
         self._watch_after_id: str | None = None
+        # Guards the snapshot walk so only one runs at a time. The walk is a full
+        # recursive stat of the folder and now happens on a worker thread; without this
+        # a slow walk on a large folder would have a second one stacked on top of it
+        # every five seconds.
+        self._watch_walk_active = False
         self._hardware_after_id: str | None = None
         self.store: FolderStore | None = None
         self.backend: ImageEmbeddingBackend | None = None
@@ -2888,7 +2899,7 @@ class BikiniScannerApp:
     def _toggle_watch_mode(self) -> None:
         if self.watch_enabled_var.get():
             if self.current_state is not None:
-                self._watch_snapshot = self._collect_watch_snapshot()
+                self._capture_watch_baseline()
             self._schedule_watch_poll()
             self._watch_notice_var.set(f"Watching {Path(self.folder_var.get()).name or 'this folder'}")
             self._refresh_watch_badge()
@@ -2937,7 +2948,9 @@ class BikiniScannerApp:
                     entry_path = Path(entry.path)
                     try:
                         if entry.is_dir(follow_symlinks=False):
-                            if entry_path not in {cache_dir, matches_dir}:
+                            # Same predicate the scan uses, so the watcher and the
+                            # scanner agree on which directories are ours.
+                            if not is_scanner_owned_directory(entry_path, cache_dir, matches_dir):
                                 pending.append(entry_path)
                             continue
                         if not entry.is_file(follow_symlinks=False):
@@ -2950,6 +2963,41 @@ class BikiniScannerApp:
                     snapshot[str(entry_path.resolve())] = (stat.st_mtime_ns, stat.st_size)
         return snapshot
 
+    def _capture_watch_baseline(self) -> None:
+        """Refresh the comparison baseline without blocking the UI."""
+        self._run_watch_walk(compare=False)
+
+    def _run_watch_walk(self, *, compare: bool) -> None:
+        """Walk the folder on a worker thread and hand the result back to the UI thread.
+
+        The walk is a full recursive scandir with a stat and a resolve per image. Run
+        inline on a 5-second timer it froze the window on every tick of a large folder,
+        which is the same cost _count_images_then_scan is threaded to avoid.
+        """
+        if self._closing or self.store is None or self._watch_walk_active:
+            return
+        self._watch_walk_active = True
+
+        def worker() -> None:
+            try:
+                snapshot = self._collect_watch_snapshot()
+            except Exception:
+                LOGGER.exception("Watch snapshot failed")
+                self._after(0, self._finish_watch_walk, None, compare)
+                return
+            self._after(0, self._finish_watch_walk, snapshot, compare)
+
+        threading.Thread(target=worker, name="watch-snapshot", daemon=True).start()
+
+    def _finish_watch_walk(self, snapshot: dict[str, tuple[int, int]] | None, compare: bool) -> None:
+        self._watch_walk_active = False
+        if self._closing or snapshot is None:
+            return
+        if not compare:
+            self._watch_snapshot = snapshot
+            return
+        self._compare_watch_snapshot(snapshot)
+
     def _watch_poll(self) -> None:
         self._watch_after_id = None
         if not self.watch_enabled_var.get() or self.queue_active or self._scan_active or self.current_state is None:
@@ -2958,10 +3006,14 @@ class BikiniScannerApp:
         if self.store is None:
             self._schedule_watch_poll()
             return
-        try:
-            current_snapshot = self._collect_watch_snapshot()
-        except Exception:  # noqa: BLE001
-            self._schedule_watch_poll()
+        self._run_watch_walk(compare=True)
+        self._schedule_watch_poll()
+
+    def _compare_watch_snapshot(self, current_snapshot: dict[str, tuple[int, int]]) -> None:
+        # Re-checked on the UI thread: a scan or a queue run can have started while the
+        # walk was in flight, and rescanning on top of one of those is exactly what the
+        # guard in _watch_poll exists to prevent.
+        if not self.watch_enabled_var.get() or self.queue_active or self._scan_active or self.current_state is None:
             return
         if current_snapshot != self._watch_snapshot:
             added = len(set(current_snapshot) - set(self._watch_snapshot))
@@ -2982,7 +3034,6 @@ class BikiniScannerApp:
             self.status_var.set(f"Watch folder: {change}. Rescanning...")
             self.root.bell()
             self.open_folder(self.folder_var.get(), scan=True)
-        self._schedule_watch_poll()
 
     def _on_close(self) -> None:
         self._closing = True
@@ -4170,7 +4221,12 @@ class BikiniScannerApp:
     def _reveal_command(path: Path) -> list[str]:
         resolved = path.resolve()
         if platform.system() == "Windows":
-            return ["explorer", "/select,", str(resolved)]
+            # One token, not two. Explorer parses "/select,<path>" as a single argument;
+            # passing the flag and the path separately puts a space (and, for any path
+            # containing one, a pair of quotes) between them, which Explorer does not
+            # recognise -- it silently opened a default location instead of selecting
+            # the photo, and because Popen still succeeded nothing reported the failure.
+            return ["explorer", f"/select,{resolved}"]
         if platform.system() == "Darwin":
             return ["open", "-R", str(resolved)]
         return ["xdg-open", str(resolved.parent)]
@@ -6139,7 +6195,7 @@ class BikiniScannerApp:
                 self._refresh_displayed_results(reset_page=False)
             self._update_stats_panel(record_history=True)
             self._save_last_folder(self.folder_var.get().strip())
-            self._watch_snapshot = self._collect_watch_snapshot()
+            self._capture_watch_baseline()
             self._refresh_hardware_status()
             self.status_var.set(
                 f"Resumed where you left off — page {self.page_index + 1}. {self._progress_note()}".strip()
@@ -6164,7 +6220,7 @@ class BikiniScannerApp:
         # from state.paths instead left out every file the scan skipped as unreadable,
         # so a folder with one corrupt image looked "changed" on every single poll and
         # rescanned itself forever.
-        self._watch_snapshot = self._collect_watch_snapshot()
+        self._capture_watch_baseline()
         if full_rescan:
             self._record_folder_history(len(state.paths), matches)
         if full_rescan and self._scan_start_monotonic is not None and state.paths:

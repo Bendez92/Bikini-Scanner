@@ -81,7 +81,15 @@ IGNORE_MARKER_FILENAME = ".bikini_scanner_ignore"
 LOGGER = logging.getLogger(__name__)
 
 
-def _is_scanner_owned_directory(path: Path, cache_dir: Path, matches_dir: Path) -> bool:
+def is_scanner_owned_directory(path: Path, cache_dir: Path, matches_dir: Path) -> bool:
+    """Whether a directory holds the scanner's own output rather than the user's photos.
+
+    Public because the GUI's watch-mode snapshot has to prune exactly what a scan prunes.
+    When the watcher only excluded the two well-known directory names, a transfer into
+    any other scanner-owned directory (the destination is built from a user-chosen output
+    path, and output_ops marks it with IGNORE_MARKER_FILENAME) looked like the folder had
+    changed, so every copy cost a spurious full rescan.
+    """
     return path in (cache_dir, matches_dir) or (path / IGNORE_MARKER_FILENAME).is_file()
 
 
@@ -93,14 +101,14 @@ def collect_image_paths(folder: str | Path) -> list[Path]:
     paths: list[Path] = []
     for parent, dirnames, filenames in os.walk(root):
         parent_path = Path(parent)
-        if _is_scanner_owned_directory(parent_path, cache_dir, matches_dir):
+        if is_scanner_owned_directory(parent_path, cache_dir, matches_dir):
             dirnames.clear()
             continue
         # Prune ignored and app-owned child directories in place so they are never descended.
         kept: list[str] = []
         for name in dirnames:
             child = parent_path / name
-            if _is_scanner_owned_directory(child, cache_dir, matches_dir):
+            if is_scanner_owned_directory(child, cache_dir, matches_dir):
                 continue
             kept.append(name)
         dirnames[:] = kept

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 from collections import OrderedDict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from PIL import Image
 
-from .backend_utils import DecodedImage, iter_decoded_image_batches, remember_bounded
+from .backend_utils import ClipBackendBase, remember_bounded
 from .config import DEFAULT_MODEL_NAME, REPO_ROOT, ScannerConfig
 from .image_formats import register_heif_support
 
@@ -35,21 +35,20 @@ def onnx_model_dir() -> Path:
 
 
 @dataclass(slots=True)
-class ClipOnnxBackend:
+class ClipOnnxBackend(ClipBackendBase):
+    """The ONNX backend, sharing the batching and normalisation the torch one uses.
+
+    It used to redeclare embed_images, embed_pil_images and iter_image_batches
+    character-for-character from ClipBackendBase because it did not inherit from it, so
+    a fix to the batching path landed in one backend and not the other.
+    """
+
     processor: CLIPProcessor
     vision_session: Any
     text_session: Any
     image_embedding_dim_value: int
     active_device_value: str = "cpu"
     active_precision_value: str = "fp32"
-
-    @property
-    def active_device(self) -> str:
-        return self.active_device_value
-
-    @property
-    def active_precision(self) -> str:
-        return self.active_precision_value
 
     @property
     def image_embedding_dim(self) -> int:
@@ -95,24 +94,6 @@ class ClipOnnxBackend:
         output = self.vision_session.run(None, {"pixel_values": pixel_values})[0]
         output = self._normalize(output)
         return [row.astype(np.float32) for row in output]
-
-    def embed_images(self, paths: Sequence[str | Path], batch_size: int = 16) -> np.ndarray:
-        embeddings: list[np.ndarray] = []
-        for batch in self.iter_image_batches(paths, batch_size=batch_size):
-            valid_images = [record.image for record in batch if record.image is not None]
-            if valid_images:
-                embeddings.append(self.embed_pil_images(valid_images))
-        if not embeddings:
-            return np.empty((0, self.image_embedding_dim), dtype=np.float32)
-        return np.vstack(embeddings).astype(np.float32)
-
-    def embed_pil_images(self, images: Sequence[Image.Image]) -> np.ndarray:
-        if not images:
-            return np.empty((0, self.image_embedding_dim), dtype=np.float32)
-        return np.vstack(self._embed_image_batch(images)).astype(np.float32)
-
-    def iter_image_batches(self, paths: Iterable[str | Path], batch_size: int = 16) -> Iterator[list[DecodedImage]]:
-        yield from iter_decoded_image_batches(paths, batch_size=batch_size)
 
     def embed_texts(self, prompts: Sequence[str]) -> np.ndarray:
         # The exported text graph fixes the sequence axis at model_max_length,

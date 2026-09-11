@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import inspect
 import io
 import json
 import logging
@@ -4485,6 +4486,180 @@ class DetailWeightsMustScoreSomething(unittest.TestCase):
     def test_a_non_finite_weight_is_dropped(self) -> None:
         config = ScannerConfig.from_mapping({"detail_weights": {"bikini": float("nan"), "midriff": 0.5}})
         self.assertEqual(config.detail_weights, {"midriff": 0.5})
+
+
+class HeadlessArgumentSafety(unittest.TestCase):
+    """The CLI must reject a contradictory invocation before it touches a file."""
+
+    def test_copy_and_move_are_rejected_at_parse_time(self) -> None:
+        """--write-metadata rewrites the user's originals, and it runs first.
+
+        The conflict used to be caught inside the transfer block, which is reached only
+        after write_image_metadata has already tagged every match, so an invocation
+        rejected as a usage error had still modified the user's files on its way out.
+        """
+        parser = run_module.build_parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            parser.parse_args(["--headless", "--folder", "x", "--write-metadata", "--copy", "--move"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_either_transfer_mode_alone_is_still_accepted(self) -> None:
+        parser = run_module.build_parser()
+        self.assertTrue(parser.parse_args(["--copy"]).copy)
+        self.assertTrue(parser.parse_args(["--move"]).move)
+
+    def test_a_flag_is_not_taken_as_a_folder_name(self) -> None:
+        """main_onnx used to scan argv by hand and take the next token as the value."""
+        parser = run_module.build_parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["--folder", "--threshold", "0.5"])
+
+    def test_a_bad_threshold_is_a_usage_error_not_a_traceback(self) -> None:
+        parser = run_module.build_parser()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            parser.parse_args(["--threshold", "not-a-number"])
+        self.assertEqual(caught.exception.code, 2)
+
+
+class PluginIsolation(unittest.TestCase):
+    """A plugin is third-party code; failing must cost the plugin, not the scan."""
+
+    def setUp(self) -> None:
+        from bikini_scanner import plugins
+
+        self.plugins = plugins
+        self.directory = plugins.plugins_dir()
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def _write(self, name: str, body: str) -> None:
+        script = self.directory / name
+        script.write_text(body, encoding="utf-8")
+        self.addCleanup(script.unlink, True)
+
+    def test_sys_exit_in_a_plugin_does_not_end_the_run(self) -> None:
+        """apply_plugins runs after the scan and before anything is written.
+
+        SystemExit is not an Exception, so it escaped the handler and took a completed
+        scan of the whole folder with it before any result reached disk.
+        """
+        self._write("quits.py", "import sys\ndef process_results(state, samples):\n    sys.exit(3)\n")
+        samples = [{"path": "/a.jpg"}]
+        result = self.plugins.apply_plugins(None, list(samples), enabled=True)
+        self.assertEqual(result, samples)
+
+    def test_a_plugin_using_dataclasses_and_pickle_works(self) -> None:
+        """Both resolve a class through sys.modules[cls.__module__].
+
+        The loader never registered the module there, so any plugin using them died
+        with a KeyError that read as the plugin author's own bug.
+        """
+        self._write(
+            "typed.py",
+            "import dataclasses, pickle\n"
+            "@dataclasses.dataclass\n"
+            "class Marker:\n"
+            "    n: int = 1\n"
+            "def process_results(state, samples):\n"
+            "    pickle.loads(pickle.dumps(Marker(2)))\n"
+            "    return list(samples) + [{'path': '/from-plugin.jpg'}]\n",
+        )
+        result = self.plugins.apply_plugins(None, [{"path": "/a.jpg"}], enabled=True)
+        self.assertIn("/from-plugin.jpg", [str(entry["path"]) for entry in result])
+
+    def test_a_plugin_that_fails_to_import_is_not_left_in_sys_modules(self) -> None:
+        self._write("explodes.py", "raise RuntimeError('boom')\n")
+        self.plugins.apply_plugins(None, [{"path": "/a.jpg"}], enabled=True)
+        self.assertNotIn("bikini_scanner_plugin_explodes", sys.modules)
+
+
+class ScannerOwnedDirectories(unittest.TestCase):
+    """Watch mode and the scan must agree on which directories are the scanner's."""
+
+    def test_a_marked_directory_is_owned_whatever_it_is_called(self) -> None:
+        """The transfer destination is built from a user-chosen output path.
+
+        Watch mode used to exclude only the two well-known names, so a copy into any
+        other marked directory looked like the folder had changed and cost a full
+        spurious rescan on every transfer.
+        """
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        exported = root / "exports" / "matches"
+        exported.mkdir(parents=True)
+        (exported / store_module.IGNORE_MARKER_FILENAME).touch()
+        self.assertTrue(
+            store_module.is_scanner_owned_directory(
+                exported, root / ".bikini_scanner_cache", root / store_module.MATCHES_DIR_NAME
+            )
+        )
+
+    def test_an_ordinary_photo_directory_is_not_owned(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        holiday = root / "holiday"
+        holiday.mkdir()
+        self.assertFalse(
+            store_module.is_scanner_owned_directory(
+                holiday, root / ".bikini_scanner_cache", root / store_module.MATCHES_DIR_NAME
+            )
+        )
+
+
+class BackendSurfaceIsShared(unittest.TestCase):
+    """The ONNX backend must inherit the batching path, not carry a second copy."""
+
+    def test_onnx_backend_inherits_rather_than_duplicates(self) -> None:
+        """Three methods were character-for-character copies of the base class.
+
+        A fix to the shared batching path landed in one backend and not the other.
+        """
+        from bikini_scanner.backend_utils import ClipBackendBase
+        from bikini_scanner.onnx_backend import ClipOnnxBackend
+
+        self.assertTrue(issubclass(ClipOnnxBackend, ClipBackendBase))
+        duplicated = set(ClipOnnxBackend.__dict__) & {
+            "embed_images",
+            "embed_pil_images",
+            "iter_image_batches",
+        }
+        self.assertEqual(duplicated, set())
+
+
+class RevealInFileManager(unittest.TestCase):
+    """Explorer parses the select flag and the path as a single argument."""
+
+    def test_windows_select_flag_and_path_are_one_token(self) -> None:
+        """Passing them separately put a space between them, so Explorer ignored the
+        select request and opened a default location, and Popen still succeeded so
+        nothing reported the failure.
+        """
+        import platform
+
+        if platform.system() != "Windows":
+            self.skipTest("Windows-only argument form")
+        command = gui_module.BikiniScannerApp._reveal_command(Path("C:/My Photos/a.jpg"))
+        self.assertEqual(len(command), 2)
+        self.assertTrue(command[1].startswith("/select,"))
+
+
+class WatchModeStaysOffTheUiThread(unittest.TestCase):
+    """The snapshot walk is a full recursive stat of the folder.
+
+    Run inline on a five-second timer it froze the window on every tick of a large
+    folder, which is the cost _count_images_then_scan is already threaded to avoid.
+    """
+
+    def test_the_poll_hands_the_walk_to_a_worker(self) -> None:
+        app = gui_module.BikiniScannerApp
+        self.assertTrue(hasattr(app, "_run_watch_walk"))
+        self.assertTrue(hasattr(app, "_compare_watch_snapshot"))
+        source = inspect.getsource(app._watch_poll)
+        self.assertNotIn("_collect_watch_snapshot()", source)
+        self.assertIn("_run_watch_walk", source)
+
+    def test_the_walk_does_not_stack_on_a_slow_folder(self) -> None:
+        source = inspect.getsource(gui_module.BikiniScannerApp._run_watch_walk)
+        self.assertIn("_watch_walk_active", source)
 
 
 class PluginReturnValues(unittest.TestCase):
