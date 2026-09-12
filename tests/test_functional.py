@@ -108,6 +108,53 @@ def _make_images(folder: Path, count: int = IMAGE_COUNT) -> list[Path]:
     return paths
 
 
+def _make_distinct_images(folder: Path, count: int) -> list[Path]:
+    """`_make_images` without its byte-identical copy, for fixtures that count files."""
+    paths = _make_images(folder, count=count)
+    duplicate = folder / "duplicate_of_00.jpg"
+    duplicate.unlink()
+    return [path for path in paths if path != duplicate]
+
+
+class _GuiTestCase(unittest.TestCase):
+    """Shared Tk lifecycle for the GUI tests.
+
+    Tk binds every PhotoImage to whichever interpreter was the default root when it
+    was created. Several GUI test classes in one process each build their own root,
+    and the stale default left behind by the previous class made every thumbnail
+    render die with 'image "pyimageN" does not exist', so the default is repointed at
+    the root this class actually uses.
+    """
+
+    def _start_gui(self):
+        tkinter = __import__("tkinter")
+        try:
+            root = tkinter.Tk()
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"no display available: {exc}")
+        tkinter._default_root = root
+        return root
+
+    def _stop_gui(self, root) -> None:
+        root.destroy()
+        __import__("tkinter")._default_root = None
+
+
+class _AlwaysVisibleScorer:
+    """Stand-in scorer for GUI tests: nothing is gated, nothing is rescored."""
+
+    config = ScannerConfig()
+
+    def state_visibility(self, state):
+        return np.ones((len(state.paths),), dtype=bool)
+
+    def label_counts(self, labels):
+        return {"good": 0, "bad": 0, "skip": 0, "unlabeled": 0}
+
+    def estimate_quality(self, embeddings, labels):
+        return None
+
+
 def _use_real_backend() -> bool:
     return os.environ.get("BIKINI_SCANNER_REAL_BACKEND", "").strip().lower() in {"1", "true", "yes"}
 
@@ -584,15 +631,11 @@ class ScanProgressReporting(unittest.TestCase):
         self.assertTrue(calls, "the legacy progress signature was never called")
 
 
-class GuiConcurrency(unittest.TestCase):
+class GuiConcurrency(_GuiTestCase):
     """Labelling a run of photos must not start a background pass per click."""
 
     def setUp(self) -> None:
-        tkinter = __import__("tkinter")
-        try:
-            self.root = tkinter.Tk()
-        except Exception as exc:  # noqa: BLE001
-            self.skipTest(f"no display available: {exc}")
+        self.root = self._start_gui()
         from bikini_scanner import gui as gui_module
 
         for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
@@ -633,7 +676,7 @@ class GuiConcurrency(unittest.TestCase):
     def tearDown(self) -> None:
         self.gate.set()
         self.app._closing = True
-        self.root.destroy()
+        self._stop_gui(self.root)
         shutil.rmtree(self.folder, ignore_errors=True)
 
     def test_repeated_retrains_do_not_stack_threads(self) -> None:
@@ -673,6 +716,390 @@ class GuiConcurrency(unittest.TestCase):
         first = self.app._scan_cancel_event
         self.app.update_algorithm()
         self.assertIs(self.app._scan_cancel_event, first, "Stop would no longer reach the running pass")
+
+
+class ReviewWorkflow(_GuiTestCase):
+    """The detected list has to stay legible while decisions are being made.
+
+    Retraining after every click re-ranks the whole folder, so the detected count moved
+    under the reviewer mid-review. These cover the three things that fixed it: honest
+    reviewed/left counts, hiding what is already decided, and batching the retrain.
+    """
+
+    def setUp(self) -> None:
+        self.root = self._start_gui()
+        from bikini_scanner import gui as gui_module
+
+        self.gui_module = gui_module
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_review_"))
+        _make_images(self.folder, count=6)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app._set_folder(str(self.folder))
+        self.app.backend = object()
+        self.app._ensure_scorer = lambda: True
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+        self.app.current_state = scorer_module.ScoreState(
+            paths=self.paths,
+            embeddings=np.zeros((len(self.paths), 4), dtype=np.float32),
+            zero_shot_scores=np.full(len(self.paths), 0.9, dtype=np.float32),
+            scores=np.full(len(self.paths), 0.9, dtype=np.float32),
+            axis_scores={"bikini": np.full(len(self.paths), 0.9, dtype=np.float32)},
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(len(self.paths), dtype=bool),
+        )
+
+        self.app.scorer = _AlwaysVisibleScorer()
+        self.app.threshold_var.set(0.35)
+        # Count retrains without running any: every one of these tests is about when a
+        # pass is launched, not what it computes.
+        self.launches: list[bool] = []
+
+        def _fake_launch(full_rescan: bool) -> None:
+            # Same book-keeping the real launcher does before it starts the thread, so
+            # the waiting-decisions counter behaves as it would in the app.
+            self.app._note_pass_started(full_rescan)
+            self.launches.append(full_rescan)
+
+        self.app._launch_background_scan = _fake_launch
+        self.app.show_detected_files()
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self._stop_gui(self.root)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def _label(self, index: int, value: int = 1) -> None:
+        self.app.set_label(self.paths[index], value)
+
+    def test_the_status_line_says_how_much_is_left(self) -> None:
+        self.assertIn(f"{len(self.paths)} detected", self.app.status_var.get())
+        self.assertIn("0 reviewed", self.app.status_var.get())
+        self.app.retrain_mode_var.set("manual")
+        self._label(0)
+        self.app.show_detected_files()
+        text = self.app.status_var.get()
+        self.assertIn("1 reviewed", text)
+        self.assertIn(f"{len(self.paths) - 1} left", text)
+
+    def test_the_total_does_not_move_when_reviewed_photos_are_hidden(self) -> None:
+        self.app.retrain_mode_var.set("manual")
+        self.app.hide_reviewed_var.set(True)
+        self._label(0)
+        self._label(1)
+        self.assertEqual(len(self.app._detected_samples()), len(self.paths) - 2, "the list did not drain")
+        total, reviewed, remaining = self.app._detected_progress()
+        self.assertEqual(total, len(self.paths), "hiding reviewed photos changed the total")
+        self.assertEqual(reviewed, 2)
+        self.assertEqual(remaining, len(self.paths) - 2)
+
+    def test_reviewed_photos_stay_listed_when_hiding_is_off(self) -> None:
+        self.app.retrain_mode_var.set("manual")
+        self.app.hide_reviewed_var.set(False)
+        self._label(0)
+        self.assertEqual(len(self.app._detected_samples()), len(self.paths))
+
+    def test_batch_mode_retrains_once_per_batch(self) -> None:
+        self.app.retrain_mode_var.set("batch")
+        self.app.retrain_batch_size_var.set(3)
+        self._label(0)
+        self._label(1)
+        self.assertEqual(self.launches, [], "a partial batch started a retrain")
+        self.assertEqual(self.app._labels_since_retrain, 2)
+        self._label(2)
+        self.assertEqual(self.launches, [False], "the full batch did not start exactly one retrain")
+
+    def test_manual_mode_only_retrains_when_asked(self) -> None:
+        self.app.retrain_mode_var.set("manual")
+        for index in range(4):
+            self._label(index)
+        self.assertEqual(self.launches, [], "a decision retrained on its own in manual mode")
+        self.assertEqual(self.app._labels_since_retrain, 4)
+        self.app.apply_learning_now()
+        self.assertEqual(self.launches, [False])
+
+    def test_instant_mode_still_retrains_on_every_decision(self) -> None:
+        self.app.retrain_mode_var.set("instant")
+        self._label(0)
+        self._label(1)
+        self.assertEqual(self.launches, [False, False], "instant mode stopped retraining per decision")
+        self.assertEqual(self.app._labels_since_retrain, 0)
+
+    def test_a_finished_pass_clears_the_waiting_decisions(self) -> None:
+        self.app.retrain_mode_var.set("batch")
+        self.app.retrain_batch_size_var.set(2)
+        self._label(0)
+        self._label(1)
+        self.assertEqual(self.launches, [False])
+        self.assertEqual(self.app._labels_since_retrain, 0, "decisions stayed queued after being applied")
+        self._label(2)
+        self.assertEqual(self.launches, [False], "the next batch started early")
+        self.assertEqual(self.app._labels_since_retrain, 1)
+
+    def test_the_apply_learning_prompt_follows_the_waiting_count(self) -> None:
+        self.app.retrain_mode_var.set("manual")
+        self.assertFalse(self.app._apply_learning_shown, "the prompt was showing with nothing waiting")
+        self._label(0)
+        self.assertTrue(self.app._apply_learning_shown, "a waiting decision did not raise the prompt")
+        self.assertIn("(1)", self.app.apply_learning_button.cget("text"))
+        self.app.apply_learning_now()
+        self.assertFalse(self.app._apply_learning_shown, "the prompt stayed up after being applied")
+
+    def test_a_grown_count_explains_itself(self) -> None:
+        """The question that started all this: why does the number go up mid-review?"""
+        self.app._detected_before_retrain = len(self.paths) - 2
+        note = self.app._detected_delta_note()
+        self.assertIn("+2 newly detected", note)
+        self.assertEqual(self.app._detected_delta_note(), "", "the note repeated on the next listing")
+
+    def test_a_shrunk_count_explains_itself(self) -> None:
+        self.app._detected_before_retrain = len(self.paths) + 3
+        self.assertIn("3 no longer detected", self.app._detected_delta_note())
+
+
+class GroupDecisions(_GuiTestCase):
+    """One decision should carry to photos that carry the same detection.
+
+    Grouping is deliberately narrow: near-identical picture AND the same thing
+    detected in it. A burst of the same bikini shot is one decision; two different
+    detections that happen to look alike are not.
+    """
+
+    def setUp(self) -> None:
+        self.root = self._start_gui()
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_group_"))
+        _make_distinct_images(self.folder, count=4)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app._set_folder(str(self.folder))
+        self.app.backend = object()
+        self.app._ensure_scorer = lambda: True
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+        self.assertEqual(len(self.paths), 4)
+        # 0 and 1 are the same shot twice; 2 looks like them but the scanner saw
+        # something else in it; 3 is an unrelated picture with the same detection.
+        embeddings = np.array(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.99, 0.14, 0.0, 0.0],
+                [0.99, 0.14, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        self.app.current_state = scorer_module.ScoreState(
+            paths=self.paths,
+            embeddings=embeddings,
+            zero_shot_scores=np.full(4, 0.9, dtype=np.float32),
+            scores=np.array([0.9, 0.9, 0.9, 0.9], dtype=np.float32),
+            axis_scores={
+                # Evidence = (score - 0.5) * 2, so 0.95 is strong and 0.50 is nothing.
+                "bikini": np.array([0.95, 0.95, 0.50, 0.95], dtype=np.float32),
+                "nsfw": np.array([0.50, 0.50, 0.95, 0.50], dtype=np.float32),
+            },
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(4, dtype=bool),
+        )
+        self.app.scorer = _AlwaysVisibleScorer()
+        self.app.threshold_var.set(0.35)
+        self.app.retrain_mode_var.set("manual")
+        # Set explicitly rather than trusting the defaults: these are saved to the user
+        # preferences file, which is shared by every test in this process, so a test
+        # that switches one off would otherwise leak into the next one.
+        self.app.group_apply_var.set(True)
+        self.app.group_similarity_var.set(0.94)
+        self.launches: list[bool] = []
+
+        def _fake_launch(full_rescan: bool) -> None:
+            self.app._note_pass_started(full_rescan)
+            self.launches.append(full_rescan)
+
+        self.app._launch_background_scan = _fake_launch
+        self.app.show_detected_files()
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self._stop_gui(self.root)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def _labels(self) -> dict[str, int]:
+        return self.app.store.load_labels()
+
+    def test_deciding_on_a_photo_decides_its_near_twins(self) -> None:
+        self.app.set_label(self.paths[0], 1)
+        labels = self._labels()
+        self.assertEqual(labels.get(self.paths[0]), 1)
+        self.assertEqual(labels.get(self.paths[1]), 1, "the second shot of the same photo was not carried along")
+
+    def test_a_different_detection_is_not_grouped(self) -> None:
+        """Looks the same, but the scanner saw something else in it."""
+        self.app.set_label(self.paths[0], 1)
+        self.assertIsNone(self._labels().get(self.paths[2]), "a different detection was swept up by the group")
+
+    def test_a_different_picture_is_not_grouped(self) -> None:
+        """Same detection, but nothing like the same photo."""
+        self.app.set_label(self.paths[0], 1)
+        self.assertIsNone(self._labels().get(self.paths[3]), "an unrelated picture was swept up by the group")
+
+    def test_a_group_never_overwrites_a_decision_you_made(self) -> None:
+        self.app.set_label(self.paths[1], 0)
+        self.app.set_label(self.paths[0], 1)
+        self.assertEqual(self._labels().get(self.paths[1]), 0, "the group overwrote a decision already made")
+
+    def test_the_whole_group_undoes_as_one_action(self) -> None:
+        self.app.set_label(self.paths[0], 1)
+        self.app.undo_last_label()
+        labels = self._labels()
+        self.assertIsNone(labels.get(self.paths[0]))
+        self.assertIsNone(labels.get(self.paths[1]), "undo left the carried-along photo labeled")
+
+    def test_a_group_counts_as_one_decision_towards_the_batch(self) -> None:
+        self.app.retrain_mode_var.set("batch")
+        self.app.retrain_batch_size_var.set(2)
+        self.app.set_label(self.paths[0], 1)
+        self.assertEqual(self.launches, [], "a two-photo group spent the whole batch on one decision")
+        self.assertEqual(self.app._labels_since_retrain, 1)
+
+    def test_grouping_can_be_turned_off(self) -> None:
+        self.app.group_apply_var.set(False)
+        self.app.set_label(self.paths[0], 1)
+        self.assertIsNone(self._labels().get(self.paths[1]), "grouping applied while switched off")
+
+    def test_the_status_line_says_what_was_carried_along(self) -> None:
+        self.app.set_label(self.paths[0], 1)
+        self.assertIn("1 similar", self.app.status_var.get())
+
+
+class BucketActions(_GuiTestCase):
+    """Whole buckets are often uniformly right or wrong; deciding one at a time is waste."""
+
+    def setUp(self) -> None:
+        self.root = self._start_gui()
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_bucket_"))
+        _make_distinct_images(self.folder, count=4)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app._set_folder(str(self.folder))
+        self.app.backend = object()
+        self.app._ensure_scorer = lambda: True
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+        self.app.current_state = scorer_module.ScoreState(
+            paths=self.paths,
+            embeddings=np.eye(4, dtype=np.float32),
+            zero_shot_scores=np.full(4, 0.9, dtype=np.float32),
+            # Two either side of the 0.5 threshold used below, at differing distances.
+            scores=np.array([0.95, 0.55, 0.45, 0.10], dtype=np.float32),
+            axis_scores={
+                "bikini": np.array([0.95, 0.95, 0.50, 0.50], dtype=np.float32),
+                "nsfw": np.array([0.50, 0.50, 0.95, 0.95], dtype=np.float32),
+            },
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(4, dtype=bool),
+        )
+        self.app.scorer = _AlwaysVisibleScorer()
+        self.app.threshold_var.set(0.05)
+        self.app.retrain_mode_var.set("manual")
+        self.app.group_apply_var.set(False)
+        self.app._launch_background_scan = lambda full_rescan: None
+        self.app.show_detected_files()
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self._stop_gui(self.root)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_a_bucket_action_only_touches_that_bucket(self) -> None:
+        self.app.label_bucket("Bikini", 0, confirm=False)
+        labels = self.app.store.load_labels()
+        self.assertEqual(labels.get(self.paths[0]), 0)
+        self.assertEqual(labels.get(self.paths[1]), 0)
+        self.assertIsNone(labels.get(self.paths[2]), "a photo from another bucket was labeled")
+        self.assertIsNone(labels.get(self.paths[3]), "a photo from another bucket was labeled")
+
+    def test_a_bucket_action_leaves_decisions_you_already_made(self) -> None:
+        self.app.set_label(self.paths[0], 1)
+        self.app.label_bucket("Bikini", 0, confirm=False)
+        self.assertEqual(self.app.store.load_labels().get(self.paths[0]), 1, "a bucket action overrode a decision")
+
+    def test_hardest_first_sort_leads_with_the_threshold_band(self) -> None:
+        self.app.threshold_var.set(0.5)
+        self.app.sort_var.set("uncertainty")
+        self.app.show_detected_files()
+        order = [str(sample["path"]) for sample in self.app.displayed_samples]
+        # 0.55 is a hair above the 0.5 threshold; 0.95 is the surest thing in the folder.
+        self.assertEqual(order[0], self.paths[1], "the most uncertain photo was not first")
+        self.assertEqual(order[-1], self.paths[0], "the surest photo was not last")
+
+
+class DuplicateDecisions(_GuiTestCase):
+    """Byte-identical files leave no judgement to make, so they always move together."""
+
+    def setUp(self) -> None:
+        self.root = self._start_gui()
+        from bikini_scanner import gui as gui_module
+
+        for name in ("_resume_last_folder_if_any", "_maybe_preload_backend", "_maybe_show_first_run_guide"):
+            setattr(gui_module.BikiniScannerApp, name, lambda self: None)
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_dupe_"))
+        # _make_images leaves a byte-identical copy of the first image behind.
+        _make_images(self.folder, count=2)
+        self.app = gui_module.BikiniScannerApp(self.root, config=ScannerConfig(preload_backend=False))
+        self.app._set_folder(str(self.folder))
+        self.app.backend = object()
+        self.app._ensure_scorer = lambda: True
+        self.paths = [str(path) for path in collect_image_paths(self.folder)]
+        count = len(self.paths)
+        self.app.current_state = scorer_module.ScoreState(
+            paths=self.paths,
+            embeddings=np.eye(count, dtype=np.float32),
+            zero_shot_scores=np.full(count, 0.9, dtype=np.float32),
+            scores=np.full(count, 0.9, dtype=np.float32),
+            axis_scores={"bikini": np.full(count, 0.95, dtype=np.float32)},
+            face_counts=None,
+            classifier_trained=False,
+            classifier_label_count=0,
+            excluded=np.zeros(count, dtype=bool),
+        )
+        self.app.scorer = _AlwaysVisibleScorer()
+        self.app.threshold_var.set(0.35)
+        self.app.retrain_mode_var.set("manual")
+        # Off, to prove identical files travel together on their own account.
+        self.app.group_apply_var.set(False)
+        self.app._launch_background_scan = lambda full_rescan: None
+        # Populate the content-hash index the way a real scan does.
+        self.app.store.save_embeddings(
+            {Path(path): np.zeros(4, dtype=np.float32) for path in self.paths}
+        )
+        self.twin = str((self.folder / "duplicate_of_00.jpg").resolve())
+        self.original = str((self.folder / "sample_00.jpg").resolve())
+
+    def tearDown(self) -> None:
+        self.app._closing = True
+        self._stop_gui(self.root)
+        shutil.rmtree(self.folder, ignore_errors=True)
+
+    def test_an_identical_copy_inherits_the_decision(self) -> None:
+        self.app.set_label(self.original, 0)
+        labels = self.app.store.load_labels()
+        self.assertEqual(labels.get(self.twin), 0, f"an identical copy did not inherit the decision: {labels}")
+
+    def test_an_identical_copy_is_not_overwritten(self) -> None:
+        self.app.set_label(self.twin, 1)
+        self.app.set_label(self.original, 0)
+        self.assertEqual(self.app.store.load_labels().get(self.twin), 1, "a decision on the copy was overwritten")
 
 
 class NumericPrimitives(unittest.TestCase):

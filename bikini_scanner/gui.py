@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import (
@@ -93,6 +94,21 @@ LOGGER = logging.getLogger(__name__)
 CARD_INFO_WIDTH = 340
 # Buckets used by the detected-files view, in the order they are listed.
 DETECTED_BUCKETS = ("Cleavage", "Bikini", "Midriff", "Explicit (NSFW)", "Other detections")
+# When your Accept/REJECT decisions are folded back into the scores.
+#   instant — rescore the folder after every decision (what the app used to do)
+#   batch   — rescore once every N decisions
+#   manual  — rescore only when you press "Apply learning"
+RETRAIN_MODES = ("instant", "batch", "manual")
+DEFAULT_RETRAIN_MODE = "batch"
+DEFAULT_RETRAIN_BATCH = 10
+# Axes compared when deciding whether two photos carry the *same detection*. Two
+# pictures of the same beach are not a group; two frames of the same bikini shot are.
+DETECTION_AXES = ("bikini", "bikini_top", "bikini_bottom", "cleavage", "midriff", "nsfw")
+# How far two evidence profiles may drift and still count as the same detection.
+DETECTION_PROFILE_TOLERANCE = 0.15
+# Cosine similarity a photo needs to the one you just decided on. Burst/near-duplicate
+# territory: below roughly 0.9 this starts catching merely similar scenes.
+DEFAULT_GROUP_SIMILARITY = 0.94
 
 
 @dataclass(slots=True)
@@ -140,6 +156,29 @@ class BikiniScannerApp:
         self.sort_var = StringVar(value=str(self.user_prefs.get("sort", "score")))
         self.match_filter_var = StringVar(value=str(self.user_prefs.get("match_filter", "all")))
         self.label_filter_var = StringVar(value=str(self.user_prefs.get("label_filter", "all")))
+        # Reviewed photos stay in the detected list by default, because the list is
+        # meant to be a complete inventory of the folder. Turn this on to make it drain
+        # as you work instead.
+        self.hide_reviewed_var = BooleanVar(value=bool(self.user_prefs.get("hide_reviewed", False)))
+        # How often your decisions are folded back into the scores. "instant" rescored
+        # the whole folder on every single click, which made the detected count jump
+        # around under the reviewer's hands; batching keeps the list still while you
+        # work through it.
+        mode = str(self.user_prefs.get("retrain_mode", DEFAULT_RETRAIN_MODE)).strip()
+        self.retrain_mode_var = StringVar(value=mode if mode in RETRAIN_MODES else DEFAULT_RETRAIN_MODE)
+        try:
+            batch = int(self.user_prefs.get("retrain_batch_size", DEFAULT_RETRAIN_BATCH))
+        except (TypeError, ValueError):
+            batch = DEFAULT_RETRAIN_BATCH
+        self.retrain_batch_size_var = IntVar(value=max(1, min(200, batch)))
+        # Carry a decision to photos that carry the same detection — a burst of the same
+        # shot is one judgement call, not five.
+        self.group_apply_var = BooleanVar(value=bool(self.user_prefs.get("group_apply", True)))
+        try:
+            similarity = float(self.user_prefs.get("group_similarity", DEFAULT_GROUP_SIMILARITY))
+        except (TypeError, ValueError):
+            similarity = DEFAULT_GROUP_SIMILARITY
+        self.group_similarity_var = DoubleVar(value=max(0.5, min(1.0, similarity)))
         self.score_min_var = StringVar(value=str(self.user_prefs.get("score_min", "")))
         self.score_max_var = StringVar(value=str(self.user_prefs.get("score_max", "")))
         self.output_organization_var = StringVar(value=str(self.user_prefs.get("output_organization", "flat")))
@@ -199,6 +238,12 @@ class BikiniScannerApp:
         # run of photos quickly produces one retrain at the end rather than a thread per
         # click, all racing each other over the same scorer and label store.
         self._retrain_pending = False
+        # Decisions saved but not yet folded into the scores, and the detected count as
+        # it stood when the current pass started — the two numbers behind the
+        # "N waiting" button and the "+N newly detected" note.
+        self._labels_since_retrain = 0
+        self._detected_before_retrain: int | None = None
+        self._apply_learning_shown = False
         self._closing = False
         self._first_run_guide_shown = bool(self.user_prefs.get("first_run_guide_shown", False))
         try:
@@ -400,9 +445,18 @@ class BikiniScannerApp:
         search_entry.pack(side=LEFT, padx=(4, 12))
         ttk.Label(row_one, text="Sort", style="Muted.TLabel").pack(side=LEFT)
         sort_combo = ttk.Combobox(
-            row_one, textvariable=self.sort_var, values=("score", "filename", "date"), state="readonly", width=10
+            row_one,
+            textvariable=self.sort_var,
+            values=("score", "uncertainty", "filename", "date"),
+            state="readonly",
+            width=11,
         )
         sort_combo.pack(side=LEFT, padx=(4, 12))
+        self._tooltip(
+            sort_combo,
+            "'uncertainty' puts the photos nearest the sensitivity threshold first —\n"
+            "the ones the scanner is least sure about, where your decision teaches it most.",
+        )
         ttk.Label(row_one, text="Show", style="Muted.TLabel").pack(side=LEFT)
         match_combo = ttk.Combobox(
             row_one,
@@ -444,6 +498,71 @@ class BikiniScannerApp:
         thumb_scale.pack(side=LEFT, fill="x", expand=True, padx=(4, 12))
         ttk.Button(row_two, text="Prompt tester", command=self.open_prompt_tester_dialog).pack(side=RIGHT)
 
+        row_three = ttk.Frame(panel, style="Toolbar.TFrame")
+        row_three.pack(side=TOP, fill="x", pady=(8, 0))
+        ttk.Label(row_three, text="Learning updates", style="Muted.TLabel").pack(side=LEFT)
+        retrain_combo = ttk.Combobox(
+            row_three,
+            textvariable=self.retrain_mode_var,
+            values=RETRAIN_MODES,
+            state="readonly",
+            width=8,
+        )
+        retrain_combo.pack(side=LEFT, padx=(4, 6))
+        self._tooltip(
+            retrain_combo,
+            "When your decisions are folded back into the scores.\n"
+            "instant: after every decision (the detected list re-ranks under you)\n"
+            "batch: once every N decisions\n"
+            "manual: only when you press Apply learning",
+        )
+        ttk.Label(row_three, text="every", style="Muted.TLabel").pack(side=LEFT)
+        self.retrain_batch_spin = ttk.Spinbox(
+            row_three, from_=1, to=200, textvariable=self.retrain_batch_size_var, width=4
+        )
+        self.retrain_batch_spin.pack(side=LEFT, padx=(4, 4))
+        ttk.Label(row_three, text="decisions", style="Muted.TLabel").pack(side=LEFT)
+
+        group_check = ttk.Checkbutton(
+            row_three,
+            text="Carry decisions to similar photos",
+            variable=self.group_apply_var,
+            command=self._sync_retrain_controls,
+        )
+        group_check.pack(side=LEFT, padx=(18, 6))
+        self._tooltip(
+            group_check,
+            "Deciding on a photo applies the same decision to near-identical photos\n"
+            "carrying the same detection — a burst of one shot is one decision.\n"
+            "Never touches a photo you have already decided on; Ctrl+Z undoes the group.",
+        )
+        ttk.Label(row_three, text="likeness", style="Muted.TLabel").pack(side=LEFT)
+        self.group_similarity_scale = ttk.Scale(
+            row_three, from_=0.80, to=1.0, variable=self.group_similarity_var, orient="horizontal", length=90
+        )
+        self.group_similarity_scale.pack(side=LEFT, padx=(4, 4))
+        self._tooltip(
+            self.group_similarity_scale,
+            "How alike two photos must be to share a decision. Right is stricter;\n"
+            "at the far right only all-but-identical frames are grouped.",
+        )
+        self.group_similarity_label = ttk.Label(row_three, text="", style="Muted.TLabel", width=5)
+        self.group_similarity_label.pack(side=LEFT)
+        self._sync_retrain_controls()
+        retrain_combo.bind("<<ComboboxSelected>>", lambda _event: self._sync_retrain_controls())
+
+    def _sync_retrain_controls(self) -> None:
+        """Grey out the settings that do not apply, and show the likeness value."""
+        if not hasattr(self, "retrain_batch_spin"):
+            return
+        try:
+            self.retrain_batch_spin.configure(state="normal" if self._retrain_mode() == "batch" else "disabled")
+            grouping = bool(self.group_apply_var.get())
+            self.group_similarity_scale.configure(state="normal" if grouping else "disabled")
+            self.group_similarity_label.configure(text=f"{float(self.group_similarity_var.get()):.2f}")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _build_queue_panel(self) -> None:
         panel = ttk.Frame(self.root, padding=(12, 4, 12, 10), style="Toolbar.TFrame")
         self._panels["queue"] = panel
@@ -474,6 +593,25 @@ class BikiniScannerApp:
         self.review_button = ttk.Button(row, text="Review queue", command=self.restore_review_view)
         self.review_button.pack(side=LEFT, padx=6)
         self._tooltip(self.review_button, "A curated shortlist to Accept or REJECT so the scanner learns")
+        self.hide_reviewed_check = ttk.Checkbutton(
+            row,
+            text="Hide reviewed",
+            variable=self.hide_reviewed_var,
+        )
+        self.hide_reviewed_check.pack(side=LEFT, padx=(12, 0))
+        self._tooltip(
+            self.hide_reviewed_check,
+            "Drop photos you have already decided on out of the detected list, so it shrinks as you work",
+        )
+        # Only shown when there are decisions waiting to be folded in, so it is a
+        # prompt rather than another permanent button.
+        self.apply_learning_button = ttk.Button(
+            row, text="Apply learning", command=self.apply_learning_now, style="Accent.TButton"
+        )
+        self._tooltip(
+            self.apply_learning_button,
+            "Rescore the folder with the decisions you have made since the last update",
+        )
         self.view_hint = ttk.Label(row, text="", style="Muted.TLabel")
         self.view_hint.pack(side=LEFT, padx=(12, 0))
 
@@ -490,6 +628,31 @@ class BikiniScannerApp:
             self.detected_button.configure(style="Accent.TButton" if detected else "TButton")
             self.review_button.configure(style="TButton" if detected else "Accent.TButton")
             self.view_hint.configure(text=hints.get(self.view_mode, ""))
+            # The toggle only governs the detected list; greyed out elsewhere so it does
+            # not look like it is doing nothing.
+            self.hide_reviewed_check.configure(state="normal" if detected else "disabled")
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_retrain_button()
+
+    def _refresh_retrain_button(self) -> None:
+        """Show the Apply-learning prompt only while decisions are waiting."""
+        if not hasattr(self, "apply_learning_button"):
+            return
+        waiting = self._labels_since_retrain
+        try:
+            if waiting > 0:
+                self.apply_learning_button.configure(text=f"Apply learning ({waiting})")
+                # Tracked state, not winfo_ismapped(): mapping only settles once the
+                # event loop runs, and labelling several photos in a row calls this
+                # again long before that.
+                if not self._apply_learning_shown:
+                    # before= keeps it left of the hint text no matter when it appears.
+                    self.apply_learning_button.pack(side=LEFT, padx=(12, 0), before=self.view_hint)
+                    self._apply_learning_shown = True
+            elif self._apply_learning_shown:
+                self.apply_learning_button.pack_forget()
+                self._apply_learning_shown = False
         except Exception:  # noqa: BLE001
             pass
 
@@ -589,7 +752,15 @@ class BikiniScannerApp:
             body = f"{folder}\n\nPress Run scan to look through this folder."
             action = ("Run scan", self.run_scan)
         elif not self.displayed_samples:
-            if self._filters_active():
+            total, _reviewed, remaining = self._detected_progress()
+            if self.view_mode == "detected" and self.hide_reviewed_var.get() and total and not remaining:
+                title = "All caught up"
+                body = (
+                    f"You have reviewed all {total} detected photos. They are hidden, not gone — "
+                    "untick 'Hide reviewed' to see the full list again."
+                )
+                action = ("Show every detected file", self._show_all_detected_files)
+            elif self._filters_active():
                 title = "Nothing matches these filters"
                 body = "Your search, score range, or label filter is hiding every result."
                 action = ("Clear filters", self.clear_filters)
@@ -647,6 +818,9 @@ class BikiniScannerApp:
             or self.score_max_var.get().strip()
             or self.match_filter_var.get().strip() not in ("", "all")
             or self.label_filter_var.get().strip() not in ("", "all")
+            # Hiding reviewed photos empties the detected list once everything has been
+            # decided; without this the empty state would blame the sensitivity slider.
+            or bool(self.hide_reviewed_var.get())
         )
 
     def clear_filters(self) -> None:
@@ -655,6 +829,7 @@ class BikiniScannerApp:
         self.score_max_var.set("")
         self.match_filter_var.set("all")
         self.label_filter_var.set("all")
+        self.hide_reviewed_var.set(False)
         self.status_var.set("Filters cleared.")
 
     def _toggle_panel(self, name: str) -> None:
@@ -769,6 +944,15 @@ class BikiniScannerApp:
             "  • The big picture at the top is the active one; Accept and REJECT apply to it.\n"
             "  • Every Accept and REJECT trains the scanner, and now carries over to other folders.\n"
             "  • 'Detected files' lists everything found, grouped by what was detected.\n"
+            "  • The count line reads 'N detected — R reviewed, L left', so the work shrinks visibly.\n"
+            "  • That count can grow while you review: learning from your decisions pushes borderline\n"
+            "    photos over the sensitivity threshold. The list says so when it happens.\n"
+            "  • 'Hide reviewed' drops decided photos out of the list; 'Learning updates' in the\n"
+            "    Filters panel sets how often your decisions are folded back into the scores.\n"
+            "  • One decision carries to near-identical photos with the same detection, so a burst\n"
+            "    of the same shot is one click. Ctrl+Z undoes the whole group.\n"
+            "  • Each bucket heading has 'Accept N' / 'Reject N' for the undecided photos in it.\n"
+            "  • Sort by 'uncertainty' to review the photos the scanner is least sure about first.\n"
             "  • Drag the sensitivity slider left to see near misses.",
         )
 
@@ -1224,6 +1408,10 @@ class BikiniScannerApp:
             self.sort_var,
             self.match_filter_var,
             self.label_filter_var,
+            self.hide_reviewed_var,
+            self.retrain_mode_var,
+            self.retrain_batch_size_var,
+            self.group_apply_var,
             self.score_min_var,
             self.score_max_var,
             self.update_url_var,
@@ -1232,11 +1420,29 @@ class BikiniScannerApp:
                 variable.trace_add("write", lambda *_args: self._on_ui_pref_change())
             except Exception:  # noqa: BLE001
                 continue
+        # The likeness slider changes nothing on screen — it only affects the next
+        # decision — so it saves and relabels without rebuilding the whole grid the way
+        # a filter change does.
+        try:
+            self.group_similarity_var.trace_add("write", lambda *_args: self._on_group_similarity_change())
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_group_similarity_change(self) -> None:
+        self._sync_retrain_controls()
+        self._save_user_prefs()
 
     def _on_ui_pref_change(self) -> None:
         self._apply_theme()
         self._trim_thumbnail_cache()
         self._save_user_prefs()
+        # Switching to instant mode should not leave decisions stranded behind a button
+        # the mode no longer shows.
+        if self._retrain_mode() == "instant" and self._labels_since_retrain:
+            self._labels_since_retrain = 0
+            self.update_algorithm()
+        self._refresh_retrain_button()
+        self._sync_retrain_controls()
         if self.current_state is not None:
             self._refresh_active_view()
 
@@ -1277,6 +1483,11 @@ class BikiniScannerApp:
             "sort": self.sort_var.get(),
             "match_filter": self.match_filter_var.get(),
             "label_filter": self.label_filter_var.get(),
+            "hide_reviewed": bool(self.hide_reviewed_var.get()),
+            "retrain_mode": self._retrain_mode(),
+            "retrain_batch_size": self._retrain_batch_target(),
+            "group_apply": bool(self.group_apply_var.get()),
+            "group_similarity": round(float(self.group_similarity_var.get()), 3),
             "score_min": self.score_min_var.get().strip(),
             "score_max": self.score_max_var.get().strip(),
             "update_url": self.update_url_var.get().strip(),
@@ -1332,6 +1543,9 @@ class BikiniScannerApp:
 
         view_menu.add_command(label="Detected files", command=self.show_detected_files)
         view_menu.add_command(label="Review queue", command=self.restore_review_view)
+        view_menu.add_checkbutton(label="Hide reviewed photos", variable=self.hide_reviewed_var)
+        view_menu.add_checkbutton(label="Carry decisions to similar photos", variable=self.group_apply_var)
+        view_menu.add_command(label="Apply learning now", command=self.apply_learning_now)
         view_menu.add_separator()
         view_menu.add_command(label="Light theme", command=lambda: self.theme_var.set("light"))
         view_menu.add_command(label="Dark theme", command=lambda: self.theme_var.set("dark"))
@@ -2079,6 +2293,11 @@ class BikiniScannerApp:
         except Exception:  # noqa: BLE001
             stat = None
         sort_mode = self.sort_var.get().strip()
+        if sort_mode == "uncertainty":
+            # Hardest first: the photos nearest the threshold are the ones the model is
+            # least sure about, so deciding them teaches it the most per click.
+            distance = abs(score - float(self.threshold_var.get()))
+            return (round(distance, 6), Path(path).name.lower(), path)
         if sort_mode == "filename":
             return (Path(path).name.lower(), -score, path)
         if sort_mode == "date":
@@ -2232,6 +2451,10 @@ class BikiniScannerApp:
             return []
         scores = self._score_map()
         index_by_path = {path: index for index, path in enumerate(self.current_state.paths)}
+        # Read the labels once. _label_text re-copies the whole label map per call, so
+        # asking it per photo turned listing a big folder into quadratic work.
+        labels = self._label_map()
+        hide_reviewed = bool(self.hide_reviewed_var.get())
         return [
             {
                 "path": path,
@@ -2239,7 +2462,53 @@ class BikiniScannerApp:
                 "bucket": self._detected_bucket(index_by_path.get(path)),
             }
             for path in self._visible_matches()
+            if not (hide_reviewed and path in labels)
         ]
+
+    def _detected_progress(self) -> tuple[int, int, int]:
+        """How much of the detected list has been decided on: (total, reviewed, left).
+
+        Always counted over the full list, never the filtered view — the point is to
+        tell the reviewer how much work is left, and hiding what is done should not
+        make the total move.
+        """
+        if self.current_state is None:
+            return (0, 0, 0)
+        labels = self._label_map()
+        matches = self._visible_matches()
+        reviewed = sum(1 for path in matches if path in labels)
+        return (len(matches), reviewed, len(matches) - reviewed)
+
+    def _detected_status_text(self) -> str:
+        """The line under the detected list: how many, how many done, what changed."""
+        total, reviewed, remaining = self._detected_progress()
+        threshold = float(self.threshold_var.get())
+        text = (
+            f"{total} detected at threshold {threshold:.3f} — {reviewed} reviewed, {remaining} left, "
+            "grouped by what was detected."
+        )
+        delta = self._detected_delta_note()
+        if delta:
+            text = f"{text} {delta}"
+        return text
+
+    def _detected_delta_note(self) -> str:
+        """Explain a detected count that moved because a retrain re-ranked the folder.
+
+        The count growing mid-review is the model getting more sensitive as it learns,
+        not photos appearing from nowhere — say so instead of letting the number change
+        silently.
+        """
+        before = self._detected_before_retrain
+        self._detected_before_retrain = None
+        if before is None:
+            return ""
+        total = len(self._visible_matches())
+        if total > before:
+            return f"(+{total - before} newly detected after learning from your decisions.)"
+        if total < before:
+            return f"({before - total} no longer detected after learning from your decisions.)"
+        return ""
 
     def show_detected_files(self) -> None:
         if self.current_state is None:
@@ -2252,12 +2521,13 @@ class BikiniScannerApp:
         self.view_mode = "detected"
         self.similar_anchor_path = None
         self.current_samples = samples
-        threshold = float(self.threshold_var.get())
-        self.status_var.set(
-            f"{len(samples)} detected files at threshold {threshold:.3f}, grouped by what was detected. "
-            "Switch to 'Review queue' to teach the scanner."
-        )
+        self.status_var.set(self._detected_status_text())
         self._refresh_displayed_results()
+
+    def _show_all_detected_files(self) -> None:
+        """Turn hiding off and list everything again, from the empty state."""
+        self.hide_reviewed_var.set(False)
+        self.show_detected_files()
 
     def restore_review_view(self) -> None:
         if self.review_samples:
@@ -2313,6 +2583,92 @@ class BikiniScannerApp:
             similarity = float(np.dot(anchor_embedding, vector) / (anchor_norm * vector_norm))
             ranked.append((path, similarity))
         return sorted(ranked, key=lambda item: item[1], reverse=True)
+
+    def _detection_signature(self, index: int) -> tuple[str, np.ndarray]:
+        """What the scanner saw in one photo: its bucket plus its axis evidence profile.
+
+        This is the "detection type" half of grouping. Two frames that look alike to
+        the embedding can still be different findings — one a bikini, the other a
+        false positive that barely registered — and those must not share a decision.
+        """
+        state = self.current_state
+        if state is None:
+            return ("", np.empty((0,), dtype=np.float32))
+        profile = []
+        for axis_name in DETECTION_AXES:
+            axis_scores = state.axis_scores.get(axis_name)
+            if axis_scores is None or index >= len(axis_scores):
+                profile.append(0.0)
+                continue
+            profile.append(float(cascade.evidence(np.asarray([axis_scores[index]]))[0]))
+        return (self._detected_bucket(index), np.asarray(profile, dtype=np.float32))
+
+    def _similar_detection_group(self, path: str) -> list[str]:
+        """Unlabeled photos that are near-identical pictures AND the same detection.
+
+        Both halves are required. Similarity alone would sweep up every photo from the
+        same afternoon; the same detection alone would sweep up every bikini in the
+        folder. Together they pick out what a person would call the same shot.
+        """
+        state = self.current_state
+        if state is None or not self.group_apply_var.get():
+            return []
+        try:
+            anchor = state.paths.index(path)
+        except ValueError:
+            return []
+        embeddings = np.asarray(state.embeddings, dtype=np.float32)
+        if embeddings.ndim != 2 or anchor >= len(embeddings):
+            return []
+        norms = np.linalg.norm(embeddings, axis=1)
+        anchor_norm = float(norms[anchor])
+        if anchor_norm <= 0:
+            return []
+        # One vector against the matrix: O(n) per decision, no clustering to maintain.
+        with np.errstate(invalid="ignore", divide="ignore"):
+            similarity = (embeddings @ embeddings[anchor]) / (norms * anchor_norm)
+        similarity = np.nan_to_num(similarity, nan=-1.0, posinf=-1.0, neginf=-1.0)
+        minimum = float(self.group_similarity_var.get())
+        visible = self._result_visibility_mask()
+        labels = self._label_map()
+        anchor_bucket, anchor_profile = self._detection_signature(anchor)
+        group: list[str] = []
+        for raw_index in np.flatnonzero(similarity >= minimum):
+            index = int(raw_index)
+            if index == anchor or index >= len(state.paths):
+                continue
+            candidate = state.paths[index]
+            # A decision you already made is never overwritten by a group.
+            if candidate in labels:
+                continue
+            if index < len(visible) and not bool(visible[index]):
+                continue
+            bucket, profile = self._detection_signature(index)
+            if bucket != anchor_bucket or profile.size != anchor_profile.size:
+                continue
+            if profile.size and float(np.max(np.abs(profile - anchor_profile))) > DETECTION_PROFILE_TOLERANCE:
+                continue
+            group.append(candidate)
+        return group
+
+    def _duplicate_siblings(self, path: str) -> list[str]:
+        """Byte-identical copies of one file.
+
+        There is no judgement to make about an identical copy, so these travel together
+        whatever the grouping settings say.
+        """
+        if self.store is None:
+            return []
+        try:
+            groups = self.store.duplicate_groups()
+        except Exception:
+            LOGGER.exception("Could not read the duplicate groups for %s", path)
+            return []
+        resolved = str(Path(path).resolve())
+        for members in groups.values():
+            if resolved in members:
+                return [member for member in members if member != resolved]
+        return []
 
     def view_image(self, path: str) -> None:
         if self.current_state is None:
@@ -3581,6 +3937,63 @@ class BikiniScannerApp:
         self.status_var.set("Stopping scan after the current batch...")
         self.stop_scan_button.configure(state="disabled")
 
+    def _retrain_mode(self) -> str:
+        mode = self.retrain_mode_var.get().strip()
+        return mode if mode in RETRAIN_MODES else DEFAULT_RETRAIN_MODE
+
+    def _retrain_batch_target(self) -> int:
+        try:
+            return max(1, min(200, int(self.retrain_batch_size_var.get())))
+        except Exception:  # noqa: BLE001
+            return DEFAULT_RETRAIN_BATCH
+
+    def _request_retrain(self, label_count: int) -> None:
+        """Decide whether saved decisions are folded in now or later.
+
+        Rescoring after every click is what made the detected count move while the
+        reviewer was in the middle of working through the list: each retrain re-ranks
+        the whole folder, so borderline photos cross the threshold under their hands.
+        Batching the retrain keeps the list still until the reviewer asks for it.
+        """
+        mode = self._retrain_mode()
+        if mode == "instant":
+            self._labels_since_retrain = 0
+            self.update_algorithm()
+            return
+        self._labels_since_retrain += max(1, int(label_count))
+        waiting = self._labels_since_retrain
+        if mode == "batch" and waiting >= self._retrain_batch_target():
+            self.status_var.set(f"{self.status_var.get()} {waiting} decisions — updating the scores now.")
+            self.apply_learning_now()
+            return
+        if mode == "batch":
+            remaining = self._retrain_batch_target() - waiting
+            note = f"{waiting} waiting — the scores update after {remaining} more (or press Apply learning)."
+        else:
+            note = f"{waiting} waiting — press Apply learning when you want the scores updated."
+        self.status_var.set(f"{self.status_var.get()} {note}")
+        self._refresh_retrain_button()
+
+    def _note_pass_started(self, full_rescan: bool) -> None:
+        """Book-keeping for a pass that is about to start.
+
+        Every decision made up to here is about to be folded in, so nothing is left
+        waiting. The detected count is remembered first: comparing it against the count
+        this pass produces is what lets the new list say why it changed.
+        """
+        self._labels_since_retrain = 0
+        self._detected_before_retrain = (
+            len(self._visible_matches()) if not full_rescan and self.current_state is not None else None
+        )
+        self._refresh_retrain_button()
+
+    def apply_learning_now(self) -> None:
+        """Fold every decision made since the last pass into the scores."""
+        if self._labels_since_retrain == 0 and self.current_state is not None:
+            self.status_var.set("Nothing new to apply — the scores already include every decision.")
+            return
+        self.update_algorithm()
+
     def update_algorithm(self) -> None:
         if self.store is None:
             messagebox.showinfo("Not ready", "Run a scan first.")
@@ -3615,6 +4028,7 @@ class BikiniScannerApp:
         assert self.scorer is not None
         generation = self._refresh_generation = self._refresh_generation + 1
         source_state = self.current_state
+        self._note_pass_started(full_rescan)
         self._scan_start_monotonic = time.monotonic()
         self._scan_active = True
         cancel_event = threading.Event()
@@ -3693,6 +4107,8 @@ class BikiniScannerApp:
         self._show_progress(False)
         # Stop means stop: a retrain queued behind this pass is dropped, not run.
         self._retrain_pending = False
+        # No new list is coming, so there is no count to compare against.
+        self._detected_before_retrain = None
         self.status_var.set("Scan stopped. Cached work is available for the next scan.")
         if self.queue_active:
             self.queue_active = False
@@ -3707,6 +4123,7 @@ class BikiniScannerApp:
         self._reset_progress_bar()
         self._show_progress(False)
         self._retrain_pending = False
+        self._detected_before_retrain = None
         self.status_var.set("Scan failed.")
         LOGGER.error("Scan failed: %s", exc, exc_info=(type(exc), exc, exc.__traceback__))
         # Map common failures to user-friendly text with a suggested action.
@@ -3817,6 +4234,11 @@ class BikiniScannerApp:
             self.show_detected_files()
         else:
             self._refresh_displayed_results()
+            # The detected list is not on screen to explain itself, so say here why the
+            # count in the summary line moved.
+            delta = self._detected_delta_note()
+            if delta:
+                self.status_var.set(f"{self.status_var.get()} {delta}".strip())
         self._update_stats_panel(record_history=True)
         self._save_review_session()
         self._save_last_folder(self.folder_var.get().strip())
@@ -3842,15 +4264,10 @@ class BikiniScannerApp:
             self.stats_var.set("")
             self.notice_var.set("")
             return
-        threshold = float(self.threshold_var.get())
-        visible_mask = self._result_visibility_mask()
-        matches = sum(
-            1
-            for score, include in zip(self.current_state.scores, visible_mask, strict=False)
-            if include and score >= threshold
-        )
+        matches, reviewed, remaining = self._detected_progress()
         self.summary_var.set(
-            f"{len(self.current_state.paths)} images, {matches} above threshold, "
+            f"{len(self.current_state.paths)} images, {matches} detected "
+            f"({reviewed} reviewed, {remaining} left), "
             f"{self.current_state.classifier_label_count} labeled, "
             f"{'classifier on' if self.current_state.classifier_trained else 'zero-shot only'}"
         )
@@ -3875,11 +4292,7 @@ class BikiniScannerApp:
             return
         samples = self._detected_samples()
         self.current_samples = samples
-        threshold = float(self.threshold_var.get())
-        self.status_var.set(
-            f"{len(samples)} detected files at threshold {threshold:.3f}, grouped by what was detected. "
-            "Switch to 'Review queue' to teach the scanner."
-        )
+        self.status_var.set(self._detected_status_text())
         self._refresh_displayed_results()
 
     def _bind_shortcuts(self) -> None:
@@ -4173,16 +4586,33 @@ class BikiniScannerApp:
                 grouped[bucket] = []
             grouped[bucket].append(sample)
         row = 0
+        labels = self._label_map()
+
+        def bucket_action(name: str, value: int) -> Callable[[], None]:
+            return lambda: self.label_bucket(name, value)
+
         for bucket in buckets:
             items = grouped[bucket]
-            ttk.Label(self.grid_inner, text=f"{bucket} ({len(items)})", font=("TkDefaultFont", 11, "bold")).grid(
-                row=row,
-                column=0,
-                columnspan=columns,
-                sticky="w",
-                padx=10,
-                pady=(10, 4),
-            )
+            header = ttk.Frame(self.grid_inner)
+            header.grid(row=row, column=0, columnspan=columns, sticky="ew", padx=10, pady=(10, 4))
+            ttk.Label(header, text=f"{bucket} ({len(items)})", font=("TkDefaultFont", 11, "bold")).pack(side=LEFT)
+            # Whole buckets are often uniformly right or wrong, so offer the bulk call
+            # right where the group is named — but only while it still has undecided
+            # photos in it.
+            undecided = sum(1 for sample in items if str(sample["path"]) not in labels)
+            if undecided:
+                ttk.Button(
+                    header,
+                    text=f"Accept {undecided}",
+                    width=11,
+                    command=bucket_action(bucket, 1),
+                ).pack(side=LEFT, padx=(12, 0))
+                ttk.Button(
+                    header,
+                    text=f"Reject {undecided}",
+                    width=11,
+                    command=bucket_action(bucket, 0),
+                ).pack(side=LEFT, padx=(6, 0))
             row += 1
             for index, sample in enumerate(items):
                 path = str(sample["path"])
@@ -4369,19 +4799,44 @@ class BikiniScannerApp:
             return
         # Deciding on the active picture moves to the next one. Without this the big
         # preview sits on the image you just judged and the click looks like it did
-        # nothing. Captured before labelling, because the retrain re-renders the grid.
-        advance_from = path if path == self.focused_path else None
-        self._apply_label_batch(
-            {path: int(label)}, status=f"Saved label for {Path(path).name}. Retraining...", retrain=True
-        )
-        if advance_from is not None:
-            self._advance_focus_after(advance_from)
+        # nothing. Resolved before labelling: a retrain — or hiding what was just
+        # reviewed — re-renders the grid and the old neighbours are gone by then.
+        advance_to = self._next_focus_after(path) if path == self.focused_path else None
+        changes, status = self._decision_with_group(path, int(label))
+        # One decision, however many photos it covers: it is one judgement call, so it
+        # is one undo entry and one step towards the next retrain.
+        self._apply_label_batch(changes, status=status, retrain=True, decision_count=1)
+        if advance_to is not None:
+            self.focused_path = advance_to
+            self._apply_focus_visuals()
 
-    def _advance_focus_after(self, path: str) -> None:
-        """Point the active picture at the next image in the list currently shown."""
+    def _decision_with_group(self, path: str, label: int) -> tuple[dict[str, int | None], str]:
+        """Expand one decision to the photos that should inherit it, and say so."""
+        labels = self._label_map()
+        changes: dict[str, int | None] = {path: label}
+        identical = [twin for twin in self._duplicate_siblings(path) if twin not in labels]
+        similar = [
+            candidate
+            for candidate in self._similar_detection_group(path)
+            if candidate not in labels and candidate not in changes and candidate not in identical
+        ]
+        for candidate in identical + similar:
+            changes[candidate] = label
+        status = f"Saved label for {Path(path).name}."
+        carried = []
+        if identical:
+            carried.append(f"{len(identical)} identical")
+        if similar:
+            carried.append(f"{len(similar)} similar")
+        if carried:
+            status = f"{status} Also applied to {' and '.join(carried)} — Ctrl+Z undoes all of it."
+        return (changes, status)
+
+    def _next_focus_after(self, path: str) -> str | None:
+        """Name the image that should become active once `path` has been decided."""
         order = [str(sample["path"]) for sample in (self.displayed_samples or self.current_samples)]
         if len(order) < 2:
-            return
+            return None
         try:
             index = order.index(path)
         except ValueError:
@@ -4389,9 +4844,15 @@ class BikiniScannerApp:
         # Everything after the current position, then wrap around to what came before.
         for candidate in order[index + 1 :] + order[: max(index, 0)]:
             if candidate != path:
-                self.focused_path = candidate
-                self._apply_focus_visuals()
-                return
+                return candidate
+        return None
+
+    def _advance_focus_after(self, path: str) -> None:
+        """Point the active picture at the next image in the list currently shown."""
+        candidate = self._next_focus_after(path)
+        if candidate is not None:
+            self.focused_path = candidate
+            self._apply_focus_visuals()
 
     def _apply_label_batch(
         self,
@@ -4399,6 +4860,7 @@ class BikiniScannerApp:
         status: str,
         retrain: bool,
         record_undo: bool = True,
+        decision_count: int | None = None,
     ) -> None:
         if self.store is None:
             return
@@ -4426,10 +4888,23 @@ class BikiniScannerApp:
             self.redo_stack.clear()
         for path in changes:
             self._refresh_label_state(path)
-        self.status_var.set(status)
+        if self.view_mode == "detected" and self.hide_reviewed_var.get():
+            # The list is meant to drain as decisions are made, so re-list it now
+            # instead of leaving what was just decided on screen until the next retrain.
+            self._relist_detected_files()
+        self.status_var.set(f"{status} {self._review_progress_note()}".strip())
         self._save_review_session()
         if retrain:
-            self.update_algorithm()
+            self._request_retrain(len(changes) if decision_count is None else decision_count)
+
+    def _review_progress_note(self) -> str:
+        """How much of the detected list is left, for the line after a decision."""
+        if self.view_mode != "detected" or self.current_state is None:
+            return ""
+        total, _reviewed, remaining = self._detected_progress()
+        if not total:
+            return ""
+        return f"{remaining} left of {total} detected."
 
     def label_focused_card(self, label: int) -> None:
         if self.focused_path is None:
@@ -4456,6 +4931,39 @@ class BikiniScannerApp:
             dict.fromkeys(paths, label),
             status=f"{verb}ed {len(paths)} shown images.",
             retrain=True,
+        )
+
+    def label_bucket(self, bucket: str, label: int, confirm: bool = True) -> None:
+        """Decide the rest of one bucket at once.
+
+        Buckets are usually uniformly right or wrong — a whole 'Other detections' group
+        is often noise — so deciding them one photo at a time is pure overhead. Only
+        undecided photos are touched, so this never overrides your own calls.
+        """
+        if self.current_state is None:
+            messagebox.showinfo("No results", "Run a scan first.")
+            return
+        labels = self._label_map()
+        paths = [
+            str(sample["path"])
+            for sample in (self.displayed_samples or self.current_samples)
+            if str(sample.get("bucket", "")) == bucket and str(sample["path"]) not in labels
+        ]
+        if not paths:
+            messagebox.showinfo("Nothing left", f"Every photo in '{bucket}' has already been decided.")
+            return
+        verb = {1: "Accept", 0: "REJECT", 2: "Skip"}.get(int(label), "label")
+        if confirm and not messagebox.askyesno(
+            f"{verb} the rest of '{bucket}'",
+            f"{verb} the {len(paths)} undecided photo{'s' if len(paths) != 1 else ''} in '{bucket}'?\n\n"
+            "Photos you have already decided on are left alone. Ctrl+Z undoes all of this.",
+        ):
+            return
+        self._apply_label_batch(
+            dict.fromkeys(paths, label),
+            status=f"{verb}ed the remaining {len(paths)} in '{bucket}'.",
+            retrain=True,
+            decision_count=1,
         )
 
     def undo_last_label(self) -> None:
