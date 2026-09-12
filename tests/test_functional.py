@@ -819,6 +819,163 @@ class OutputOperations(unittest.TestCase):
             image.verify()
 
 
+class OutputTransferExecution(unittest.TestCase):
+    """The move and overwrite execution paths, including the ones that only run once
+    something has already gone wrong.
+
+    These are the branches that can lose a file: a rename that fails and falls back to
+    copy-then-delete, a source that cannot be removed after that copy, and an overwrite
+    that unlinks an existing destination. The happy copy path is covered by
+    OutputOperations above; everything here is about what happens when the filesystem
+    refuses.
+    """
+
+    def setUp(self) -> None:
+        self.working = Path(tempfile.mkdtemp(prefix="bikini_exec_"))
+        self.source_dir = self.working / "src"
+        self.source_dir.mkdir()
+        self.source = self.source_dir / "photo.jpg"
+        self.source.write_bytes(_make_image_bytes())
+        self.payload = self.source.read_bytes()
+
+    def _plan(self, destination_dir: Path, *, move: bool = False, policy: str = "rename"):
+        options = output_ops.OutputOptions()
+        options.duplicate_policy = policy
+        return output_ops.build_transfer_plan(
+            [str(self.source)], destination_dir, {str(self.source): 0.5}, {}, options, move=move
+        )
+
+    def test_move_within_the_same_folder_relocates_the_file(self) -> None:
+        """Same-parent moves take the os.replace path."""
+        options = output_ops.OutputOptions()
+        options.filename_template = "renamed"
+        plan = output_ops.build_transfer_plan(
+            [str(self.source)], self.source_dir, {str(self.source): 0.5}, {}, options, move=True
+        )
+        processed, _skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=True)
+        self.assertEqual((processed, retained, failed), (1, 0, 0))
+        self.assertFalse(self.source.exists(), "a move must remove the source")
+        self.assertEqual((self.source_dir / "renamed.jpg").read_bytes(), self.payload)
+
+    def test_move_across_folders_relocates_the_file(self) -> None:
+        """Differing parents take the shutil.move path."""
+        destination = self.working / "out"
+        plan = self._plan(destination, move=True)
+        processed, _skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=True)
+        self.assertEqual((processed, retained, failed), (1, 0, 0))
+        self.assertFalse(self.source.exists(), "a move must remove the source")
+        self.assertEqual(plan[0].destination.read_bytes(), self.payload)
+
+    def test_move_falls_back_to_copy_when_the_rename_fails(self) -> None:
+        """A cross-volume move raises out of shutil.move; the copy fallback must still
+        deliver the file and remove the source."""
+        destination = self.working / "out"
+        plan = self._plan(destination, move=True)
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("simulated cross-device rename")
+
+        original = shutil.move
+        shutil.move = refuse
+        try:
+            processed, _skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=True)
+        finally:
+            shutil.move = original
+
+        self.assertEqual((processed, retained, failed), (1, 0, 0))
+        self.assertEqual(plan[0].destination.read_bytes(), self.payload)
+        self.assertFalse(self.source.exists(), "the fallback must remove the source after copying")
+        self.assertTrue(plan[0].source_removed)
+
+    def test_a_fallback_that_cannot_remove_the_source_reports_it(self) -> None:
+        """Copy succeeded but the source could not be unlinked, so the file now exists in
+        both places. That must be counted and flagged, never reported as a clean move."""
+        destination = self.working / "out"
+        plan = self._plan(destination, move=True)
+
+        def refuse_move(*_args, **_kwargs):
+            raise OSError("simulated cross-device rename")
+
+        def refuse_unlink(_self, *_args, **_kwargs):
+            raise PermissionError("simulated locked source")
+
+        original_move = shutil.move
+        original_unlink = Path.unlink
+        shutil.move = refuse_move
+        Path.unlink = refuse_unlink
+        try:
+            processed, _skipped, retained, failed = output_ops.execute_transfer_plan(plan, move=True)
+        finally:
+            shutil.move = original_move
+            Path.unlink = original_unlink
+
+        self.assertEqual(failed, 0, "the copy succeeded, so this is not a failure")
+        self.assertEqual(processed, 1)
+        self.assertEqual(retained, 1, "the surviving source must be counted")
+        self.assertFalse(plan[0].source_removed, "the item must record that the source is still there")
+        self.assertTrue(self.source.exists())
+        self.assertEqual(plan[0].destination.read_bytes(), self.payload)
+
+    def test_overwrite_policy_replaces_an_existing_destination(self) -> None:
+        """Pins the end result of the overwrite policy: planned as "overwrite", and the
+        stale bytes are gone afterwards.
+
+        It deliberately does not claim to cover the pre-emptive unlink in
+        execute_transfer_plan. Deleting that unlink leaves this test green, because
+        shutil.copy2 truncates the destination by itself -- which is what the comment
+        on that branch already says. The unlink is defensive only, so there is no
+        observable behaviour left for a test to hold it to.
+        """
+        destination = self.working / "out"
+        destination.mkdir()
+        existing = destination / "photo.jpg"
+        existing.write_bytes(b"stale contents")
+        plan = self._plan(destination, policy="overwrite")
+        self.assertEqual(plan[0].action, "overwrite")
+        processed, _skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=False)
+        self.assertEqual((processed, failed), (1, 0))
+        self.assertEqual(existing.read_bytes(), self.payload, "the stale file must be replaced")
+
+    def test_rename_policy_gives_each_collision_a_fresh_name(self) -> None:
+        """Two files already holding the obvious names push the counter loop past its
+        first attempt, so the copy lands on photo_2.jpg rather than overwriting."""
+        destination = self.working / "out"
+        destination.mkdir()
+        (destination / "photo.jpg").write_bytes(b"first")
+        (destination / "photo_1.jpg").write_bytes(b"second")
+        plan = self._plan(destination, policy="rename")
+        processed, _skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=False)
+        self.assertEqual((processed, failed), (1, 0))
+        self.assertEqual(plan[0].destination.name, "photo_2.jpg")
+        self.assertEqual((destination / "photo.jpg").read_bytes(), b"first", "existing files must survive")
+        self.assertEqual((destination / "photo_1.jpg").read_bytes(), b"second")
+
+    def test_skip_policy_leaves_an_existing_destination_untouched(self) -> None:
+        destination = self.working / "out"
+        destination.mkdir()
+        existing = destination / "photo.jpg"
+        existing.write_bytes(b"do not touch")
+        plan = self._plan(destination, policy="skip")
+        processed, skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=False)
+        self.assertEqual((processed, skipped, failed), (0, 1, 0))
+        self.assertEqual(plan[0].reason, "duplicate exists")
+        self.assertEqual(existing.read_bytes(), b"do not touch")
+
+    def test_a_source_that_is_its_own_destination_is_skipped(self) -> None:
+        """Scanning a folder and writing output back into it must not copy a file over
+        itself, which would truncate it."""
+        options = output_ops.OutputOptions()
+        options.filename_template = "{stem}"
+        plan = output_ops.build_transfer_plan(
+            [str(self.source)], self.source_dir, {str(self.source): 0.5}, {}, options, move=True
+        )
+        self.assertEqual(plan[0].action, "skip")
+        self.assertEqual(plan[0].reason, "source and destination are identical")
+        processed, skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=True)
+        self.assertEqual((processed, skipped, failed), (0, 1, 0))
+        self.assertEqual(self.source.read_bytes(), self.payload, "the original must be intact")
+
+
 class Configuration(unittest.TestCase):
     def test_round_trip_preserves_every_field(self) -> None:
         config = ScannerConfig()

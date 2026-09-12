@@ -20,3 +20,6 @@ models/
 *.pt
 *.bin
 *.safetensors
+.coverage
+coverage.xml
+htmlcov/
