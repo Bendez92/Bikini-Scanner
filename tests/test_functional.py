@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import pickle
 import shutil
@@ -53,6 +54,7 @@ from bikini_scanner import (
     linear_model,
     output_ops,
     regions,
+    safe_io,
 )
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
@@ -974,6 +976,324 @@ class OutputTransferExecution(unittest.TestCase):
         processed, skipped, _retained, failed = output_ops.execute_transfer_plan(plan, move=True)
         self.assertEqual((processed, skipped, failed), (0, 1, 0))
         self.assertEqual(self.source.read_bytes(), self.payload, "the original must be intact")
+
+
+class AtomicWrites(unittest.TestCase):
+    """safe_io is what stops a crash mid-write from truncating the label store.
+
+    The guarantee is all-or-nothing: the destination either holds the previous
+    contents or the new ones, never a half-written file, and a failed write leaves no
+    stray temporary behind.
+    """
+
+    def setUp(self) -> None:
+        self.working = Path(tempfile.mkdtemp(prefix="bikini_atomic_"))
+
+    def _strays(self) -> list[Path]:
+        return list(self.working.rglob("*.tmp"))
+
+    def test_text_is_written_and_no_temporary_survives(self) -> None:
+        target = self.working / "labels.json"
+        safe_io.atomic_write_text(target, "hello")
+        self.assertEqual(target.read_text(encoding="utf-8"), "hello")
+        self.assertEqual(self._strays(), [], "the temporary must be moved, not left behind")
+
+    def test_missing_parent_directories_are_created(self) -> None:
+        target = self.working / "deep" / "nested" / "labels.json"
+        safe_io.atomic_write_text(target, "hello")
+        self.assertEqual(target.read_text(encoding="utf-8"), "hello")
+
+    def test_an_existing_file_keeps_its_old_contents_when_the_write_fails(self) -> None:
+        """The point of the temp-file dance: a failed write must not damage what is
+        already on disk, and must not leave a .tmp lying next to it."""
+        target = self.working / "labels.json"
+        target.write_text("original", encoding="utf-8")
+
+        def explode(_path: Path) -> None:
+            raise RuntimeError("simulated serialisation failure")
+
+        with self.assertRaises(RuntimeError):
+            safe_io.atomic_replace(target, explode)
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "original")
+        self.assertEqual(self._strays(), [], "a failed write must clean up its temporary")
+
+    def test_a_failing_text_write_cleans_up_and_re_raises(self) -> None:
+        target = self.working / "labels.json"
+        original_write = Path.write_text
+
+        def explode(self_path, *args, **kwargs):
+            if self_path.suffix == ".tmp":
+                raise OSError("simulated disk full")
+            return original_write(self_path, *args, **kwargs)
+
+        Path.write_text = explode
+        try:
+            with self.assertRaises(OSError):
+                safe_io.atomic_write_text(target, "never lands")
+        finally:
+            Path.write_text = original_write
+
+        self.assertFalse(target.exists(), "nothing should have been put in place")
+        self.assertEqual(self._strays(), [], "a failed write must clean up its temporary")
+
+    def test_a_write_still_lands_when_fsync_is_unavailable(self) -> None:
+        """fsync failures are swallowed on purpose: some filesystems refuse it, and the
+        replace is still worth doing."""
+        target = self.working / "labels.json"
+        original_fsync = os.fsync
+
+        def refuse(_fd):
+            raise OSError("simulated fsync refusal")
+
+        os.fsync = refuse
+        try:
+            safe_io.atomic_write_text(target, "written anyway")
+        finally:
+            os.fsync = original_fsync
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "written anyway")
+        self.assertEqual(self._strays(), [])
+
+    def test_json_round_trips(self) -> None:
+        target = self.working / "payload.json"
+        payload = {"b": 2, "a": [1, 2, 3]}
+        safe_io.atomic_write_json(target, payload)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8")), payload)
+
+    def test_atomic_replace_hands_the_writer_a_temporary_not_the_target(self) -> None:
+        """The writer must never see the real path, or a crash inside it would damage
+        the existing file directly."""
+        target = self.working / "labels.json"
+        target.write_text("original", encoding="utf-8")
+        seen: list[Path] = []
+
+        def writer(path: Path) -> None:
+            seen.append(path)
+            path.write_text("replacement", encoding="utf-8")
+
+        safe_io.atomic_replace(target, writer)
+        self.assertEqual(target.read_text(encoding="utf-8"), "replacement")
+        self.assertNotEqual(seen[0], target, "the writer must be given a temporary path")
+
+
+class QuarantineBrokenFiles(unittest.TestCase):
+    def setUp(self) -> None:
+        self.working = Path(tempfile.mkdtemp(prefix="bikini_quarantine_"))
+        self.logger = logging.getLogger("bikini_scanner.tests.quarantine")
+
+    def test_a_missing_file_quarantines_to_nothing_and_says_nothing(self) -> None:
+        """Nothing to quarantine is the ordinary case, not a failure.
+
+        The silence is the assertion that matters. Without the exists() guard the call
+        still returns None -- the rename below simply raises and is swallowed -- but it
+        logs a warning about a file that was never there.
+        """
+        with self.assertNoLogs(self.logger, level="WARNING"):
+            result = safe_io.quarantine_broken_file(self.working / "absent.json", self.logger, "unreadable")
+        self.assertIsNone(result)
+
+    def test_a_broken_file_is_renamed_out_of_the_way(self) -> None:
+        source = self.working / "labels.json"
+        source.write_bytes(b"corrupt")
+        with self.assertLogs(self.logger, level="WARNING"):
+            result = safe_io.quarantine_broken_file(source, self.logger, "bad json")
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.name, "labels.json.broken")
+        self.assertEqual(result.read_bytes(), b"corrupt", "the evidence must be preserved")
+        self.assertFalse(source.exists(), "the broken file must be moved aside")
+
+    def test_repeated_breakages_do_not_overwrite_the_earlier_evidence(self) -> None:
+        source = self.working / "labels.json"
+        (self.working / "labels.json.broken").write_bytes(b"first failure")
+        (self.working / "labels.json.broken.1").write_bytes(b"second failure")
+        source.write_bytes(b"third failure")
+        with self.assertLogs(self.logger, level="WARNING"):
+            result = safe_io.quarantine_broken_file(source, self.logger, "bad json")
+        assert result is not None
+        self.assertEqual(result.name, "labels.json.broken.2")
+        self.assertEqual((self.working / "labels.json.broken").read_bytes(), b"first failure")
+        self.assertEqual((self.working / "labels.json.broken.1").read_bytes(), b"second failure")
+
+    def test_a_quarantine_that_cannot_rename_reports_none(self) -> None:
+        source = self.working / "labels.json"
+        source.write_bytes(b"corrupt")
+        original_replace = Path.replace
+
+        def refuse(_self, _target):
+            raise PermissionError("simulated locked file")
+
+        Path.replace = refuse
+        try:
+            with self.assertLogs(self.logger, level="WARNING"):
+                result = safe_io.quarantine_broken_file(source, self.logger, "bad json")
+        finally:
+            Path.replace = original_replace
+
+        self.assertIsNone(result, "a failed quarantine must report failure, not a path")
+        self.assertTrue(source.exists())
+
+
+class ClassifierCachePersistence(unittest.TestCase):
+    """The per-folder classifier cache is a pickle on disk, so every load is a trust
+    decision as well as a compatibility one."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_clf_"))
+        self.store = FolderStore(self.folder)
+        self.addCleanup(self.store.sqlite_cache.close)
+
+    def test_absent_cache_loads_as_nothing(self) -> None:
+        self.assertIsNone(self.store.load_classifier_cache())
+
+    def test_a_saved_cache_round_trips_and_is_stamped_with_its_version(self) -> None:
+        self.store.save_classifier_cache({"classifier": {"weights": [1.0, 2.0]}})
+        loaded = self.store.load_classifier_cache()
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded["classifier"], {"weights": [1.0, 2.0]})
+        self.assertEqual(loaded["version"], store_module.CLASSIFIER_CACHE_VERSION)
+
+    def test_a_cache_from_another_version_is_ignored(self) -> None:
+        """An old pickle must be discarded rather than fed to the current code."""
+        self.store.save_classifier_cache({"classifier": {"weights": [1.0]}})
+        stale = {"version": store_module.CLASSIFIER_CACHE_VERSION + 1, "classifier": {"weights": [1.0]}}
+        self.store.classifier_path.write_bytes(pickle.dumps(stale))
+        self.assertIsNone(self.store.load_classifier_cache())
+
+    def test_a_cache_without_a_classifier_is_ignored(self) -> None:
+        payload = {"version": store_module.CLASSIFIER_CACHE_VERSION, "classifier": None}
+        self.store.classifier_path.write_bytes(pickle.dumps(payload))
+        self.assertIsNone(self.store.load_classifier_cache())
+
+    def test_a_cache_that_is_not_a_mapping_is_ignored(self) -> None:
+        self.store.classifier_path.write_bytes(pickle.dumps(["not", "a", "dict"]))
+        self.assertIsNone(self.store.load_classifier_cache())
+
+    def test_corrupt_bytes_load_as_nothing_rather_than_raising(self) -> None:
+        self.store.classifier_path.write_bytes(b"this is not a pickle at all")
+        self.assertIsNone(self.store.load_classifier_cache())
+
+    def test_the_unpickler_refuses_a_module_outside_the_allowlist(self) -> None:
+        """The guard itself, checked without running anything: find_class must raise
+        rather than import."""
+        hostile = b"cos\nsystem\n(S'echo pwned'\ntR."
+        with self.assertRaises(pickle.UnpicklingError):
+            store_module.RestrictedUnpickler(io.BytesIO(hostile)).load()
+
+    def test_loading_the_cache_goes_through_the_restricted_unpickler(self) -> None:
+        """That the call site actually uses the guard, not just that the guard exists.
+
+        The payload is a well-formed cache whose classifier is an instance of a class
+        from a module outside the allowlist. An unrestricted unpickler would load it
+        happily and return a dict; the restricted one refuses and the load yields None.
+        A hostile os.system payload would NOT work here -- it returns an int, so the
+        isinstance check rejects it either way and the test could not tell the two
+        unpicklers apart.
+        """
+        payload = {
+            "version": store_module.CLASSIFIER_CACHE_VERSION,
+            "classifier": types.SimpleNamespace(weights=[1.0]),
+        }
+        self.store.classifier_path.write_bytes(pickle.dumps(payload))
+        self.assertIsNone(
+            self.store.load_classifier_cache(),
+            "a classifier from a non-allowlisted module must not be unpickled",
+        )
+
+
+class ReviewSessionPersistence(unittest.TestCase):
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_review_"))
+        self.store = FolderStore(self.folder)
+        self.addCleanup(self.store.sqlite_cache.close)
+
+    def test_absent_session_loads_as_nothing(self) -> None:
+        self.assertIsNone(self.store.load_review_session())
+
+    def test_a_saved_session_round_trips(self) -> None:
+        self.store.save_review_session({"index": 4, "bucket": "Bikini"})
+        self.assertEqual(self.store.load_review_session(), {"index": 4, "bucket": "Bikini"})
+
+    def test_unreadable_json_is_quarantined_rather_than_deleted(self) -> None:
+        """A corrupt session must not take the app down, and must not be silently
+        destroyed either -- the bytes are kept next to it for inspection."""
+        self.store.review_session_path.write_text("{not valid json", encoding="utf-8")
+        with self.assertLogs(store_module.LOGGER, level="WARNING"):
+            self.assertIsNone(self.store.load_review_session())
+        preserved = self.store.review_session_path.with_name(f"{self.store.review_session_path.name}.broken")
+        self.assertTrue(preserved.exists(), "the corrupt file must be preserved")
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "{not valid json")
+        self.assertFalse(self.store.review_session_path.exists())
+
+    def test_a_session_of_the_wrong_shape_is_quarantined(self) -> None:
+        self.store.review_session_path.write_text("[1, 2, 3]", encoding="utf-8")
+        self.assertIsNone(self.store.load_review_session())
+        preserved = self.store.review_session_path.with_name(f"{self.store.review_session_path.name}.broken")
+        self.assertTrue(preserved.exists())
+
+
+class DuplicateGroupsAndCacheSize(unittest.TestCase):
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_dupes_"))
+        payload = _make_image_bytes()
+        self.twin_a = self.folder / "a.jpg"
+        self.twin_b = self.folder / "b.jpg"
+        self.lonely = self.folder / "c.jpg"
+        self.twin_a.write_bytes(payload)
+        self.twin_b.write_bytes(payload)
+        self.lonely.write_bytes(_make_image_bytes(size=(48, 48)))
+        self.store = FolderStore(self.folder)
+        self.addCleanup(self.store.sqlite_cache.close)
+        self.store.save_scan_cache(
+            {},
+            {
+                p: {
+                    "content_hash": content_hash_for_path(p),
+                    "mtime_ns": p.stat().st_mtime_ns,
+                    "size": p.stat().st_size,
+                }
+                for p in (self.twin_a, self.twin_b, self.lonely)
+            },
+        )
+
+    def test_identical_files_are_grouped_and_singletons_are_not(self) -> None:
+        groups = self.store.duplicate_groups()
+        self.assertEqual(len(groups), 1, "only the two identical files form a group")
+        members = next(iter(groups.values()))
+        self.assertEqual(members, sorted([str(self.twin_a.resolve()), str(self.twin_b.resolve())]))
+        self.assertNotIn(str(self.lonely.resolve()), members)
+
+    def test_restricting_to_one_file_leaves_no_group(self) -> None:
+        """A group needs two members present; filtering one twin out dissolves it."""
+        groups = self.store.duplicate_groups([self.twin_a])
+        self.assertEqual(groups, {})
+
+    def test_cache_size_counts_nested_files_too(self) -> None:
+        """The cache has subdirectories, so a top-level-only walk would under-report."""
+        self.store.save_scan_metadata({"scanned": 3})
+        nested_dir = self.store.cache_dir / "thumbs" / "deep"
+        nested_dir.mkdir(parents=True)
+        (nested_dir / "buried.bin").write_bytes(b"x" * 4096)
+
+        size = self.store.cache_size_bytes()
+        expected = sum(p.stat().st_size for p in self.store.cache_dir.rglob("*") if p.is_file())
+        self.assertEqual(size, expected)
+        self.assertGreaterEqual(size, 4096, "the nested file must be included in the total")
+
+    def test_clearing_the_cache_empties_it_but_keeps_the_images(self) -> None:
+        self.store.save_scan_metadata({"scanned": 3})
+        self.store.save_review_session({"index": 1})
+        self.assertGreater(self.store.cache_size_bytes(), 0)
+
+        self.store.clear_cache()
+        self.addCleanup(self.store.sqlite_cache.close)
+
+        self.assertIsNone(self.store.load_review_session(), "cleared state must not come back")
+        self.assertTrue(self.store.cache_dir.is_dir(), "the cache directory itself is recreated")
+        for image in (self.twin_a, self.twin_b, self.lonely):
+            self.assertTrue(image.exists(), "clearing the cache must never touch the user's images")
 
 
 class Configuration(unittest.TestCase):
