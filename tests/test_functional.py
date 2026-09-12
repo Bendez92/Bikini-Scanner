@@ -1552,6 +1552,208 @@ class UserPreferences(unittest.TestCase):
         self.assertEqual(json.loads(nested.read_text(encoding="utf-8")), {"a": 1})
 
 
+class PromptNormalisation(unittest.TestCase):
+    """Prompts arrive from config as bare strings or (text, weight) pairs, so the
+    normaliser is the first thing any bad config hits."""
+
+    def test_bare_strings_get_a_unit_weight(self) -> None:
+        texts, weights = BikiniScorer._normalize_prompts(["a photo", " a drawing "])
+        self.assertEqual(texts, ["a photo", "a drawing"])
+        np.testing.assert_allclose(weights, [1.0, 1.0])
+
+    def test_weighted_pairs_keep_their_weight(self) -> None:
+        texts, weights = BikiniScorer._normalize_prompts([("a photo", 2.5)])
+        self.assertEqual(texts, ["a photo"])
+        np.testing.assert_allclose(weights, [2.5])
+
+    def test_an_unparsable_weight_falls_back_to_one(self) -> None:
+        _texts, weights = BikiniScorer._normalize_prompts([("a photo", "heavy")])
+        np.testing.assert_allclose(weights, [1.0])
+
+    def test_a_non_positive_weight_falls_back_to_one(self) -> None:
+        """A zero or negative weight would silently delete or invert a prompt."""
+        _texts, weights = BikiniScorer._normalize_prompts([("a", 0.0), ("b", -3.0)])
+        np.testing.assert_allclose(weights, [1.0, 1.0])
+
+    def test_blank_prompts_are_dropped(self) -> None:
+        texts, weights = BikiniScorer._normalize_prompts(["real", "   ", ""])
+        self.assertEqual(texts, ["real"])
+        self.assertEqual(len(weights), 1)
+
+    def test_an_entirely_blank_prompt_list_still_yields_one_entry(self) -> None:
+        """Downstream code indexes into this, so it must never come back empty."""
+        texts, weights = BikiniScorer._normalize_prompts(["  ", ""])
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(len(weights), 1)
+
+
+class LabelCounts(unittest.TestCase):
+    def test_each_label_value_lands_in_its_own_bucket(self) -> None:
+        counts = BikiniScorer.label_counts({"a": 1, "b": 1, "c": 0, "d": 2, "e": 7})
+        self.assertEqual(counts["good"], 2)
+        self.assertEqual(counts["bad"], 1)
+        self.assertEqual(counts["skip"], 1)
+
+    def test_an_empty_mapping_counts_zero_everywhere(self) -> None:
+        self.assertEqual(BikiniScorer.label_counts({}), {"good": 0, "bad": 0, "skip": 0, "unlabeled": 0})
+
+
+class ClassifierTraining(unittest.TestCase):
+    """Training is cached against a signature of the labelled set, so the signature has
+    to move whenever the training data does -- otherwise a stale model is reused."""
+
+    def setUp(self) -> None:
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_train_"))
+        self.scorer = BikiniScorer(backend=_shared()["backend"], config=ScannerConfig())
+        self.rng = np.random.default_rng(0)
+        self.paths: list[str] = []
+        for index in range(10):
+            path = self.folder / f"img_{index}.jpg"
+            path.write_bytes(_make_image_bytes())
+            self.paths.append(str(path))
+        # Separable by the first component so the fit is meaningful rather than noise.
+        self.embeddings = {
+            path: np.concatenate(
+                [[1.0 if index % 2 == 0 else -1.0], self.rng.normal(size=7)]
+            ).astype(np.float32)
+            for index, path in enumerate(self.paths)
+        }
+        self.labels = {path: (1 if index % 2 == 0 else 0) for index, path in enumerate(self.paths)}
+
+    def test_too_few_labels_leave_no_classifier(self) -> None:
+        few = dict(list(self.labels.items())[:4])
+        count = self.scorer.train_classifier(self.embeddings, few)
+        self.assertEqual(count, 4)
+        self.assertIsNone(self.scorer.classifier, "fewer than six labels must not train a model")
+
+    def test_a_single_class_leaves_no_classifier(self) -> None:
+        """Eight accepts and no rejects is not something to learn a boundary from."""
+        one_sided = dict.fromkeys(self.paths[:8], 1)
+        self.scorer.train_classifier(self.embeddings, one_sided)
+        self.assertIsNone(self.scorer.classifier)
+
+    def test_skip_labels_are_not_training_data(self) -> None:
+        mixed = dict(self.labels)
+        for path in self.paths[:2]:
+            mixed[path] = 2
+        count = self.scorer.train_classifier(self.embeddings, mixed)
+        self.assertEqual(count, len(self.paths) - 2, "label 2 (skip) must not be counted or trained on")
+
+    def test_enough_labels_train_a_classifier(self) -> None:
+        count = self.scorer.train_classifier(self.embeddings, self.labels)
+        self.assertEqual(count, len(self.paths))
+        self.assertIsNotNone(self.scorer.classifier)
+
+    def test_the_signature_tracks_the_labelled_set(self) -> None:
+        pairs = [(path, self.labels[path]) for path in self.paths]
+        base = self.scorer._classifier_signature(pairs, 24)
+        self.assertEqual(base, self.scorer._classifier_signature(list(reversed(pairs)), 24),
+                         "ordering must not change the signature")
+        flipped = [(path, 1 - label) for path, label in pairs]
+        self.assertNotEqual(base, self.scorer._classifier_signature(flipped, 24),
+                            "changed labels must change the signature")
+        self.assertNotEqual(base, self.scorer._classifier_signature(pairs, 48),
+                            "a different feature width must change the signature")
+
+    def test_editing_a_labelled_image_changes_the_signature(self) -> None:
+        """The signature folds in mtime and size, so a re-saved photo retrains rather
+        than reusing a model fitted to the old pixels."""
+        pairs = [(path, self.labels[path]) for path in self.paths]
+        before = self.scorer._classifier_signature(pairs, 24)
+        edited = Path(self.paths[0])
+        edited.write_bytes(_make_image_bytes(size=(96, 96)))
+        os.utime(edited, (0, 0))
+        self.assertNotEqual(before, self.scorer._classifier_signature(pairs, 24))
+
+    def test_a_matching_cached_classifier_is_reused_instead_of_refitting(self) -> None:
+        store = FolderStore(self.folder)
+        self.addCleanup(store.sqlite_cache.close)
+        self.scorer.train_classifier(self.embeddings, self.labels, store=store)
+        trained = self.scorer.classifier
+        self.assertIsNotNone(trained)
+
+        fresh = BikiniScorer(backend=_shared()["backend"], config=ScannerConfig())
+        fresh.train_classifier(self.embeddings, self.labels, store=store)
+        self.assertIsNotNone(fresh.classifier)
+        self.assertEqual(
+            store.load_classifier_cache()["signature"],
+            fresh._classifier_signature(
+                [(p, self.labels[p]) for p in self.paths],
+                int(next(iter(self.embeddings.values())).shape[0]) * 2 + len(scorer_module.FEATURE_AXIS_ORDER),
+            ),
+        )
+
+    def test_a_cache_from_different_labels_is_not_reused(self) -> None:
+        store = FolderStore(self.folder)
+        self.addCleanup(store.sqlite_cache.close)
+        store.save_classifier_cache({"signature": "not-the-right-signature", "classifier": "a stale object"})
+        self.scorer.train_classifier(self.embeddings, self.labels, store=store)
+        self.assertNotEqual(self.scorer.classifier, "a stale object", "a stale cache must be refitted, not trusted")
+        self.assertIsNotNone(self.scorer.classifier)
+
+    def test_a_cache_that_cannot_be_written_does_not_lose_the_model(self) -> None:
+        """A read-only cache folder used to throw the training away on every restart."""
+        store = FolderStore(self.folder)
+        self.addCleanup(store.sqlite_cache.close)
+
+        def refuse(_self, _payload):
+            raise OSError("simulated read-only cache")
+
+        # FolderStore uses __slots__, so the method is patched on the class.
+        original = FolderStore.save_classifier_cache
+        FolderStore.save_classifier_cache = refuse
+        self.addCleanup(setattr, FolderStore, "save_classifier_cache", original)
+
+        with self.assertLogs(scorer_module.LOGGER, level="ERROR"):
+            count = self.scorer.train_classifier(self.embeddings, self.labels, store=store)
+        self.assertEqual(count, len(self.paths))
+        self.assertIsNotNone(self.scorer.classifier, "the model is usable this session even if it cannot be saved")
+
+
+class QualityEstimation(unittest.TestCase):
+    def setUp(self) -> None:
+        self.scorer = BikiniScorer(backend=_shared()["backend"], config=ScannerConfig())
+        rng = np.random.default_rng(1)
+        self.embeddings = {
+            f"p{i}": np.concatenate([[1.0 if i % 2 == 0 else -1.0], rng.normal(size=7)]).astype(np.float32)
+            for i in range(20)
+        }
+        self.labels = {f"p{i}": (1 if i % 2 == 0 else 0) for i in range(20)}
+
+    def test_too_few_labels_give_no_estimate(self) -> None:
+        """Pins the outcome, not the `< 6` guard that produces it.
+
+        That guard is arithmetically redundant: test_size is max(2, round(n/4)), so for
+        every n below 6 the `len(y) - test_size < 4` check below already returns None.
+        Deleting it leaves this test green because there is no input that reaches one
+        guard without the other.
+        """
+        few = {f"p{i}": self.labels[f"p{i}"] for i in range(4)}
+        self.assertIsNone(self.scorer.estimate_quality(self.embeddings, few))
+
+    def test_a_minority_class_of_two_gives_no_estimate(self) -> None:
+        """Two examples of a class cannot honestly be split into train and test.
+
+        The size matters: with 20 labels and a minority of 2 the split does succeed, and
+        without the min-class guard this returns a perfect 1.0 computed from a single
+        minority example -- a quality figure the user would read as certainty. At 10
+        labels the split fails for unrelated reasons and the guard cannot be seen.
+        """
+        labels = {f"p{i}": (0 if i < 2 else 1) for i in range(20)}
+        self.assertIsNone(self.scorer.estimate_quality(self.embeddings, labels))
+
+    def test_a_separable_set_scores_above_chance(self) -> None:
+        auc = self.scorer.estimate_quality(self.embeddings, self.labels)
+        self.assertIsNotNone(auc)
+        assert auc is not None
+        self.assertGreaterEqual(auc, 0.5)
+        self.assertLessEqual(auc, 1.0)
+
+    def test_a_measured_cv_score_is_preferred_over_a_fresh_split(self) -> None:
+        self.scorer.learning_outcome.cv_auc = 0.77
+        self.assertAlmostEqual(self.scorer.estimate_quality(self.embeddings, self.labels), 0.77)
+
+
 class Configuration(unittest.TestCase):
     def test_round_trip_preserves_every_field(self) -> None:
         config = ScannerConfig()
