@@ -22,7 +22,7 @@ Run these before committing to `main`:
 
 Expected outcomes:
 
-- 215 functional tests pass.
+- 234 functional tests pass.
 - Ruff reports `All checks passed!`.
 - Mypy reports `Success: no issues found in ... source files`.
 - Baseline reports `Baseline matches ...`.

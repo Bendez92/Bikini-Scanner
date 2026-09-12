@@ -29,6 +29,7 @@ import textwrap
 import threading
 import types
 import unittest
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -63,6 +64,7 @@ from bikini_scanner import (
     user_prefs,
     vision_analysis,
 )
+from bikini_scanner import global_store as global_store_module
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
 from bikini_scanner.__version__ import __version__
@@ -84,6 +86,26 @@ from bikini_scanner.vision_analysis import FaceBox, detect_face_count
 from bikini_scanner.vlm_backend import VLMCancelled, VLMClient, is_local_endpoint, parse_axis_json
 
 IMAGE_COUNT = 8
+
+
+def _record_unpickle_side_effect(marker: str) -> int:
+    """Stand-in for the arbitrary callable a crafted pickle would invoke.
+
+    Writing a file is harmless and observable; the real payload would not be.
+    """
+    Path(marker).write_text("executed", encoding="utf-8")
+    return 0
+
+
+class _ExecutesOnUnpickle:
+    """Reduces to a call, which is what makes a pickle dangerous in the first place."""
+
+    def __init__(self, marker: str) -> None:
+        self.marker = marker
+
+    def __reduce__(self):
+        return (_record_unpickle_side_effect, (self.marker,))
+
 _SHARED: dict[str, object] = {}
 
 
@@ -2143,6 +2165,200 @@ class FaceDetectionResults(unittest.TestCase):
         vision_analysis._detector = lambda: Exploding()
         with self.assertLogs(vision_analysis.LOGGER, level="ERROR"):
             self.assertEqual(vision_analysis.detect_face_boxes(Image.new("RGB", (64, 64))), [])
+
+
+class TrainingSetShape(unittest.TestCase):
+    def test_length_is_the_label_count(self) -> None:
+        training = global_store_module.TrainingSet(
+            features=np.zeros((3, 4), dtype=np.float32),
+            labels=np.asarray([1, 0, 1], dtype=np.int64),
+            paths=["a", "b", "c"],
+        )
+        self.assertEqual(len(training), 3)
+        self.assertEqual(training.class_counts(), {0: 1, 1: 2})
+
+    def test_an_empty_set_counts_zero_of_each_class(self) -> None:
+        """Pins the outcome, not the early return that produces it: np.bincount with
+        minlength=2 already yields [0, 0] for an empty array, so deleting that guard
+        leaves this green."""
+        empty = global_store_module.TrainingSet(
+            features=np.zeros((0, 4), dtype=np.float32),
+            labels=np.asarray([], dtype=np.int64),
+            paths=[],
+        )
+        self.assertEqual(len(empty), 0)
+        self.assertEqual(empty.class_counts(), {0: 0, 1: 0})
+
+
+class GlobalLearningPersistence(unittest.TestCase):
+    """Labels and features shared across folders. Everything here is read back from
+    disk, so every file is untrusted input by the time it returns."""
+
+    def setUp(self) -> None:
+        self.store = GlobalLearningStore(f"persistence-{uuid.uuid4().hex}")
+        self.addCleanup(self.store.clear)
+        self.rng = np.random.default_rng(5)
+        # Real files on disk: training_set prunes labels whose image is gone, so
+        # invented paths would be dropped before any of this could be observed.
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_global_"))
+
+    def _entries(self, count: int):
+        entries = []
+        for i in range(count):
+            path = self.folder / f"img_{i}.jpg"
+            path.write_bytes(_make_image_bytes())
+            entries.append((str(path), i % 2, self.rng.normal(size=8).astype(np.float32)))
+        return entries
+
+    def test_recorded_labels_come_back_as_a_training_set(self) -> None:
+        self.store.record(self._entries(6), sequence=1)
+        training = self.store.training_set()
+        self.assertEqual(len(training), 6)
+        self.assertEqual(training.features.shape, (6, 8))
+        self.assertEqual(training.class_counts(), {0: 3, 1: 3})
+
+    def test_stats_count_each_verdict(self) -> None:
+        """Deliberately lopsided: an even split cannot tell accepted from rejected."""
+        entries = self._entries(6)
+        skewed = [(path, 1, feature) for path, _label, feature in entries[:5]]
+        skewed.append((entries[5][0], 0, entries[5][2]))
+        self.store.record(skewed, sequence=1)
+        self.assertEqual(self.store.stats(), {"total": 6, "accepted": 5, "rejected": 1})
+
+    def test_forgetting_a_path_removes_it_from_training(self) -> None:
+        entries = self._entries(6)
+        self.store.record(entries, sequence=1)
+        self.store.forget([entries[0][0]])
+        training = self.store.training_set()
+        self.assertEqual(len(training), 5)
+        self.assertNotIn(entries[0][0], training.paths)
+
+    def test_a_label_whose_image_is_gone_stops_teaching(self) -> None:
+        """Otherwise one scan of a temporary folder trains this model forever."""
+        entries = self._entries(6)
+        self.store.record(entries, sequence=1)
+        Path(entries[0][0]).unlink()
+        with self.assertLogs(global_store_module.LOGGER, level="INFO"):
+            training = self.store.training_set()
+        self.assertEqual(len(training), 5)
+        self.assertNotIn(entries[0][0], training.paths)
+        self.assertEqual(self.store.stats()["total"], 5, "the label is pruned, not just skipped")
+
+    def test_features_of_the_wrong_width_are_excluded(self) -> None:
+        """A model change alters the feature width; mixing widths would raise inside
+        np.vstack and take the whole training set with it."""
+        self.store.record(self._entries(4), sequence=1)
+        odd = self.folder / "odd.jpg"
+        odd.write_bytes(_make_image_bytes())
+        self.store.record([(str(odd), 1, self.rng.normal(size=16).astype(np.float32))], sequence=2)
+        training = self.store.training_set(expected_dim=8)
+        self.assertEqual(training.features.shape[1], 8)
+        self.assertNotIn(str(odd), training.paths)
+
+    def test_a_corrupt_index_is_quarantined(self) -> None:
+        self.store.record(self._entries(4), sequence=1)
+        self.store.index_path.write_text("{not json", encoding="utf-8")
+        with self.assertLogs(global_store_module.LOGGER, level="WARNING"):
+            self.assertEqual(self.store.stats()["total"], 0)
+        self.assertTrue(self.store.index_path.with_name(f"{self.store.index_path.name}.broken").exists())
+
+    def test_an_archive_carrying_a_pickled_object_is_refused(self) -> None:
+        """A valid NPZ whose payload is a pickled object, which is how a crafted
+        features.npz would execute code on load. Garbage bytes cannot show this: they
+        fail with or without allow_pickle=False, so only a well-formed archive
+        distinguishes the two."""
+        self.store.record(self._entries(4), sequence=1)
+        marker = self.folder / "unpickle_ran.txt"
+        payload = np.empty(1, dtype=object)
+        payload[0] = _ExecutesOnUnpickle(str(marker))
+        with self.store.features_path.open("wb") as handle:
+            np.savez(handle, hostile=payload)
+
+        with self.assertLogs(global_store_module.LOGGER, level="WARNING"):
+            self.assertEqual(len(self.store.training_set()), 0)
+
+        self.assertFalse(marker.exists(), "the archive's pickle must never be executed")
+        self.assertTrue(self.store.features_path.with_name(f"{self.store.features_path.name}.broken").exists())
+
+    def test_a_corrupt_feature_archive_is_quarantined(self) -> None:
+        self.store.record(self._entries(4), sequence=1)
+        self.store.features_path.write_bytes(b"not an npz archive")
+        with self.assertLogs(global_store_module.LOGGER, level="WARNING"):
+            self.assertEqual(len(self.store.training_set()), 0)
+        self.assertTrue(self.store.features_path.with_name(f"{self.store.features_path.name}.broken").exists())
+
+    def test_an_index_that_is_not_a_mapping_yields_nothing(self) -> None:
+        self.store.index_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.index_path.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
+        self.assertEqual(self.store.stats()["total"], 0)
+
+    def test_clearing_removes_every_file(self) -> None:
+        self.store.record(self._entries(4), sequence=1)
+        self.store.save_classifier({"classifier": {"weights": [1.0]}})
+        self.store.clear()
+        for path in (self.store.index_path, self.store.features_path, self.store.classifier_path):
+            self.assertFalse(path.exists(), f"{path.name} must be gone")
+
+    def test_clearing_an_already_empty_store_is_not_an_error(self) -> None:
+        self.store.clear()
+        self.store.clear()
+
+
+class GlobalClassifierPersistence(unittest.TestCase):
+    def setUp(self) -> None:
+        self.store = GlobalLearningStore(f"classifier-{uuid.uuid4().hex}")
+        self.addCleanup(self.store.clear)
+
+    def test_an_absent_classifier_loads_as_nothing(self) -> None:
+        self.assertIsNone(self.store.load_classifier())
+
+    def test_a_saved_classifier_round_trips_with_its_feature_version(self) -> None:
+        self.store.save_classifier({"classifier": {"weights": [1.0, 2.0]}})
+        loaded = self.store.load_classifier()
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertEqual(loaded["classifier"], {"weights": [1.0, 2.0]})
+        self.assertEqual(loaded["feature_version"], global_store_module.FEATURE_VERSION)
+
+    def test_a_classifier_from_another_feature_version_is_ignored(self) -> None:
+        """Features changed shape, so a model fitted to the old ones is meaningless."""
+        payload = {
+            "classifier": {"weights": [1.0]},
+            "feature_version": global_store_module.FEATURE_VERSION + 1,
+        }
+        self.store.classifier_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.classifier_path.write_bytes(pickle.dumps(payload))
+        self.assertIsNone(self.store.load_classifier())
+
+    def test_corrupt_classifier_bytes_load_as_nothing(self) -> None:
+        self.store.classifier_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.classifier_path.write_bytes(b"not a pickle")
+        with self.assertLogs(global_store_module.LOGGER, level="WARNING"):
+            self.assertIsNone(self.store.load_classifier())
+
+    def test_loading_goes_through_the_restricted_unpickler(self) -> None:
+        """The call site, not just the guard. A well-formed payload whose classifier
+        comes from a non-allowlisted module would load fine under a plain unpickler."""
+        payload = {
+            "classifier": types.SimpleNamespace(weights=[1.0]),
+            "feature_version": global_store_module.FEATURE_VERSION,
+        }
+        self.store.classifier_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.classifier_path.write_bytes(pickle.dumps(payload))
+        with self.assertLogs(global_store_module.LOGGER, level="WARNING"):
+            self.assertIsNone(self.store.load_classifier())
+
+    def test_a_classifier_that_cannot_be_written_is_logged_not_raised(self) -> None:
+        original = global_store_module.atomic_replace
+
+        def refuse(*_args, **_kwargs):
+            raise OSError("simulated read-only global store")
+
+        global_store_module.atomic_replace = refuse
+        self.addCleanup(setattr, global_store_module, "atomic_replace", original)
+
+        with self.assertLogs(global_store_module.LOGGER, level="ERROR"):
+            self.store.save_classifier({"classifier": {"weights": [1.0]}})
 
 
 class Configuration(unittest.TestCase):
