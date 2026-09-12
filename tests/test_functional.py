@@ -24,6 +24,7 @@ import pickle
 import shutil
 import sys
 import tempfile
+import textwrap
 import threading
 import types
 import unittest
@@ -53,11 +54,15 @@ from bikini_scanner import (
     learning,
     linear_model,
     output_ops,
+    plugins,
     regions,
     safe_io,
+    update_checker,
+    user_prefs,
 )
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
+from bikini_scanner.__version__ import __version__
 from bikini_scanner.config import ScannerConfig, filter_folder_override
 from bikini_scanner.config_profiles import BUILTIN_PROFILES, profile_config, profile_names
 from bikini_scanner.global_store import GlobalLearningStore
@@ -1294,6 +1299,257 @@ class DuplicateGroupsAndCacheSize(unittest.TestCase):
         self.assertTrue(self.store.cache_dir.is_dir(), "the cache directory itself is recreated")
         for image in (self.twin_a, self.twin_b, self.lonely):
             self.assertTrue(image.exists(), "clearing the cache must never touch the user's images")
+
+
+class PluginLoading(unittest.TestCase):
+    """Plugins are arbitrary Python from the user's own plugins folder, executed in
+    process. The defaults and the failure handling are the whole safety story."""
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bikini_plugins_"))
+        original = plugins.plugins_dir
+        plugins.plugins_dir = lambda: self.directory
+        self.addCleanup(setattr, plugins, "plugins_dir", original)
+        self.samples: list[dict[str, object]] = [{"path": "a.jpg"}, {"path": "b.jpg"}]
+
+    def _write_plugin(self, name: str, body: str) -> Path:
+        path = self.directory / name
+        path.write_text(textwrap.dedent(body), encoding="utf-8")
+        return path
+
+    def test_plugins_do_not_run_unless_explicitly_enabled(self) -> None:
+        """The default must be off: a plugin file sitting in the folder is not consent
+        to execute it."""
+        marker = self.directory / "executed.txt"
+        self._write_plugin(
+            "evil.py",
+            f"""
+            from pathlib import Path
+            Path(r"{marker}").write_text("ran", encoding="utf-8")
+
+            def process_results(state, samples):
+                return []
+            """,
+        )
+        result = plugins.apply_plugins(None, self.samples)
+        self.assertEqual(result, self.samples)
+        self.assertFalse(marker.exists(), "a disabled plugin must not be imported at all")
+
+    def test_a_missing_plugins_folder_is_not_an_error(self) -> None:
+        """Pins the outcome -- samples come back untouched, nothing raises.
+
+        It does not pin the exists() early-out above the loop: deleting that guard
+        leaves this test green, because Path.glob over a missing directory yields
+        nothing rather than raising. The guard saves a walk, not a crash.
+        """
+        shutil.rmtree(self.directory)
+        self.assertEqual(plugins.apply_plugins(None, self.samples, enabled=True), self.samples)
+
+    def test_an_enabled_plugin_can_rewrite_the_samples(self) -> None:
+        self._write_plugin(
+            "keep_first.py",
+            """
+            def process_results(state, samples):
+                return samples[:1]
+            """,
+        )
+        with self.assertLogs(plugins.LOGGER, level="INFO"):
+            result = plugins.apply_plugins(None, self.samples, enabled=True)
+        self.assertEqual(result, [{"path": "a.jpg"}])
+
+    def test_a_plugin_returning_none_leaves_the_samples_alone(self) -> None:
+        self._write_plugin(
+            "observer.py",
+            """
+            def process_results(state, samples):
+                return None
+            """,
+        )
+        with self.assertLogs(plugins.LOGGER, level="INFO"):
+            result = plugins.apply_plugins(None, self.samples, enabled=True)
+        self.assertEqual(result, self.samples)
+
+    def test_a_plugin_without_the_hook_is_reported_and_skipped(self) -> None:
+        self._write_plugin("useless.py", "VALUE = 1\n")
+        with self.assertLogs(plugins.LOGGER, level="WARNING") as captured:
+            result = plugins.apply_plugins(None, self.samples, enabled=True)
+        self.assertEqual(result, self.samples)
+        self.assertIn("process_results", "".join(captured.output))
+
+    def test_one_broken_plugin_does_not_stop_the_others(self) -> None:
+        """A plugin that raises on import must not cost the user the plugins that work."""
+        self._write_plugin("a_broken.py", "raise RuntimeError('boom')\n")
+        self._write_plugin(
+            "b_working.py",
+            """
+            def process_results(state, samples):
+                return samples[:1]
+            """,
+        )
+        with self.assertLogs(plugins.LOGGER, level="WARNING"):
+            result = plugins.apply_plugins(None, self.samples, enabled=True)
+        self.assertEqual(result, [{"path": "a.jpg"}], "the working plugin must still run")
+
+    def test_a_hook_that_raises_is_caught(self) -> None:
+        self._write_plugin(
+            "thrower.py",
+            """
+            def process_results(state, samples):
+                raise ValueError("bad plugin")
+            """,
+        )
+        with self.assertLogs(plugins.LOGGER, level="WARNING"):
+            result = plugins.apply_plugins(None, self.samples, enabled=True)
+        self.assertEqual(result, self.samples)
+
+    def test_plugins_are_chained_in_filename_order(self) -> None:
+        self._write_plugin(
+            "1_first.py",
+            """
+            def process_results(state, samples):
+                return samples + [{"path": "from_first"}]
+            """,
+        )
+        self._write_plugin(
+            "2_second.py",
+            """
+            def process_results(state, samples):
+                return samples + [{"path": "from_second"}]
+            """,
+        )
+        with self.assertLogs(plugins.LOGGER, level="INFO"):
+            result = plugins.apply_plugins(None, self.samples, enabled=True)
+        self.assertEqual(
+            [str(entry["path"]) for entry in result],
+            ["a.jpg", "b.jpg", "from_first", "from_second"],
+            "each plugin must receive the previous plugin's output",
+        )
+
+
+class VersionComparison(unittest.TestCase):
+    def test_a_leading_v_and_whitespace_are_ignored(self) -> None:
+        self.assertEqual(update_checker._version_tuple("  v1.4.2 "), (1, 4, 2))
+
+    def test_non_numeric_segments_count_as_zero_rather_than_raising(self) -> None:
+        self.assertEqual(update_checker._version_tuple("1.4.2b"), (1, 4, 0))
+
+    def test_ordering_is_numeric_not_lexicographic(self) -> None:
+        """The bug this prevents: "1.10.0" sorting below "1.9.0" as text."""
+        self.assertGreater(update_checker._version_tuple("1.10.0"), update_checker._version_tuple("1.9.0"))
+
+
+class UpdateChecking(unittest.TestCase):
+    """The update check talks to the network, so every failure mode has to end in a
+    quiet None rather than an exception reaching the GUI."""
+
+    def setUp(self) -> None:
+        self.original = update_checker.urlopen
+        self.addCleanup(setattr, update_checker, "urlopen", self.original)
+        self.requested: list[object] = []
+
+    def _serve(self, body: str):
+        class FakeResponse:
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *_exc):
+                return False
+
+            def read(self_inner):
+                return body.encode("utf-8")
+
+        def fake_urlopen(request, timeout=None):
+            self.requested.append(request)
+            return FakeResponse()
+
+        update_checker.urlopen = fake_urlopen
+
+    def test_a_blank_url_asks_nothing_and_complains_about_nothing(self) -> None:
+        """An unconfigured update URL is a normal state, not a failure to report.
+
+        The silence matters as much as the None. Without the early return the blank URL
+        reaches Request(), which raises ValueError, which is caught -- same None, but a
+        warning in the log on every startup for a feature the user never enabled.
+        """
+        self._serve("{}")
+        with self.assertNoLogs(update_checker.LOGGER, level="WARNING"):
+            self.assertIsNone(update_checker.check_for_update("   "))
+        self.assertEqual(self.requested, [], "a blank URL must not reach the network")
+
+    def test_a_newer_version_is_reported(self) -> None:
+        current = update_checker._version_tuple(__version__)
+        newer = ".".join(str(part) for part in (current[0] + 1, *current[1:]))
+        self._serve(json.dumps({"latest_version": newer, "download_url": "https://example.invalid/dl"}))
+        result = update_checker.check_for_update("https://example.invalid/latest")
+        self.assertEqual(result, {"latest_version": newer, "download_url": "https://example.invalid/dl"})
+
+    def test_the_current_version_is_not_an_update(self) -> None:
+        self._serve(json.dumps({"latest_version": __version__, "download_url": "x"}))
+        self.assertIsNone(update_checker.check_for_update("https://example.invalid/latest"))
+
+    def test_an_older_version_is_not_an_update(self) -> None:
+        self._serve(json.dumps({"latest_version": "0.0.1", "download_url": "x"}))
+        self.assertIsNone(update_checker.check_for_update("https://example.invalid/latest"))
+
+    def test_a_payload_without_a_version_is_ignored(self) -> None:
+        """Pins the outcome, not the `not latest` guard that produces it.
+
+        That guard is redundant: _version_tuple("") is (0,), which loses the comparison
+        below on its own, so deleting it leaves this test green. It would only matter if
+        the app's own version were 0.0.0.
+        """
+        self._serve(json.dumps({"download_url": "x"}))
+        self.assertIsNone(update_checker.check_for_update("https://example.invalid/latest"))
+
+    def test_malformed_json_is_swallowed(self) -> None:
+        self._serve("not json at all")
+        with self.assertLogs(update_checker.LOGGER, level="WARNING"):
+            self.assertIsNone(update_checker.check_for_update("https://example.invalid/latest"))
+
+    def test_a_network_failure_is_swallowed(self) -> None:
+        def explode(_request, timeout=None):
+            raise OSError("simulated connection refused")
+
+        update_checker.urlopen = explode
+        with self.assertLogs(update_checker.LOGGER, level="WARNING"):
+            self.assertIsNone(update_checker.check_for_update("https://example.invalid/latest"))
+
+
+class UserPreferences(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bikini_prefs_"))
+        self.path = self.directory / "prefs.json"
+        original = user_prefs.prefs_path
+        user_prefs.prefs_path = lambda: self.path
+        self.addCleanup(setattr, user_prefs, "prefs_path", original)
+
+    def test_absent_prefs_load_as_an_empty_mapping(self) -> None:
+        self.assertEqual(user_prefs.load_user_prefs(), {})
+
+    def test_prefs_round_trip(self) -> None:
+        user_prefs.save_user_prefs({"last_folder": "C:/photos", "threshold": 0.4})
+        self.assertEqual(user_prefs.load_user_prefs(), {"last_folder": "C:/photos", "threshold": 0.4})
+
+    def test_corrupt_prefs_are_quarantined_not_deleted(self) -> None:
+        """Losing preferences is survivable; silently destroying the file is not."""
+        self.path.write_text("{broken", encoding="utf-8")
+        with self.assertLogs(user_prefs.LOGGER, level="WARNING"):
+            self.assertEqual(user_prefs.load_user_prefs(), {})
+        preserved = self.path.with_name(f"{self.path.name}.broken")
+        self.assertTrue(preserved.exists())
+        self.assertEqual(preserved.read_text(encoding="utf-8"), "{broken")
+
+    def test_prefs_of_the_wrong_shape_are_quarantined(self) -> None:
+        self.path.write_text("[1, 2, 3]", encoding="utf-8")
+        with self.assertLogs(user_prefs.LOGGER, level="WARNING"):
+            self.assertEqual(user_prefs.load_user_prefs(), {})
+        self.assertTrue(self.path.with_name(f"{self.path.name}.broken").exists())
+
+    def test_saving_creates_missing_parent_directories(self) -> None:
+        nested = self.directory / "deep" / "nested" / "prefs.json"
+        user_prefs.prefs_path = lambda: nested
+        user_prefs.save_user_prefs({"a": 1})
+        self.assertEqual(json.loads(nested.read_text(encoding="utf-8")), {"a": 1})
 
 
 class Configuration(unittest.TestCase):
