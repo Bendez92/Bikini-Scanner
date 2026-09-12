@@ -53,6 +53,7 @@ from bikini_scanner import (
     image_formats,
     learning,
     linear_model,
+    logging_setup,
     output_ops,
     plugins,
     regions,
@@ -1752,6 +1753,218 @@ class QualityEstimation(unittest.TestCase):
     def test_a_measured_cv_score_is_preferred_over_a_fresh_split(self) -> None:
         self.scorer.learning_outcome.cv_auc = 0.77
         self.assertAlmostEqual(self.scorer.estimate_quality(self.embeddings, self.labels), 0.77)
+
+
+class ConfigProfiles(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bikini_profiles_"))
+        self.path = self.directory / "profiles.json"
+        original = config_profiles.profiles_path
+        config_profiles.profiles_path = lambda: self.path
+        self.addCleanup(setattr, config_profiles, "profiles_path", original)
+
+    def test_absent_profiles_load_as_empty(self) -> None:
+        self.assertEqual(config_profiles.load_profiles(), {})
+
+    def test_a_saved_profile_round_trips(self) -> None:
+        config = ScannerConfig()
+        config.threshold = 0.42
+        config_profiles.save_profile("Mine", config)
+        self.assertIn("Mine", config_profiles.load_profiles())
+        restored = config_profiles.profile_config("Mine")
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertAlmostEqual(restored.threshold, 0.42)
+
+    def test_a_builtin_name_cannot_be_overwritten(self) -> None:
+        with self.assertRaises(ValueError):
+            config_profiles.save_profile("Strict", ScannerConfig())
+
+    def test_a_blank_name_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            config_profiles.save_profile("   ", ScannerConfig())
+
+    def test_builtin_profiles_cannot_be_deleted(self) -> None:
+        """The profiles file is written by hand often enough to contain a shadowing
+        entry. Without the built-in guard that entry would be deletable, and the name
+        would then resolve to the built-in again -- a delete that appears to work and
+        silently does nothing. An empty profiles file cannot show this: the lookup
+        misses and reports False either way.
+        """
+        self.path.write_text(json.dumps({"Strict": {"threshold": 0.9}}), encoding="utf-8")
+        self.assertFalse(config_profiles.delete_profile("Strict"))
+        self.assertIn("Strict", config_profiles.load_profiles(), "the shadowing entry must survive")
+
+    def test_deleting_an_unknown_profile_reports_false(self) -> None:
+        self.assertFalse(config_profiles.delete_profile("never existed"))
+
+    def test_a_custom_profile_can_be_deleted(self) -> None:
+        config_profiles.save_profile("Mine", ScannerConfig())
+        self.assertTrue(config_profiles.delete_profile("Mine"))
+        self.assertNotIn("Mine", config_profiles.load_profiles())
+
+    def test_builtins_lead_the_name_list_and_customs_are_sorted(self) -> None:
+        config_profiles.save_profile("zebra", ScannerConfig())
+        config_profiles.save_profile("alpha", ScannerConfig())
+        names = config_profiles.profile_names()
+        self.assertEqual(names[: len(BUILTIN_PROFILES)], list(BUILTIN_PROFILES))
+        self.assertEqual(names[len(BUILTIN_PROFILES):], ["alpha", "zebra"])
+
+    def test_an_unknown_profile_has_no_config(self) -> None:
+        self.assertIsNone(config_profiles.profile_config("not a profile"))
+
+    def test_corrupt_profiles_are_quarantined(self) -> None:
+        self.path.write_text("{not json", encoding="utf-8")
+        with self.assertLogs(config_profiles.LOGGER, level="WARNING"):
+            self.assertEqual(config_profiles.load_profiles(), {})
+        self.assertTrue(self.path.with_name(f"{self.path.name}.broken").exists())
+
+    def test_a_profile_file_whose_entries_are_not_mappings_is_quarantined(self) -> None:
+        """A JSON object of strings would otherwise reach ScannerConfig.from_mapping."""
+        self.path.write_text(json.dumps({"Mine": "not a mapping"}), encoding="utf-8")
+        with self.assertLogs(config_profiles.LOGGER, level="WARNING"):
+            self.assertEqual(config_profiles.load_profiles(), {})
+        self.assertTrue(self.path.with_name(f"{self.path.name}.broken").exists())
+
+    def test_a_top_level_list_is_quarantined(self) -> None:
+        self.path.write_text(json.dumps([{"threshold": 0.5}]), encoding="utf-8")
+        with self.assertLogs(config_profiles.LOGGER, level="WARNING"):
+            self.assertEqual(config_profiles.load_profiles(), {})
+        self.assertTrue(self.path.with_name(f"{self.path.name}.broken").exists())
+
+    def test_legacy_only_keys_are_reported_as_inert_under_the_cascade_pipeline(self) -> None:
+        """A profile setting classifier_weight without pipeline=legacy looks like it is
+        tuning the scoring and in fact does nothing."""
+        self.assertEqual(
+            config_profiles.inert_keys({"classifier_weight": 0.8, "threshold": 0.5}),
+            {"classifier_weight"},
+        )
+
+    def test_nothing_is_inert_once_the_legacy_pipeline_is_selected(self) -> None:
+        self.assertEqual(
+            config_profiles.inert_keys({"classifier_weight": 0.8, "pipeline": "legacy"}),
+            set(),
+        )
+
+    def test_neither_builtin_profile_ships_an_inert_key(self) -> None:
+        """Both built-ins used to set weights that the cascade pipeline ignores."""
+        for name, mapping in BUILTIN_PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertEqual(config_profiles.inert_keys(mapping), set())
+
+    def test_neither_builtin_profile_touches_the_age_gate(self) -> None:
+        """A profile that quietly loosened the age gate would be an unpleasant surprise."""
+        for name, mapping in BUILTIN_PROFILES.items():
+            with self.subTest(profile=name):
+                self.assertNotIn("exclude_minors", mapping)
+                self.assertNotIn("minor_threshold", mapping)
+
+
+class ExifOrientation(unittest.TestCase):
+    """A portrait phone photo is stored landscape with a rotation tag. Ignoring the tag
+    feeds the model a sideways image and reports the wrong dimensions."""
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bikini_exif_"))
+
+    def _write(self, name: str, orientation: int | None) -> Path:
+        path = self.directory / name
+        image = Image.new("RGB", (80, 40), color=(120, 90, 60))
+        if orientation is None:
+            image.save(path, format="JPEG")
+        else:
+            exif = image.getexif()
+            exif[0x0112] = orientation
+            image.save(path, format="JPEG", exif=exif)
+        return path
+
+    def test_an_untagged_image_keeps_its_stored_size(self) -> None:
+        path = self._write("plain.jpg", None)
+        self.assertEqual(image_formats.oriented_size(path), (80, 40))
+
+    def test_a_transposed_orientation_swaps_the_reported_axes(self) -> None:
+        path = self._write("rotated.jpg", 6)
+        self.assertEqual(image_formats.oriented_size(path), (40, 80))
+
+    def test_a_non_transposing_orientation_leaves_the_axes_alone(self) -> None:
+        path = self._write("mirrored.jpg", 2)
+        self.assertEqual(image_formats.oriented_size(path), (80, 40))
+
+    def test_open_oriented_rotates_the_pixels_to_match(self) -> None:
+        path = self._write("rotated.jpg", 6)
+        with image_formats.open_oriented(path) as image:
+            self.assertEqual(image.size, (40, 80))
+            self.assertEqual(image.mode, "RGB")
+
+    def test_the_decoded_image_outlives_the_file_handle(self) -> None:
+        """Callers open inside a `with`; a handle-backed image would die on close."""
+        path = self._write("plain.jpg", None)
+        image = image_formats.open_oriented(path)
+        path.unlink()
+        self.assertEqual(image.size, (80, 40))
+        image.load()
+
+    def test_a_malformed_exif_block_does_not_cost_the_image(self) -> None:
+        original = image_formats.ImageOps.exif_transpose
+
+        def explode(_image):
+            raise ValueError("simulated malformed EXIF")
+
+        image_formats.ImageOps.exif_transpose = explode
+        self.addCleanup(setattr, image_formats.ImageOps, "exif_transpose", original)
+
+        path = self._write("plain.jpg", None)
+        with Image.open(path) as handle:
+            result = image_formats.apply_orientation(handle)
+        self.assertEqual(result.size, (80, 40))
+        result.load()
+
+
+class LogRedaction(unittest.TestCase):
+    """The log is something users paste into bug reports, so the home directory has to
+    come out of it."""
+
+    def test_the_home_directory_is_replaced(self) -> None:
+        formatter = logging_setup.RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            "t", logging.INFO, "p", 1, "failed to read %s" % (Path.home() / "photos" / "a.jpg"), None, None
+        )
+        message = formatter.format(record)
+        self.assertNotIn(str(Path.home()), message)
+        self.assertIn(logging_setup.RedactingFormatter.REPLACEMENT, message)
+        self.assertIn("photos", message, "only the private prefix is removed")
+
+    def test_a_message_with_no_home_path_is_untouched(self) -> None:
+        formatter = logging_setup.RedactingFormatter("%(message)s")
+        record = logging.LogRecord("t", logging.INFO, "p", 1, "nothing private here", None, None)
+        self.assertEqual(formatter.format(record), "nothing private here")
+
+    def test_a_missing_log_reads_as_empty(self) -> None:
+        original = logging_setup.log_path
+        logging_setup.log_path = lambda: Path(tempfile.mkdtemp(prefix="bikini_nolog_")) / "absent.log"
+        self.addCleanup(setattr, logging_setup, "log_path", original)
+        self.assertEqual(logging_setup.read_log_tail(), "")
+
+    def test_a_log_that_exists_but_cannot_be_opened_reads_as_empty(self) -> None:
+        """Reaches the OSError handler, which the missing-file case never does -- it
+        returns on the exists() check well before any open."""
+        directory = Path(tempfile.mkdtemp(prefix="bikini_dirlog_"))
+        original = logging_setup.log_path
+        logging_setup.log_path = lambda: directory  # a directory exists but will not open
+        self.addCleanup(setattr, logging_setup, "log_path", original)
+        self.assertEqual(logging_setup.read_log_tail(), "")
+
+    def test_only_the_tail_of_a_large_log_is_read(self) -> None:
+        directory = Path(tempfile.mkdtemp(prefix="bikini_biglog_"))
+        path = directory / "app.log"
+        path.write_text("A" * 5000 + "TAIL_MARKER", encoding="utf-8")
+        original = logging_setup.log_path
+        logging_setup.log_path = lambda: path
+        self.addCleanup(setattr, logging_setup, "log_path", original)
+
+        tail = logging_setup.read_log_tail(max_bytes=100)
+        self.assertLessEqual(len(tail), 100)
+        self.assertIn("TAIL_MARKER", tail, "the tail must be the end of the file, not the start")
 
 
 class Configuration(unittest.TestCase):
