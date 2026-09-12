@@ -16,6 +16,7 @@ to check that a change behaves the same way against real embeddings.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import logging
@@ -60,6 +61,7 @@ from bikini_scanner import (
     safe_io,
     update_checker,
     user_prefs,
+    vision_analysis,
 )
 from bikini_scanner import scorer as scorer_module
 from bikini_scanner import store as store_module
@@ -1965,6 +1967,182 @@ class LogRedaction(unittest.TestCase):
         tail = logging_setup.read_log_tail(max_bytes=100)
         self.assertLessEqual(len(tail), 100)
         self.assertIn("TAIL_MARKER", tail, "the tail must be the end of the file, not the start")
+
+
+class FaceBoxGeometry(unittest.TestCase):
+    def test_area_is_the_pixel_count(self) -> None:
+        self.assertEqual(FaceBox(x=10, y=20, width=30, height=4).area, 120)
+
+    def test_box_is_left_top_right_bottom(self) -> None:
+        self.assertEqual(FaceBox(x=10, y=20, width=30, height=4).box, (10, 20, 40, 24))
+
+
+class FaceModelResolution(unittest.TestCase):
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bikini_face_"))
+        self.installed = self.directory / "installed" / vision_analysis.MODEL_FILENAME
+        self.bundled = self.directory / "bundled" / vision_analysis.MODEL_FILENAME
+        for attr, value in (("model_path", self.installed), ("bundled_model_path", self.bundled)):
+            original = getattr(vision_analysis, attr)
+            setattr(vision_analysis, attr, lambda v=value: v)
+            self.addCleanup(setattr, vision_analysis, attr, original)
+
+    def _write(self, path: Path, size: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\0" * size)
+
+    def test_no_model_anywhere_resolves_to_nothing(self) -> None:
+        self.assertIsNone(vision_analysis.resolve_model())
+
+    def test_an_installed_model_is_found(self) -> None:
+        self._write(self.installed, 4096)
+        self.assertEqual(vision_analysis.resolve_model(), self.installed)
+
+    def test_a_bundled_model_is_used_when_nothing_is_installed(self) -> None:
+        self._write(self.bundled, 4096)
+        self.assertEqual(vision_analysis.resolve_model(), self.bundled)
+
+    def test_the_installed_model_wins_over_the_bundled_one(self) -> None:
+        self._write(self.installed, 4096)
+        self._write(self.bundled, 4096)
+        self.assertEqual(vision_analysis.resolve_model(), self.installed)
+
+    def test_a_truncated_download_is_not_treated_as_a_model(self) -> None:
+        """A few hundred bytes is an error page or a half-finished download, not a
+        230 KB ONNX graph."""
+        self._write(self.installed, 200)
+        self.assertIsNone(vision_analysis.resolve_model())
+
+    def test_detection_is_unavailable_without_a_model(self) -> None:
+        self.assertFalse(vision_analysis.face_detection_available())
+
+    def test_an_unavailable_detector_reports_unknown_rather_than_zero_faces(self) -> None:
+        """The distinction the module docstring insists on: no detector means unknown,
+        never "there are no people in this photo"."""
+        self.assertIsNone(vision_analysis.detect_face_count(Image.new("RGB", (32, 32))))
+
+
+class FaceModelInstallation(unittest.TestCase):
+    """The model is fetched over the network on an explicit user action, so the
+    checksum is the only thing standing between that download and code OpenCV loads."""
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp(prefix="bikini_install_"))
+        self.target = self.directory / "models" / vision_analysis.MODEL_FILENAME
+        original_path = vision_analysis.model_path
+        vision_analysis.model_path = lambda: self.target
+        self.addCleanup(setattr, vision_analysis, "model_path", original_path)
+
+        self.payload = b"pretend onnx graph" * 64
+        original_sha = vision_analysis.MODEL_SHA256
+        vision_analysis.MODEL_SHA256 = hashlib.sha256(self.payload).hexdigest()
+        self.addCleanup(setattr, vision_analysis, "MODEL_SHA256", original_sha)
+
+    def test_a_matching_payload_is_installed(self) -> None:
+        result = vision_analysis.install_model_from_bytes(self.payload)
+        self.assertEqual(result, self.target)
+        self.assertEqual(self.target.read_bytes(), self.payload)
+
+    def test_a_tampered_payload_is_refused_and_nothing_is_written(self) -> None:
+        with self.assertRaises(ValueError):
+            vision_analysis.install_model_from_bytes(self.payload + b"tampered")
+        self.assertFalse(self.target.exists(), "a bad download must not land on disk")
+
+    def test_no_partial_file_is_left_behind(self) -> None:
+        vision_analysis.install_model_from_bytes(self.payload)
+        self.assertEqual(list(self.target.parent.glob("*.part")), [])
+
+    def test_installing_clears_the_cached_detector(self) -> None:
+        """Otherwise the process keeps using the detector it built before the install."""
+        vision_analysis._DETECTOR = "a stale detector"
+        vision_analysis._DETECTOR_PATH = Path("somewhere/old.onnx")
+        self.addCleanup(setattr, vision_analysis, "_DETECTOR", None)
+        self.addCleanup(setattr, vision_analysis, "_DETECTOR_PATH", None)
+
+        vision_analysis.install_model_from_bytes(self.payload)
+        self.assertIsNone(vision_analysis._DETECTOR)
+        self.assertIsNone(vision_analysis._DETECTOR_PATH)
+
+
+class FaceDetectionResults(unittest.TestCase):
+    """detect_face_boxes against a stand-in detector, so the geometry and filtering are
+    checked without a 230 KB model download."""
+
+    def setUp(self) -> None:
+        self.original = vision_analysis._detector
+        self.addCleanup(setattr, vision_analysis, "_detector", self.original)
+
+    def _detect_with(self, detections, image_size=(200, 200)):
+        class FakeDetector:
+            def setInputSize(self_inner, _size):
+                return None
+
+            def detect(self_inner, _frame):
+                return None, detections
+
+        vision_analysis._detector = lambda: FakeDetector()
+        return vision_analysis.detect_face_boxes(Image.new("RGB", image_size))
+
+    def test_no_detector_yields_no_faces(self) -> None:
+        vision_analysis._detector = lambda: None
+        self.assertEqual(vision_analysis.detect_face_boxes(Image.new("RGB", (64, 64))), [])
+
+    def test_a_none_detection_array_yields_no_faces(self) -> None:
+        self.assertEqual(self._detect_with(None), [])
+
+    def test_a_detected_face_keeps_its_coordinates_at_full_resolution(self) -> None:
+        rows = np.array([[10.0, 20.0, 40.0, 50.0, *([0.0] * 10), 0.9]], dtype=np.float32)
+        faces = self._detect_with(rows)
+        self.assertEqual(len(faces), 1)
+        self.assertEqual((faces[0].x, faces[0].y, faces[0].width, faces[0].height), (10, 20, 40, 50))
+        self.assertAlmostEqual(faces[0].score, 0.9, places=5)
+
+    def test_faces_below_the_minimum_size_are_dropped(self) -> None:
+        """Sub-16px boxes are noise, not faces."""
+        rows = np.array(
+            [
+                [0.0, 0.0, 8.0, 8.0, *([0.0] * 10), 0.9],
+                [0.0, 0.0, 40.0, 40.0, *([0.0] * 10), 0.9],
+            ],
+            dtype=np.float32,
+        )
+        faces = self._detect_with(rows)
+        self.assertEqual(len(faces), 1)
+        self.assertEqual(faces[0].width, 40)
+
+    def test_faces_come_back_largest_first(self) -> None:
+        rows = np.array(
+            [
+                [0.0, 0.0, 20.0, 20.0, *([0.0] * 10), 0.9],
+                [0.0, 0.0, 60.0, 60.0, *([0.0] * 10), 0.9],
+                [0.0, 0.0, 40.0, 40.0, *([0.0] * 10), 0.9],
+            ],
+            dtype=np.float32,
+        )
+        areas = [face.area for face in self._detect_with(rows)]
+        self.assertEqual(areas, sorted(areas, reverse=True))
+
+    def test_coordinates_from_a_downscaled_frame_are_mapped_back_up(self) -> None:
+        """Large images are shrunk before detection, so the boxes come back in the
+        small frame's coordinates and have to be scaled to the original."""
+        big = (vision_analysis.DETECT_MAX_SIDE * 2, vision_analysis.DETECT_MAX_SIDE * 2)
+        rows = np.array([[100.0, 100.0, 50.0, 50.0, *([0.0] * 10), 0.9]], dtype=np.float32)
+        faces = self._detect_with(rows, image_size=big)
+        self.assertEqual(len(faces), 1)
+        self.assertEqual(faces[0].x, 200, "a box at x=100 in a half-size frame is x=200 in the original")
+        self.assertEqual(faces[0].width, 100)
+
+    def test_a_detector_that_raises_yields_no_faces(self) -> None:
+        class Exploding:
+            def setInputSize(self_inner, _size):
+                return None
+
+            def detect(self_inner, _frame):
+                raise RuntimeError("simulated detector failure")
+
+        vision_analysis._detector = lambda: Exploding()
+        with self.assertLogs(vision_analysis.LOGGER, level="ERROR"):
+            self.assertEqual(vision_analysis.detect_face_boxes(Image.new("RGB", (64, 64))), [])
 
 
 class Configuration(unittest.TestCase):
