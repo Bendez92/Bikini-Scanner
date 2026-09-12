@@ -30,6 +30,7 @@ import threading
 import types
 import unittest
 import uuid
+import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -50,6 +51,7 @@ os.environ["HOME"] = str(_STATE_DIR)
 os.environ["USERPROFILE"] = str(_STATE_DIR)
 
 from bikini_scanner import (
+    backend_utils,
     cascade,
     config_profiles,
     image_formats,
@@ -2359,6 +2361,152 @@ class GlobalClassifierPersistence(unittest.TestCase):
 
         with self.assertLogs(global_store_module.LOGGER, level="ERROR"):
             self.store.save_classifier({"classifier": {"weights": [1.0]}})
+
+
+class RankingMetrics(unittest.TestCase):
+    """roc_auc and average_precision replace the sklearn versions, so they are checked
+    against values worked out by hand rather than against themselves."""
+
+    def test_a_perfect_ranking_scores_one(self) -> None:
+        labels = np.asarray([0, 0, 1, 1])
+        scores = np.asarray([0.1, 0.2, 0.8, 0.9])
+        self.assertAlmostEqual(linear_model.roc_auc(labels, scores), 1.0, places=6)
+
+    def test_an_inverted_ranking_scores_zero(self) -> None:
+        labels = np.asarray([0, 0, 1, 1])
+        scores = np.asarray([0.9, 0.8, 0.2, 0.1])
+        self.assertAlmostEqual(linear_model.roc_auc(labels, scores), 0.0, places=6)
+
+    def test_all_ties_score_one_half(self) -> None:
+        """Every score identical is pure chance, and tie handling is what makes that
+        come out at 0.5 rather than at whatever order the sort happened to produce."""
+        labels = np.asarray([0, 1, 0, 1])
+        scores = np.asarray([0.5, 0.5, 0.5, 0.5])
+        self.assertAlmostEqual(linear_model.roc_auc(labels, scores), 0.5, places=6)
+
+    def test_a_known_mixed_ranking_matches_the_hand_computed_value(self) -> None:
+        # Positives ranked 2nd and 4th of 4: of the four positive/negative pairs, three
+        # are ordered correctly and one is not.
+        labels = np.asarray([0, 1, 0, 1])
+        scores = np.asarray([0.1, 0.2, 0.3, 0.4])
+        self.assertAlmostEqual(linear_model.roc_auc(labels, scores), 0.75, places=6)
+
+    def test_a_single_class_is_refused_rather_than_guessed(self) -> None:
+        with self.assertRaises(ValueError):
+            linear_model.roc_auc(np.asarray([1, 1, 1, 1]), np.asarray([0.1, 0.2, 0.3, 0.4]))
+
+    def test_too_few_samples_are_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            linear_model.roc_auc(np.asarray([0, 1]), np.asarray([0.1, 0.9]))
+
+    def test_average_precision_of_a_perfect_ranking_is_one(self) -> None:
+        labels = np.asarray([1, 1, 0, 0])
+        scores = np.asarray([0.9, 0.8, 0.2, 0.1])
+        self.assertAlmostEqual(linear_model.average_precision(labels, scores), 1.0, places=6)
+
+    def test_average_precision_without_positives_is_zero(self) -> None:
+        labels = np.asarray([0, 0, 0, 0])
+        scores = np.asarray([0.9, 0.8, 0.2, 0.1])
+        self.assertEqual(linear_model.average_precision(labels, scores), 0.0)
+
+    def test_average_precision_matches_the_hand_computed_value(self) -> None:
+        # Ranked 1st and 3rd: precision 1/1 at the first hit, 2/3 at the second.
+        labels = np.asarray([1, 0, 1, 0])
+        scores = np.asarray([0.9, 0.8, 0.7, 0.6])
+        self.assertAlmostEqual(linear_model.average_precision(labels, scores), (1.0 + 2.0 / 3.0) / 2, places=6)
+
+
+class SigmoidAndLogit(unittest.TestCase):
+    def test_sigmoid_is_centred_on_a_half(self) -> None:
+        np.testing.assert_allclose(linear_model.sigmoid(np.asarray([0.0])), [0.5], atol=1e-6)
+
+    def test_sigmoid_saturates_without_overflowing(self) -> None:
+        """The positive/negative split exists so exp never sees a large positive input.
+
+        The warning is the assertion. The naive 1/(1+exp(-x)) returns the same 0.0 here
+        because 1/(1+inf) is 0, so only the overflow it raises on the way distinguishes
+        the two -- numpy is configured to raise rather than warn for the duration.
+        """
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            with np.errstate(over="raise"):
+                values = linear_model.sigmoid(np.asarray([-800.0, 800.0]))
+        self.assertTrue(np.all(np.isfinite(values)))
+        self.assertAlmostEqual(float(values[0]), 0.0, places=6)
+        self.assertAlmostEqual(float(values[1]), 1.0, places=6)
+
+    def test_logit_inverts_sigmoid(self) -> None:
+        probabilities = np.asarray([0.1, 0.3, 0.5, 0.8])
+        np.testing.assert_allclose(
+            linear_model.sigmoid(linear_model.logit(probabilities)), probabilities, atol=1e-5
+        )
+
+    def test_logit_clamps_the_endpoints_to_stay_finite(self) -> None:
+        values = linear_model.logit(np.asarray([0.0, 1.0]))
+        self.assertTrue(np.all(np.isfinite(values)), "0 and 1 must not become -inf/inf")
+
+
+class BackendBaseBehaviour(unittest.TestCase):
+    """ClipBackendBase carries the batching and empty-input handling that every backend
+    inherits, so it is checked through a stand-in rather than a real model."""
+
+    class _Backend(backend_utils.ClipBackendBase):
+        def __init__(self, dim: int = 6) -> None:
+            self.dim = dim
+            self.batches: list[int] = []
+
+        @property
+        def image_embedding_dim(self) -> int:
+            return self.dim
+
+        def _embed_image_batch(self, images):
+            self.batches.append(len(images))
+            return [np.full((self.dim,), float(index), dtype=np.float32) for index in range(len(images))]
+
+        def embed_texts(self, prompts):
+            return np.zeros((len(prompts), self.dim), dtype=np.float32)
+
+    def setUp(self) -> None:
+        self.backend = self._Backend()
+        self.folder = Path(tempfile.mkdtemp(prefix="bikini_backend_"))
+
+    def test_no_images_yields_an_empty_array_of_the_right_width(self) -> None:
+        """Callers vstack this, so the width has to be right even when there are no rows."""
+        result = self.backend.embed_images([])
+        self.assertEqual(result.shape, (0, self.backend.dim))
+        self.assertEqual(result.dtype, np.float32)
+
+    def test_an_empty_pil_batch_yields_an_empty_array_of_the_right_width(self) -> None:
+        result = self.backend.embed_pil_images([])
+        self.assertEqual(result.shape, (0, self.backend.dim))
+
+    def test_unreadable_files_do_not_produce_rows(self) -> None:
+        broken = self.folder / "broken.jpg"
+        broken.write_bytes(b"not an image")
+        result = self.backend.embed_images([str(broken)])
+        self.assertEqual(result.shape, (0, self.backend.dim))
+        self.assertEqual(self.backend.batches, [], "an undecodable file must not reach the model")
+
+    def test_readable_files_produce_one_row_each(self) -> None:
+        paths = []
+        for index in range(3):
+            path = self.folder / f"img_{index}.jpg"
+            path.write_bytes(_make_image_bytes())
+            paths.append(str(path))
+        result = self.backend.embed_images(paths)
+        self.assertEqual(result.shape, (3, self.backend.dim))
+
+    def test_a_broken_file_does_not_cost_the_readable_ones(self) -> None:
+        good = self.folder / "good.jpg"
+        good.write_bytes(_make_image_bytes())
+        broken = self.folder / "broken.jpg"
+        broken.write_bytes(b"not an image")
+        result = self.backend.embed_images([str(broken), str(good)])
+        self.assertEqual(result.shape, (1, self.backend.dim))
+
+    def test_the_device_and_precision_are_reported(self) -> None:
+        self.assertEqual(self.backend.active_device, "cpu")
+        self.assertEqual(self.backend.active_precision, "fp32")
 
 
 class Configuration(unittest.TestCase):
