@@ -111,7 +111,32 @@ Audit of the requested feature list and what the program now does.
   once, and re-scans reuse cached embeddings by content hash.
 - **Human-in-the-Loop (Review UI)** — ✅ The whole app: review borderline
   buckets (uncertain, likely false positives/negatives, model disagreements), mark
-  Accept/REJECT, and the model retrains and re-ranks immediately.
+  Accept/REJECT, and the model retrains and re-ranks.
+- **One decision, many photos** — ✅ Deciding on a photo carries that decision to
+  photos that are both near-identical (cosine similarity over the CLIP embeddings,
+  0.94 by default and adjustable) **and** carry the same detection (same bucket, axis
+  evidence profile within 0.15). Both halves are required: similarity alone would
+  sweep up every photo from the same afternoon, the same detection alone every bikini
+  in the folder. Byte-identical copies always travel together regardless of the
+  setting — there is no judgement to make about an identical file. A group never
+  overwrites a decision you already made, counts as one step towards the next retrain,
+  and Ctrl+Z undoes the whole group as one action.
+- **Per-bucket bulk decisions** — ✅ Each bucket heading carries "Accept N"/"Reject N"
+  buttons covering only the undecided photos in that bucket, for the common case where
+  a whole group (typically "Other detections") is uniformly right or wrong.
+- **Hardest-first review** — ✅ A `uncertainty` sort orders by distance from the
+  sensitivity threshold, so the photos the model is least sure about come first and
+  each decision teaches it more than another obvious true positive would.
+- **Steady review list** — ✅ Every retrain re-ranks the whole folder, so photos
+  cross the sensitivity threshold as the model learns and the detected count moves
+  while you are working through the list. Three things keep that legible:
+  *Learning updates* (Filters panel) chooses when decisions are folded in —
+  `batch` (default, once every N decisions), `instant` (the old per-click
+  behaviour), or `manual`; an **Apply learning (N)** button appears beside the view
+  switch whenever decisions are waiting; **Hide reviewed** drains the detected list
+  as you decide; and the counts read "N detected — R reviewed, L left" with a
+  "+N newly detected after learning from your decisions" note whenever a retrain
+  changes the total.
 - **Local vision-LLM adjudication** — ✅ Optional Ollama/llama.cpp-compatible
   second opinion for borderline and uncertain-age images. Requests cover all
   detection axes, run concurrently, include the best body crop, and cache verdicts
