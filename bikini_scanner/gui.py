@@ -4815,10 +4815,12 @@ class BikiniScannerApp:
         labels = self._label_map()
         changes: dict[str, int | None] = {path: label}
         identical = [twin for twin in self._duplicate_siblings(path) if twin not in labels]
+        # _similar_detection_group already leaves out anything decided, so only overlap
+        # with the identical copies needs removing here.
         similar = [
             candidate
             for candidate in self._similar_detection_group(path)
-            if candidate not in labels and candidate not in changes and candidate not in identical
+            if candidate not in changes and candidate not in identical
         ]
         for candidate in identical + similar:
             changes[candidate] = label

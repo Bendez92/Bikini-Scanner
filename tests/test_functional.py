@@ -754,6 +754,11 @@ class ReviewWorkflow(_GuiTestCase):
 
         self.app.scorer = _AlwaysVisibleScorer()
         self.app.threshold_var.set(0.35)
+        # Pinned rather than trusted: these live in the preferences file shared by every
+        # test in the process, so whatever the previous test left would leak in.
+        self.app.retrain_batch_size_var.set(10)
+        self.app.hide_reviewed_var.set(False)
+        self.app.group_apply_var.set(False)
         # Count retrains without running any: every one of these tests is about when a
         # pass is launched, not what it computes.
         self.launches: list[bool] = []
@@ -814,6 +819,9 @@ class ReviewWorkflow(_GuiTestCase):
 
     def test_manual_mode_only_retrains_when_asked(self) -> None:
         self.app.retrain_mode_var.set("manual")
+        # A batch size of 1 would retrain on the very first decision, so manual mode
+        # quietly behaving like batch mode cannot hide behind a large batch here.
+        self.app.retrain_batch_size_var.set(1)
         for index in range(4):
             self._label(index)
         self.assertEqual(self.launches, [], "a decision retrained on its own in manual mode")
@@ -943,6 +951,33 @@ class GroupDecisions(_GuiTestCase):
         """Looks the same, but the scanner saw something else in it."""
         self.app.set_label(self.paths[0], 1)
         self.assertIsNone(self._labels().get(self.paths[2]), "a different detection was swept up by the group")
+
+    def test_a_second_finding_in_the_same_bucket_is_not_grouped(self) -> None:
+        """Same shot, same bucket, but the scanner also found strong cleavage in one.
+
+        Only the evidence-profile check can tell these apart — the bucket is Bikini
+        for both — so this is what keeps that check honest.
+        """
+        state = self.app.current_state
+        # Evidence 0.9 bikini on both; 0.7 cleavage on the second only. Bikini still wins
+        # the bucket, but the profiles are 0.7 apart on one axis.
+        state.axis_scores["cleavage"] = np.array([0.50, 0.85, 0.50, 0.50], dtype=np.float32)
+        self.assertEqual(self.app._detected_bucket(0), self.app._detected_bucket(1), "fixture: buckets differ")
+        self.app.set_label(self.paths[0], 1)
+        self.assertIsNone(self._labels().get(self.paths[1]), "a photo with a second, stronger finding was grouped")
+
+    def test_a_photo_that_tips_into_another_bucket_is_not_grouped(self) -> None:
+        """Nearly the same profile, but it lands on the other side of a close call.
+
+        Only the bucket check can tell these apart — the profiles are 0.02 apart — so
+        this is what keeps that check honest.
+        """
+        state = self.app.current_state
+        state.axis_scores["bikini"] = np.array([0.90, 0.89, 0.50, 0.95], dtype=np.float32)
+        state.axis_scores["cleavage"] = np.array([0.89, 0.90, 0.50, 0.50], dtype=np.float32)
+        self.assertNotEqual(self.app._detected_bucket(0), self.app._detected_bucket(1), "fixture: same bucket")
+        self.app.set_label(self.paths[0], 1)
+        self.assertIsNone(self._labels().get(self.paths[1]), "a photo detected as something else was grouped")
 
     def test_a_different_picture_is_not_grouped(self) -> None:
         """Same detection, but nothing like the same photo."""
