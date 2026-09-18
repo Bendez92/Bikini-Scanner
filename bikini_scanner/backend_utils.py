@@ -13,12 +13,13 @@ import hashlib
 import logging
 import os
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 from PIL import Image
@@ -36,6 +37,26 @@ LOGGER = logging.getLogger(__name__)
 # most of the work on a large photo.
 DECODE_TARGET_PX = 448
 _HASH_CHUNK_BYTES = 1024 * 1024
+
+
+# Loaded models are cached so a rescan does not pay to load one again, but a CLIP model
+# is 600 MB and the large one is 1.7 GB. Unbounded, the cache pinned every model the
+# session had ever touched. Two is what the app actually uses at once: the scan model
+# and the refine model.
+MAX_CACHED_BACKENDS = 2
+
+
+def remember_bounded(cache: OrderedDict, key: Any, value: Any, limit: int = MAX_CACHED_BACKENDS) -> None:
+    """Insert into an LRU cache, evicting the oldest entries beyond `limit`.
+
+    Eviction only drops the cache's own reference. A backend still in use stays alive
+    through the caller's reference and is collected once the last one goes.
+    """
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max(1, int(limit)):
+        evicted, _ = cache.popitem(last=False)
+        LOGGER.info("Releasing the cached backend for %r; %d kept", evicted, len(cache))
 
 
 @dataclass(slots=True)

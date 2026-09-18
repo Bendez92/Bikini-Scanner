@@ -17,7 +17,7 @@ import pickle
 import re
 import threading
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +68,15 @@ class GlobalLearningStore:
 
     model_name: str
     root: Path = None  # type: ignore[assignment]
+    # Everything below is an in-process read cache, stamped with the (mtime, size) of
+    # the file it came from. A retrain used to re-read and re-parse the whole index and
+    # the whole feature archive, then stat every labelled path, to add three rows. The
+    # stamp is two stats; a mismatch (another instance wrote) falls back to a real read.
+    _index_cache: dict = field(init=False, default_factory=dict, repr=False)
+    _index_stamp: tuple = field(init=False, default=(), repr=False)
+    _features_cache: dict = field(init=False, default_factory=dict, repr=False)
+    _features_stamp: tuple = field(init=False, default=(), repr=False)
+    _training_cache: dict = field(init=False, default_factory=dict, repr=False)
 
     def __post_init__(self) -> None:
         self.root = global_dir() / _namespace(self.model_name)
@@ -88,30 +97,98 @@ class GlobalLearningStore:
     def classifier_path(self) -> Path:
         return self.root / "classifier.pkl"
 
+    @property
+    def retained_path(self) -> Path:
+        return self.root / "retained.json"
+
+    # --- deliberately removed examples --------------------------------------
+    def _load_retained(self) -> set[str]:
+        try:
+            payload = json.loads(self.retained_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return set()
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Ignoring unreadable retained-label list %s: %s", self.retained_path, exc)
+            return set()
+        return {str(key) for key in payload} if isinstance(payload, list) else set()
+
+    def retain(self, paths: Iterable[str]) -> None:
+        """Keep teaching from these examples after their files are gone.
+
+        `training_set` drops a label whose file has vanished, so that scanning a
+        temporary folder does not train this model forever. Deleting a photo *because*
+        you rejected it is the opposite case: the whole point of "reject and delete"
+        is that the scanner learns what you did not want, and dropping the label on the
+        next pass would quietly undo the training the action was named for.
+
+        Keys are derived from the path, so this can be called before the retrain that
+        records the features — which is what the delete flow does, since the files are
+        gone by the time that retrain runs.
+        """
+        keys = {_key_for(str(path)) for path in paths}
+        if not keys:
+            return
+        with _LOCK:
+            merged = self._load_retained() | keys
+            try:
+                atomic_write_json(self.retained_path, sorted(merged))
+            except Exception:
+                LOGGER.exception("Could not persist the retained-label list")
+
     # --- persistence --------------------------------------------------------
+    @staticmethod
+    def _stamp(path: Path) -> tuple:
+        """Cheap identity for a file: modification time and size, or () if absent."""
+        try:
+            info = path.stat()
+        except OSError:
+            return ()
+        return (info.st_mtime_ns, info.st_size)
+
     def _load_index(self) -> dict[str, dict[str, Any]]:
+        stamp = self._stamp(self.index_path)
+        if stamp and stamp == self._index_stamp:
+            return self._index_cache
         if not self.index_path.exists():
+            self._index_cache, self._index_stamp = {}, stamp
             return {}
         try:
             payload = json.loads(self.index_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Ignoring unreadable global label index %s: %s", self.index_path, exc)
             quarantine_broken_file(self.index_path, LOGGER, "invalid JSON")
+            self._index_cache, self._index_stamp = {}, ()
             return {}
         if not isinstance(payload, dict):
+            self._index_cache, self._index_stamp = {}, stamp
             return {}
-        return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        parsed = {str(key): value for key, value in payload.items() if isinstance(value, dict)}
+        self._index_cache, self._index_stamp = parsed, stamp
+        return parsed
 
     def _load_features(self) -> dict[str, np.ndarray]:
+        stamp = self._stamp(self.features_path)
+        if stamp and stamp == self._features_stamp:
+            return self._features_cache
         if not self.features_path.exists():
+            self._features_cache, self._features_stamp = {}, stamp
             return {}
         try:
             with np.load(self.features_path, allow_pickle=False) as archive:
-                return {str(key): archive[key].astype(np.float32) for key in archive.files}
+                loaded = {str(key): archive[key].astype(np.float32) for key in archive.files}
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Ignoring unreadable global feature cache %s: %s", self.features_path, exc)
             quarantine_broken_file(self.features_path, LOGGER, "invalid NPZ")
+            self._features_cache, self._features_stamp = {}, ()
             return {}
+        self._features_cache, self._features_stamp = loaded, stamp
+        return loaded
+
+    def _adopt(self, index: dict[str, dict[str, Any]], features: dict[str, np.ndarray]) -> None:
+        """Take the just-written state as the cache, and drop derived results."""
+        self._index_cache, self._index_stamp = index, self._stamp(self.index_path)
+        self._features_cache, self._features_stamp = features, self._stamp(self.features_path)
+        self._training_cache = {}
 
     def record(self, entries: Iterable[tuple[str, int, np.ndarray]], sequence: int) -> int:
         """Add or update labelled examples. Returns the total kept afterwards."""
@@ -131,9 +208,19 @@ class GlobalLearningStore:
                 features[key] = feature
             if len(index) > MAX_ENTRIES:
                 ordered = sorted(index.items(), key=lambda item: int(item[1].get("seq", 0)))
-                for key, _ in ordered[: len(index) - MAX_ENTRIES]:
+                evicted = {key for key, _ in ordered[: len(index) - MAX_ENTRIES]}
+                for key in evicted:
                     index.pop(key, None)
                     features.pop(key, None)
+                # An evicted row can never be consulted again, so its retained mark is
+                # dead weight. Without this the list grew by one key per deleted photo
+                # for the life of the install and was rewritten in full on every retain.
+                retained = self._load_retained()
+                if retained & evicted:
+                    try:
+                        atomic_write_json(self.retained_path, sorted(retained - evicted))
+                    except Exception:
+                        LOGGER.exception("Could not prune the retained-label list")
             # Only keep features that still have a label, and vice versa.
             for key in list(features):
                 if key not in index:
@@ -155,6 +242,7 @@ class GlobalLearningStore:
                         np.savez(handle, **features)  # type: ignore[arg-type]
 
                 atomic_replace(self.features_path, write_npz)
+                self._adopt(index, features)
             except Exception:
                 LOGGER.exception("Could not persist global learning memory")
             return len(index)
@@ -165,6 +253,14 @@ class GlobalLearningStore:
         if not keys:
             return
         with _LOCK:
+            # Clearing a label retires it completely, retained or not; otherwise the
+            # list would keep growing with keys nothing refers to any more.
+            retained = self._load_retained()
+            if retained & keys:
+                try:
+                    atomic_write_json(self.retained_path, sorted(retained - keys))
+                except Exception:
+                    LOGGER.exception("Could not persist the retained-label list")
             index = self._load_index()
             if not any(key in index for key in keys):
                 return
@@ -189,12 +285,29 @@ class GlobalLearningStore:
                         np.savez(handle, **features)  # type: ignore[arg-type]
 
                 atomic_replace(self.features_path, write_npz)
+                self._adopt(index, features)
             except Exception:
                 LOGGER.exception("Could not update global learning memory")
 
     def training_set(self, expected_dim: int | None = None) -> TrainingSet:
-        index = self._load_index()
-        features = self._load_features()
+        with _LOCK:
+            # Snapshots, not the live caches. _load_index hands back the cache dict
+            # itself, and record()/forget() mutate it in place, so iterating the
+            # original raised "dictionary changed size during iteration" the moment
+            # anything else touched the store.
+            index = dict(self._load_index())
+            features = dict(self._load_features())
+        # Building this walks every labelled row and stats every labelled path to drop
+        # ones whose file is gone. That answer only changes when the store changes, so
+        # it is derived once per (index, features, dim) rather than once per retrain.
+        # The retained list is part of the answer, so it has to be part of the key:
+        # without it, retaining an example returned the cached set that had just
+        # dropped it.
+        cache_key = (self._index_stamp, self._features_stamp, self._stamp(self.retained_path), expected_dim)
+        cached = self._training_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        retained = self._load_retained()
         rows: list[np.ndarray] = []
         labels: list[int] = []
         paths: list[str] = []
@@ -205,14 +318,16 @@ class GlobalLearningStore:
                 continue
             path = str(entry.get("path", key))
             # A label on a file that no longer exists should stop teaching: otherwise a
-            # scan of a temporary folder trains this model forever.
-            try:
-                if not Path(path).exists():
+            # scan of a temporary folder trains this model forever. A file the reviewer
+            # deleted *because* they rejected it is the exception — see `retain`.
+            if key not in retained:
+                try:
+                    if not Path(path).exists():
+                        vanished.append(path)
+                        continue
+                except OSError:
                     vanished.append(path)
                     continue
-            except OSError:
-                vanished.append(path)
-                continue
             if expected_dim is not None and int(feature.shape[-1]) != int(expected_dim):
                 continue
             rows.append(np.asarray(feature, dtype=np.float32).ravel())
@@ -223,16 +338,25 @@ class GlobalLearningStore:
             self.forget(vanished)
         if not rows:
             dim = int(expected_dim or 0)
-            return TrainingSet(
+            empty = TrainingSet(
                 features=np.empty((0, dim), dtype=np.float32),
                 labels=np.empty((0,), dtype=np.int64),
                 paths=[],
             )
-        return TrainingSet(
-            features=np.vstack(rows).astype(np.float32),
-            labels=np.asarray(labels, dtype=np.int64),
-            paths=paths,
+            return self._remember(cache_key, empty)
+        return self._remember(
+            cache_key,
+            TrainingSet(
+                features=np.vstack(rows).astype(np.float32),
+                labels=np.asarray(labels, dtype=np.int64),
+                paths=paths,
+            ),
         )
+
+    def _remember(self, cache_key: tuple, result: TrainingSet) -> TrainingSet:
+        # One entry per shape is plenty: callers ask with a single expected_dim.
+        self._training_cache = {cache_key: result}
+        return result
 
     def load_classifier(self) -> dict[str, Any] | None:
         if not self.classifier_path.exists():

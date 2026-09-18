@@ -13,7 +13,16 @@
 #     static link libraries, and codec DLLs for video/HEIC encoding this app never does.
 #   * scikit-learn and scipy are gone entirely - bikini_scanner.linear_model implements the
 #     handful of primitives that were used, in numpy.
+#   * The ONNX graphs and runtime are opt-in (BIKINI_BUNDLE_ONNX=1). Bundled, they add
+#     ~615 MB for an experimental backend; the default build leaves them out.
+#
+# Measured breakdown of a default build's _internal, largest first: torch 364 MB,
+# cv2 82 MB, transformers 36 MB, libx265 21 MB, numpy.libs 20 MB, PIL 14 MB. torch
+# dominates and is irreducible short of dropping the backend; cv2 is 82 MB for the
+# YuNet face detector plus resize/cvtColor, and is the next-largest lever if face
+# detection is ever moved onto another runtime.
 
+import os
 import sys
 from pathlib import Path
 
@@ -78,12 +87,27 @@ datas = [
     *send2trash_datas,
     *torch_datas,
 ]
-# Conditionally bundle exported ONNX graphs so the clip-onnx backend works in a
-# packaged build without a manual copy. Only included when the models have been
-# exported (python -m scripts.export_onnx); absent models don't break the build.
+# The exported ONNX graphs are 577 MB - clip_vision.onnx (335 MB) plus clip_text.onnx
+# (242 MB) - which is 45% of the whole bundle, for the experimental clip-onnx backend
+# that Settings itself describes as optional. They are the same CLIP weights torch
+# already carries, in a second format.
+#
+# This used to bundle them whenever the files happened to exist in models/, so whether
+# an installer was 486 MB or ~150 MB depended on whether somebody had run the ONNX
+# export in that checkout. Now it takes an explicit opt-in, and the default build does
+# not ship a backend most users never select.
+#
+#     set BIKINI_BUNDLE_ONNX=1     (then run make_installer.ps1)
+_BUNDLE_ONNX = os.environ.get("BIKINI_BUNDLE_ONNX", "").strip().lower() in {"1", "true", "yes", "on"}
 _onnx_model_dir = ROOT / "models"
-if (_onnx_model_dir / "clip_vision.onnx").is_file() and (_onnx_model_dir / "clip_text.onnx").is_file():
-    datas.append((str(_onnx_model_dir), "models"))
+if _BUNDLE_ONNX:
+    if (_onnx_model_dir / "clip_vision.onnx").is_file() and (_onnx_model_dir / "clip_text.onnx").is_file():
+        datas.append((str(_onnx_model_dir), "models"))
+        print("spec: BIKINI_BUNDLE_ONNX set - bundling the ONNX graphs (~577 MB)")
+    else:
+        print("spec: BIKINI_BUNDLE_ONNX set but models/clip_*.onnx are missing; run scripts/export_onnx first")
+else:
+    print("spec: ONNX graphs and runtime excluded (set BIKINI_BUNDLE_ONNX=1 to include them)")
 binaries = [
     *pillow_bins,
     *pillow_heif_bins,
@@ -110,6 +134,14 @@ EXCLUDES = [
     "threadpoolctl",
     "tkinter.test",
 ]
+
+# onnx/onnxruntime/onnxscript are in requirements-onnx.txt, an optional extra that
+# make_installer.ps1 does not install. They were still ending up in the bundle (~38 MB)
+# purely because whoever last exported the ONNX graphs left them in .venv - the build
+# inherited whatever happened to be installed rather than what was declared. Excluded
+# unless the ONNX backend is deliberately being shipped.
+if not _BUNDLE_ONNX:
+    EXCLUDES += ["onnx", "onnxruntime", "onnxscript"]
 
 # Link-time payloads and the video codec. .lib files exist only to compile against
 # torch, and the OpenCV ffmpeg DLL decodes video, which this app never opens.

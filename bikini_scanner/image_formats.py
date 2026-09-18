@@ -29,7 +29,20 @@ LOGGER = logging.getLogger(__name__)
 DECODE_VERSION = 2
 
 
+_HEIF_REGISTERED = False
+
+
+def heif_supported() -> bool:
+    """Whether HEIC/HEIF files can be read in this install.
+
+    Public so the UI can tell a reviewer that their skipped .heic files are an absent
+    optional package rather than damaged photos.
+    """
+    return _HEIF_REGISTERED
+
+
 def register_heif_support() -> None:
+    global _HEIF_REGISTERED
     try:
         import pillow_heif
     except ImportError:
@@ -39,6 +52,8 @@ def register_heif_support() -> None:
         pillow_heif.register_heif_opener()
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Unable to register HEIF opener: %s", exc)
+        return
+    _HEIF_REGISTERED = True
 
 
 def apply_orientation(image: Image.Image) -> Image.Image:

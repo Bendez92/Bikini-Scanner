@@ -10,8 +10,21 @@ The app only works on a folder you choose locally. It does not scrape, download,
 
 ## Features
 
-- Tkinter GUI with dark and light themes, collapsible advanced controls, and an
-  enlarged active picture you can Accept or REJECT from the keyboard
+- Tkinter GUI with dark and light themes, collapsible advanced controls, and a
+  resizable enlarged active picture you can Accept or REJECT from the keyboard;
+  deciding a photo takes it out of the grid so the queue counts down
+- Focus mode (`F`): one photo, full screen, keyboard only - `A`/`D`/`S` to decide,
+  `J`/`K` to move, `N` for a note, `Ctrl+Z` to undo
+- Browse a folder without scanning it (File > Browse folder without scanning) to
+  record decisions before any model runs; a later scan picks them up
+- Per-image notes alongside the Accept/REJECT decision, carried into CSV and JSON
+  exports
+- "Why this score?" (`W`) breaks one photo's result down: prompt score against what
+  your labels taught, every axis, the crop used, and any second opinion
+- An age-gate report summarising what the gate excluded and on what evidence, without
+  putting excluded images back on screen
+- HTML reports sort and filter in the browser, so a shared report is as usable as the
+  app that made it
 - Staged scan pipeline: people → female subject → age exclusion → bikini / cleavage /
   midriff detail, with each stage both ranking and able to exclude
 - Face and body-region crops for candidate images, so small subjects are scored at a
@@ -257,12 +270,23 @@ ONNX path:
 The exported graphs live under `models/` and the ONNX backend still uses the
 same CLIP preprocessing. RAW formats such as CR2/NEF are still out of scope.
 
-The Settings dialog also exposes:
+The Settings dialog is tabbed — Detection, Model, Prompts, Advanced — and also
+exposes:
 
 - device selection: auto / cpu / cuda
 - precision: auto / fp32 / fp16
 - CPU int8 quantization toggle
 - backend preload on startup
+
+Headless runs and interactive review compose through `--import-labels` and
+`--export-labels`, so decisions made in the GUI can drive a scripted scan and vice
+versa. `--rerank` refuses to embed anything new, failing instead if the folder has no
+scan cache yet, and `--estimate` reports what a scan would involve — images found, how
+many are already embedded — without scanning or loading the model.
+
+Clearing a folder's cache keeps the things a rescan cannot rebuild: your decisions,
+your notes, and that folder's saved settings. Removing those is a separate action that
+says so.
 
 The app also has a built-in guide under Help, recent folders in File, optional
 folder drag-and-drop when `tkinterdnd2` is installed, and UI prefs for theme,

@@ -16,6 +16,11 @@
 
 .PARAMETER SkipBuild
     Skip PyInstaller and only recompile the installer from the existing dist folder.
+
+.NOTES
+    The experimental clip-onnx backend is not bundled by default: its exported graphs
+    are ~577 MB and its runtime another ~38 MB, roughly half the installer, for a
+    backend Settings describes as optional. Set BIKINI_BUNDLE_ONNX=1 to include them.
 #>
 [CmdletBinding()]
 param(
@@ -87,7 +92,17 @@ if (-not (Test-Path $VenvPython)) {
 # because this run just created it, or PyInstaller is missing - install anyway.
 # Honouring the flag there guarantees a confusing "PyInstaller failed" several
 # minutes later instead of a clear message now.
-& $VenvPython -c "import PyInstaller" 2>$null
+# find_spec rather than a bare import, and no stderr redirection. Two reasons, and the
+# second one broke this script outright:
+#   * importing PyInstaller to ask whether it exists is slow and has side effects;
+#     find_spec answers the same question by looking.
+#   * `... 2>$null` on a *native* executable makes Windows PowerShell wrap each stderr
+#     line in an ErrorRecord, and with $ErrorActionPreference = "Stop" (set at the top
+#     of this script) that is a terminating error. So the probe for "is PyInstaller
+#     missing?" killed the build whenever it was missing - precisely the fresh-venv
+#     case the block below exists to handle. This version writes nothing to stderr at
+#     all and carries its answer in the exit code.
+& $VenvPython -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('PyInstaller') else 1)"
 $HasPyInstaller = $LASTEXITCODE -eq 0
 if ($SkipDeps -and ($FreshVenv -or -not $HasPyInstaller)) {
     Write-Host ""
@@ -111,6 +126,9 @@ $Version = $Version.Trim()
 # --- 3. PyInstaller ---------------------------------------------------------
 if (-not $SkipBuild) {
     Write-Step "Building application bundle v$Version (this takes several minutes)"
+    if ($env:BIKINI_BUNDLE_ONNX) {
+        Write-Step "BIKINI_BUNDLE_ONNX is set - the ONNX backend and its ~577 MB of graphs will be bundled"
+    }
     & $VenvPython -m PyInstaller bikini_scanner.spec --noconfirm
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 }

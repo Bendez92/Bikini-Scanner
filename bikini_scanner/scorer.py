@@ -39,11 +39,17 @@ from .regions import (
     crop_regions,
     plan_regions,
     region_kind,
+    region_subject,
 )
+from .safe_io import resolved_str
 from .store import FolderStore, collect_image_paths, safe_stat
 from .vision_analysis import detect_face_boxes, detect_face_count
 
 LOGGER = logging.getLogger(__name__)
+
+# Re-run the regularisation sweep once the training set is this much bigger than it was
+# when C was last chosen. 1.5 keeps it to a handful of sweeps over a long session.
+C_RESELECT_GROWTH = 1.5
 
 # Axis order in the learned feature vector. Fixed, because features are pooled across
 # folders and scans - appending is safe, reordering is not.
@@ -92,6 +98,52 @@ class ScoreState:
     detail_regions: list[str] = field(default_factory=list)
     refine: RefineResult | None = None
 
+    def __post_init__(self) -> None:
+        """Every field here is indexed by image position, so they must agree in length.
+
+        Nothing used to check that. A mismatch is not a crash, it is silently wrong
+        output: the consumers zip these together, so a short array quietly truncates the
+        results, drops images from the grid, or pairs a path with another image's score.
+        This turns "impossible state" back into an exception at the point it is created,
+        which is the only place the cause is still visible.
+
+        Optional fields are allowed to be None (not computed for this pipeline) and the
+        list fields to be empty (the legacy pipeline fills none of them), but anything
+        actually populated has to be the right length.
+        """
+        count = len(self.paths)
+        problems: list[str] = []
+
+        def row_count(value: object) -> int | None:
+            if value is None:
+                return None
+            if isinstance(value, np.ndarray):
+                return int(value.shape[0]) if value.ndim else None
+            if isinstance(value, list):
+                return len(value)
+            return None
+
+        # Always populated, so an empty one is itself a mismatch.
+        for name in ("embeddings", "zero_shot_scores", "scores"):
+            found = row_count(getattr(self, name))
+            if found is not None and found != count:
+                problems.append(f"{name} has {found} rows, expected {count}")
+        # Optional: absent is fine, wrong-length is not.
+        for name in ("face_counts", "detail_embeddings", "excluded", "features"):
+            found = row_count(getattr(self, name))
+            if found is not None and found and found != count:
+                problems.append(f"{name} has {found} rows, expected {count}")
+        for name in ("cascade_stage", "cascade_reason", "detail_regions"):
+            found = len(getattr(self, name))
+            if found and found != count:
+                problems.append(f"{name} has {found} entries, expected {count}")
+        for axis, values in self.axis_scores.items():
+            found = row_count(values)
+            if found is not None and found != count:
+                problems.append(f"axis_scores[{axis!r}] has {found} rows, expected {count}")
+        if problems:
+            raise ValueError(f"ScoreState is inconsistent for {count} image(s): " + "; ".join(problems))
+
 
 class ScanCancelled(Exception):
     """Raised when a cooperative scan cancellation was requested."""
@@ -115,7 +167,31 @@ PHASE_LABELS = {
 # Shares of the overall bar. Deliberately not equal: embedding dominates a cold scan.
 PHASE_SHARES = {PHASE_EMBED: 0.65, PHASE_DETAIL: 0.30, PHASE_REFINE: 0.03, PHASE_SCORE: 0.01}
 # Shares when no region pass will run, so the bar still reaches 100%.
-PHASE_SHARES_NO_DETAIL = {PHASE_EMBED: 0.95, PHASE_DETAIL: 0.0, PHASE_REFINE: 0.03, PHASE_SCORE: 0.01}
+# 0.96, not 0.95: these have to add to 1.0 or the bar stops at 99% and sits there.
+PHASE_SHARES_NO_DETAIL = {PHASE_EMBED: 0.96, PHASE_DETAIL: 0.0, PHASE_REFINE: 0.03, PHASE_SCORE: 0.01}
+
+
+def phase_shares(uncached: int, total: int, runs_detail_pass: bool) -> dict[str, float]:
+    """Weight the bar by the work this particular scan has to do.
+
+    The embed phase walks every image but only pays for the ones that are not already
+    cached — reading a row from SQLite against running the model is not a comparable
+    cost. With fixed shares a rescan of an already-cached folder leapt to 65% in a
+    second and then crawled through the region pass, which is the opposite of what the
+    numbers were tuned for.
+    """
+    if not runs_detail_pass:
+        return dict(PHASE_SHARES_NO_DETAIL)
+    if total <= 0:
+        return dict(PHASE_SHARES)
+    tail = PHASE_SHARES[PHASE_REFINE] + PHASE_SHARES[PHASE_SCORE]
+    embed = PHASE_SHARES[PHASE_EMBED] * (max(0, min(uncached, total)) / total)
+    return {
+        PHASE_EMBED: embed,
+        PHASE_DETAIL: max(0.0, 1.0 - embed - tail),
+        PHASE_REFINE: PHASE_SHARES[PHASE_REFINE],
+        PHASE_SCORE: PHASE_SHARES[PHASE_SCORE],
+    }
 
 
 @dataclass(slots=True)
@@ -274,6 +350,10 @@ class BikiniScorer:
     classifier_weight: float = field(init=False, default=DEFAULT_CLASSIFIER_WEIGHT, repr=False)
     zero_shot_weight: float = field(init=False, default=DEFAULT_ZERO_SHOT_WEIGHT, repr=False)
     learning_outcome: learning.LearningOutcome = field(init=False, default_factory=learning.LearningOutcome, repr=False)
+    # Label count the regularisation sweep last ran at. The sweep costs folds x grid
+    # fits and is the bulk of a retrain; it is redone once the evidence has grown by
+    # C_RESELECT_GROWTH, not every time three more photos are judged.
+    _c_selected_at: int = field(init=False, default=0, repr=False)
     _global_cache: GlobalLearningStore | None = field(init=False, default=None, repr=False)
     _global_signature: str = field(init=False, default="", repr=False)
 
@@ -546,6 +626,7 @@ class BikiniScorer:
             axis_scores=self.axis_zero_shot_scores(embeddings),
             image_count=count,
             full_row=rows,
+            subject=np.full((count,), -1, dtype=np.int64),
         )
 
     def build_region_table(
@@ -560,7 +641,7 @@ class BikiniScorer:
         owner_array: np.ndarray = np.asarray(owner, dtype=np.int64)
         kinds = np.array([region_kind(key) for key in region_keys], dtype=object)
         full_row: np.ndarray = np.zeros((image_count,), dtype=np.int64)
-        for row, (image_index, key) in enumerate(zip(owner_array, region_keys, strict=False)):
+        for row, (image_index, key) in enumerate(zip(owner_array, region_keys, strict=True)):
             if key == FULL_REGION:
                 full_row[int(image_index)] = row
         return RegionScoreTable(
@@ -569,6 +650,7 @@ class BikiniScorer:
             axis_scores=self.axis_zero_shot_scores(row_embeddings),
             image_count=int(image_count),
             full_row=full_row,
+            subject=np.array([region_subject(key) for key in region_keys], dtype=np.int64),
         )
 
     def build_features(
@@ -598,6 +680,10 @@ class BikiniScorer:
             ]
         )
         return np.hstack([embeddings, detail, axis_block]).astype(np.float32)
+
+    def global_memory(self) -> GlobalLearningStore | None:
+        """The cross-folder learning store, or None when it is off or unavailable."""
+        return self._global_store()
 
     def _global_store(self) -> GlobalLearningStore | None:
         if not self.config.global_learning:
@@ -635,12 +721,12 @@ class BikiniScorer:
         store = self._global_store()
         if store is not None:
             signature = hashlib.sha1(
-                json.dumps(sorted(zip(local_paths, local_labels, strict=False)), separators=(",", ":")).encode("utf-8")
+                json.dumps(sorted(zip(local_paths, local_labels, strict=True)), separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             if signature != self._global_signature:
                 try:
                     store.record(
-                        zip(local_paths, local_labels, local_rows, strict=False),
+                        zip(local_paths, local_labels, local_rows, strict=True),
                         sequence=int(datetime.now(timezone.utc).timestamp()),
                     )
                     # A cleared label must stop teaching the model.
@@ -654,7 +740,7 @@ class BikiniScorer:
         if store is not None:
             known = set(local_paths)
             pooled = store.training_set(expected_dim=int(features.shape[1]))
-            for row, label, path in zip(pooled.features, pooled.labels, pooled.paths, strict=False):
+            for row, label, path in zip(pooled.features, pooled.labels, pooled.paths, strict=True):
                 if str(path) in known:
                     continue
                 train_rows.append(np.asarray(row, dtype=np.float32))
@@ -662,12 +748,34 @@ class BikiniScorer:
 
         if not train_rows:
             self.learning_outcome = learning.LearningOutcome()
+            self._c_selected_at = 0
             return self.learning_outcome
+        # A retrain lands a few labels after the last one, so the previous solution is
+        # a much better starting point than zero, and the regularisation strength it
+        # settled on is still the right one. Both are re-derived from scratch whenever
+        # the evidence has grown enough to plausibly change the answer.
+        previous = self.learning_outcome
+        reuse_c: float | None = None
+        if (
+            previous.chosen_c is not None
+            and self._c_selected_at > 0
+            and len(train_labels) < self._c_selected_at * C_RESELECT_GROWTH
+        ):
+            reuse_c = float(previous.chosen_c)
         outcome = learning.fit(
             np.vstack(train_rows).astype(np.float32),
             np.asarray(train_labels, dtype=np.int64),
             max_weight=float(self.config.max_learning_weight),
+            warm_start=previous.classifier,
+            reuse_c=reuse_c,
         )
+        if reuse_c is None and outcome.chosen_c is not None:
+            self._c_selected_at = len(train_labels)
+        # Split this folder's labels out of the pooled total so the status bar can be
+        # reconciled against the reviewer's own Accepted/Rejected tally.
+        outcome.local_count = len(local_labels)
+        outcome.local_positive = sum(1 for value in local_labels if value == 1)
+        outcome.local_negative = sum(1 for value in local_labels if value == 0)
         self.learning_outcome = outcome
         self.classifier = outcome.classifier
         LOGGER.info("Learning: %s", outcome.summary())
@@ -724,7 +832,7 @@ class BikiniScorer:
         count = len(list(paths))
 
         if self.config.pipeline == "legacy":
-            embeddings_by_path = dict(zip(paths, embeddings, strict=False))
+            embeddings_by_path = dict(zip(paths, embeddings, strict=True))
             label_count = self.train_classifier(embeddings_by_path, labels, store=store)
             axis_scores = self.axis_zero_shot_scores(embeddings)
             scores = np.asarray(self.final_scores(embeddings, axis_scores=axis_scores), dtype=np.float32)
@@ -850,11 +958,11 @@ class BikiniScorer:
             raise ScanCancelled
         visible_mask = self.state_visibility(new_state)
         samples = bucketed_sampling(
-            [path for path, include in zip(new_state.paths, visible_mask, strict=False) if include],
-            [score for score, include in zip(new_state.scores, visible_mask, strict=False) if include],
+            [path for path, include in zip(new_state.paths, visible_mask, strict=True) if include],
+            [score for score, include in zip(new_state.scores, visible_mask, strict=True) if include],
             labels.keys(),
             embeddings=[
-                embedding for embedding, include in zip(new_state.embeddings, visible_mask, strict=False) if include
+                embedding for embedding, include in zip(new_state.embeddings, visible_mask, strict=True) if include
             ],
             threshold=threshold,
             disagreement=state_disagreement(new_state, visible_mask),
@@ -873,7 +981,7 @@ def state_disagreement(state: ScoreState, visible_mask: np.ndarray) -> list[floa
     if scores.shape != zero_shot.shape:
         return []
     gaps = np.abs(scores - zero_shot)
-    return [float(gap) for gap, include in zip(gaps, visible_mask, strict=False) if include]
+    return [float(gap) for gap, include in zip(gaps, visible_mask, strict=True) if include]
 
 
 @dataclass(slots=True)
@@ -897,8 +1005,16 @@ def _embedding_namespace(config: ScannerConfig) -> str:
 
 
 def _region_namespace(config: ScannerConfig) -> str:
+    """Identity of the crop layout cached region embeddings belong to.
+
+    max_faces is part of it because it decides how many people get crops planned for
+    them. Without it, lowering max_faces left the extra subjects' crops in the cache and
+    they were loaded and scored exactly as before, so the setting appeared to do nothing
+    on any folder that had already been scanned — and it is a key a folder override may
+    set.
+    """
     slug = re.sub(r"[^A-Za-z0-9]+", "_", str(config.model_name or "default")).strip("_").lower()
-    return f"{slug}__g{REGION_GEOMETRY_VERSION}"
+    return f"{slug}__g{REGION_GEOMETRY_VERSION}__f{int(config.max_faces)}"
 
 
 def _candidate_mask(
@@ -971,7 +1087,15 @@ def run_deep_pass(
     # Crops that need embedding are gathered across images so the backend is invoked once
     # per batch instead of once per candidate. Cached crops skip this list entirely.
     pending_crops: list[tuple[int, str, Image.Image]] = []
-    pending_meta: list[tuple[int, str, str]] = []  # (index, content_hash, key)
+    # Parallel to pending_crops, one entry per crop, content_hash None when the file
+    # could not be hashed. It used to be built with a filter on content_hash while
+    # pending_crops was not, so a single unhashable image shifted the zip against the
+    # embedding vectors and every later crop was cached under another image's key.
+    pending_meta: list[str | None] = []
+    # Only the VLM pass ever reads these back, and they are full-resolution frames:
+    # retaining one per candidate held thousands of decoded images for the whole scan
+    # when the pass was not even going to run.
+    keep_decoded = bool(scorer.config.vlm_enabled)
     decoded_images: dict[int, Image.Image] = {}
     processed = 0
 
@@ -998,7 +1122,8 @@ def run_deep_pass(
                 # anything, so a scaled decode would throw away the very detail the
                 # crops exist to recover.
                 image = open_oriented(path)
-                decoded_images[index] = image
+                if keep_decoded:
+                    decoded_images[index] = image
                 faces = detect_face_boxes(image)
                 updated_faces[index] = len(faces)
                 planned = [
@@ -1008,11 +1133,7 @@ def run_deep_pass(
                 ]
                 materialised = crop_regions(image, planned)
                 pending_crops.extend((index, key, crop) for key, crop in materialised)
-                pending_meta.extend(
-                    (index, str(content_hash), key)
-                    for key, _ in materialised
-                    if content_hash
-                )
+                pending_meta.extend(str(content_hash) if content_hash else None for _key, _ in materialised)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Deep pass skipped %s: %s", path, exc)
 
@@ -1032,7 +1153,7 @@ def run_deep_pass(
     if pending_crops:
         crop_images = [crop for _, _, crop in pending_crops]
         vectors = backend.embed_pil_images(crop_images)
-        for (index, key, _), vector in zip(pending_crops, vectors, strict=False):
+        for (index, key, _), vector in zip(pending_crops, vectors, strict=True):
             vector = np.asarray(vector, dtype=np.float32)
             owner.append(index)
             region_keys.append(key)
@@ -1040,8 +1161,17 @@ def run_deep_pass(
             if region_kind(key) != KIND_FACE:
                 detail_rows.setdefault(index, []).append(len(row_embeddings) - 1)
         if store is not None:
-            for (index, content_hash, key), vector in zip(pending_meta, vectors, strict=False):
-                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(vector, dtype=np.float32)
+            # pending_crops, pending_meta and vectors are all the same length and in the
+            # same order; images with no content hash are skipped here rather than being
+            # left out of one of the three lists.
+            for (index, key, _crop), content_hash, vector in zip(
+                pending_crops, pending_meta, vectors, strict=True
+            ):
+                if not content_hash:
+                    continue
+                pending_cache[store.region_cache_key(content_hash, namespace, key)] = np.asarray(
+                    vector, dtype=np.float32
+                )
                 pending_cache[store.region_cache_key(content_hash, namespace, "__faces__")] = np.asarray(
                     [max(int(updated_faces[index]), 0)], dtype=np.float32
                 )
@@ -1055,11 +1185,18 @@ def run_deep_pass(
     # learned model should train on. Each row only votes on the axes its position allows,
     # so a bottom-of-frame band cannot win the slot by "detecting cleavage".
     row_detail = cascade_module.combine_detail_rows(table.axis_scores, scorer.config.detail_weights, list(table.kinds))
+    # A crop belonging to someone the age gate reads as a minor is never eligible for
+    # this slot, whatever it scores. Otherwise a photo that surfaces on an adult's
+    # evidence could still be represented by - and train the learned model on - a
+    # child's crop.
+    subjects = cascade_module.analyse_subjects(table, scorer.config)
+    blocked_rows = subjects.row_minor if subjects is not None else np.zeros(matrix.shape[0], dtype=bool)
     if row_detail.size == matrix.shape[0]:
         for index, rows in detail_rows.items():
-            if not rows:
+            eligible = [row for row in rows if not blocked_rows[row]]
+            if not eligible:
                 continue
-            best_row = max(rows, key=lambda row: float(row_detail[row]))
+            best_row = max(eligible, key=lambda row: float(row_detail[row]))
             if float(row_detail[best_row]) > float(row_detail[index]):
                 detail_embeddings[index] = matrix[best_row]
                 detail_regions[index] = region_keys[best_row]
@@ -1171,8 +1308,6 @@ def compute_vlm_scores(
             LOGGER.warning("VLM pass skipped %s: %s", state.paths[index], exc)
     if not ranked:
         return None
-    if not ranked:
-        return None
     cached: dict[int, dict[str, float]] = {}
     pending: dict[str, dict[str, float]] = {}
     uncached_images: list[list[Image.Image]] = []
@@ -1187,7 +1322,10 @@ def compute_vlm_scores(
         if content_hash and store is not None:
             key = store.vlm_cache_key(content_hash, scorer.config.vlm_model, VLM_PROMPT_VERSION)
             verdict = store.lookup_vlm_verdict(key)
-            if verdict is not None:
+            # `not verdict` rather than `is not None`: an empty verdict is not a
+            # judgment, and older builds cached those. Treating one as real scored the
+            # image 0.0 off the back of a reply that named no axes.
+            if verdict:
                 cached[position] = verdict
                 continue
         uncached_images.append(views)
@@ -1198,8 +1336,8 @@ def compute_vlm_scores(
         except VLMCancelled:
             # A cancellation is the user's own signal, not an error worth chaining.
             raise ScanCancelled from None
-        for position, response in zip(uncached_positions, responses, strict=False):
-            if response is None:
+        for position, response in zip(uncached_positions, responses, strict=True):
+            if not response:
                 continue
             cached[position] = response
             content_hash = position_hashes.get(position)
@@ -1215,7 +1353,7 @@ def compute_vlm_scores(
     config = scorer.config
     for position, (_, index, _views) in enumerate(ranked):
         values = cached.get(position)
-        if values is None:
+        if not values:
             continue
         matrix: np.ndarray = np.asarray([[values.get(axis, 0.5) for axis in VLM_AXES]], dtype=np.float32)
         axis_scores = {axis: matrix[:, offset] for offset, axis in enumerate(VLM_AXES)}
@@ -1352,7 +1490,7 @@ def bucketed_sampling(
     )
     scored = [
         {"path": str(path), "score": float(score), "index": index}
-        for index, (path, score) in enumerate(zip(paths, scores, strict=False))
+        for index, (path, score) in enumerate(zip(paths, scores, strict=True))
         if str(path) not in labeled_set
     ]
 
@@ -1374,7 +1512,6 @@ def bucketed_sampling(
     ) -> list[dict[str, object]]:
         ranked = sorted(items, key=sort_key, reverse=reverse)
         selected: list[dict[str, object]] = []
-        selected_vectors: list[np.ndarray] = []
         if embedding_array is None:
             for item in ranked:
                 path = str(item["path"])
@@ -1387,28 +1524,55 @@ def bucketed_sampling(
             return selected
 
         candidates = [item for item in ranked if str(item["path"]) not in used_paths]
-        while candidates and len(selected) < per_bucket:
-            if not selected_vectors:
-                best_index = 0
+        if not candidates:
+            return selected
+        # Picking six diverse images used to compare every remaining candidate against
+        # every image already picked, one Python call per pair. On a folder of 5 000
+        # that was ~1.07 s of the 1.47 s a retrain took — more than the model fit and
+        # the rescoring put together, all to choose thirty photos.
+        #
+        # Same greedy farthest-point choice, done as one matrix-vector product per
+        # selection: the running minimum distance to the chosen set is updated in bulk
+        # instead of recomputed from scratch for every candidate.
+        positions: np.ndarray = np.fromiter(
+            (cast(int, item["index"]) for item in candidates), dtype=np.int64, count=len(candidates)
+        )
+        vectors = embedding_array[positions]
+        norms = np.linalg.norm(vectors, axis=1)
+        unit = vectors / np.where(norms > 0, norms, 1.0)[:, None]
+        candidate_scores: np.ndarray = np.fromiter(
+            (cast(float, item["score"]) for item in candidates), dtype=np.float64, count=len(candidates)
+        )
+        # Secondary and tertiary keys never change, so they are computed once.
+        distance_to_threshold = np.abs(candidate_scores - threshold)
+        available: np.ndarray = np.ones(len(candidates), dtype=bool)
+        min_distance: np.ndarray | None = None
+        while available.any() and len(selected) < per_bucket:
+            if min_distance is None:
+                best_index = int(np.flatnonzero(available)[0])
             else:
-                best_index = max(
-                    range(len(candidates)),
-                    key=lambda idx: (
-                        min(
-                            _cosine_distance(embedding_array[cast(int, candidates[idx]["index"])], vector)
-                            for vector in selected_vectors
-                        ),
-                        -abs(cast(float, candidates[idx]["score"]) - threshold),
-                        cast(float, candidates[idx]["score"]),
-                    ),
+                # lexsort's last key is the primary one and the sort is stable, so this
+                # reproduces max() over (distance, -|score-threshold|, score) exactly,
+                # ties included: the earliest-ranked candidate still wins.
+                ranked_order = np.lexsort(
+                    (-candidate_scores, distance_to_threshold, -np.where(available, min_distance, -np.inf))
                 )
-            item = candidates.pop(best_index)
+                best_index = int(next(index for index in ranked_order if available[index]))
+            item = candidates[best_index]
+            available[best_index] = False
             path = str(item["path"])
             if path in used_paths:
                 continue
             used_paths.add(path)
             selected.append({k: v for k, v in item.items() if k != "index"} | {"bucket": bucket_name})
-            selected_vectors.append(embedding_array[cast(int, item["index"])])
+            similarity = np.clip(unit @ unit[best_index], -1.0, 1.0)
+            distance = 1.0 - similarity
+            # A zero-length vector has no direction to differ in; the scalar version
+            # returned distance 0 for it and this has to agree.
+            distance = (
+                np.zeros_like(distance) if norms[best_index] <= 0 else np.where(norms > 0, distance, 0.0)
+            )
+            min_distance = distance if min_distance is None else np.minimum(min_distance, distance)
         return selected
 
     contested = _take(
@@ -1504,7 +1668,9 @@ def _scan_and_score_folder_impl(
     processed = 0
     scan_timestamp = datetime.now(timezone.utc).isoformat()
     runs_detail_pass = scorer.config.pipeline != "legacy" and scorer.config.deep_scan != "off"
-    reporter = _ProgressReporter(progress_callback, PHASE_SHARES if runs_detail_pass else PHASE_SHARES_NO_DETAIL)
+    reporter = _ProgressReporter(
+        progress_callback, phase_shares(len(uncached_paths), len(paths), runs_detail_pass)
+    )
     reporter.start_phase(PHASE_EMBED, len(paths))
 
     def _notify() -> None:
@@ -1544,7 +1710,7 @@ def _scan_and_score_folder_impl(
         image_records.append(
             {
                 "filename": path.name,
-                "path": str(path.resolve()),
+                "path": resolved_str(path),
                 "score": None,
                 "zero_shot_score": None,
                 "axis_scores": {},
@@ -1584,7 +1750,11 @@ def _scan_and_score_folder_impl(
             elif scorer.config.enable_face_detection:
                 try:
                     face_count = detect_face_count(open_oriented(path))
-                except Exception:  # noqa: BLE001
+                except Exception as exc:  # noqa: BLE001
+                    # None means "unknown", which the age gate handles - but a detector
+                    # failing on every image would silently downgrade the gate to
+                    # whole-frame reasoning with nothing said about it.
+                    LOGGER.warning("Face detection failed for %s: %s", path, exc)
                     face_count = None
                 if face_count is not None:
                     content_face_counts[content_hash] = face_count
@@ -1626,7 +1796,7 @@ def _scan_and_score_folder_impl(
                 image_records.append(
                     {
                         "filename": record.path.name,
-                        "path": str(record.path.resolve()),
+                        "path": resolved_str(record.path),
                         "score": None,
                         "zero_shot_score": None,
                         "axis_scores": {},
@@ -1644,7 +1814,7 @@ def _scan_and_score_folder_impl(
         if hash_to_image:
             _check_cancelled()
             batch_embeddings = backend.embed_pil_images(list(hash_to_image.values()))
-            for content_hash, embedding in zip(hash_to_image.keys(), batch_embeddings, strict=False):
+            for content_hash, embedding in zip(hash_to_image.keys(), batch_embeddings, strict=True):
                 content_embeddings[content_hash] = embedding
                 if scorer.config.enable_face_detection and content_hash not in content_face_counts:
                     source_image = hash_to_image.get(content_hash)
@@ -1652,7 +1822,8 @@ def _scan_and_score_folder_impl(
                     if source_image is not None:
                         try:
                             face_count = detect_face_count(source_image)
-                        except Exception:  # noqa: BLE001
+                        except Exception as exc:  # noqa: BLE001
+                            LOGGER.warning("Face detection failed for %s: %s", content_hash, exc)
                             face_count = None
                     if face_count is not None:
                         content_face_counts[content_hash] = face_count
@@ -1673,7 +1844,7 @@ def _scan_and_score_folder_impl(
                     image_records.append(
                         {
                             "filename": path.name,
-                            "path": str(path.resolve()),
+                            "path": resolved_str(path),
                             "score": None,
                             "zero_shot_score": None,
                             "axis_scores": {},
@@ -1685,11 +1856,19 @@ def _scan_and_score_folder_impl(
         for record in decoded_images:
             processed += 1
             if record.image is None:
+                # A file listed at the start of the scan and gone by the time it was
+                # read is not a damaged image, and "[Errno 2] No such file or directory"
+                # sitting in the "Files that could not be read" list next to genuinely
+                # corrupt photos invited the wrong conclusion about both.
+                if not record.path.exists():
+                    _record_vanished(record.path)
+                    _notify()
+                    continue
                 LOGGER.warning("Skipped unreadable image %s: %s", record.path, record.error)
                 skipped_records.append(
                     {
                         "filename": record.path.name,
-                        "path": str(record.path.resolve()),
+                        "path": resolved_str(record.path),
                         "error": record.error,
                         "timestamp": scan_timestamp,
                     }
@@ -1814,18 +1993,18 @@ def _scan_and_score_folder_impl(
             refine=refine,
         )
     visible_mask = scorer.state_visibility(state)
-    visible_paths = [path for path, include in zip(state.paths, visible_mask, strict=False) if include]
-    visible_scores = [score for score, include in zip(state.scores, visible_mask, strict=False) if include]
+    visible_paths = [path for path, include in zip(state.paths, visible_mask, strict=True) if include]
+    visible_scores = [score for score, include in zip(state.scores, visible_mask, strict=True) if include]
     samples = bucketed_sampling(
         visible_paths,
         visible_scores,
         labels.keys(),
-        embeddings=[embedding for embedding, include in zip(state.embeddings, visible_mask, strict=False) if include],
+        embeddings=[embedding for embedding, include in zip(state.embeddings, visible_mask, strict=True) if include],
         threshold=threshold,
         disagreement=state_disagreement(state, visible_mask),
     )
     for idx, (image_record, score, zero_shot_score, image_path) in enumerate(
-        zip(image_records, state.scores, state.zero_shot_scores, state.paths, strict=False)
+        zip(image_records, state.scores, state.zero_shot_scores, state.paths, strict=True)
     ):
         image_record.update(
             {

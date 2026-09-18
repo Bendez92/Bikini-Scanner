@@ -35,7 +35,7 @@ jobs:
       - name: Install test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "numpy>=2.0,<3" "Pillow>=10.0" "ruff>=0.6,<1"
+          python -m pip install "numpy>=2.0,<3" "Pillow>=10.0" "ruff>=0.6,<1" "mypy>=1.11,<2"
 
       - name: Lint
         run: python -m ruff check bikini_scanner scripts tests
@@ -43,6 +43,12 @@ jobs:
       - name: Format check
         run: python -m ruff format --check bikini_scanner scripts tests
         continue-on-error: true
+
+      # CLAUDE.md lists this among the checks to run before committing to main, but CI
+      # was only running ruff, so a type error could reach the branch unchallenged.
+      # ignore_missing_imports covers the absent torch/transformers.
+      - name: Types
+        run: python -m mypy bikini_scanner
 
       - name: Tests
         env:

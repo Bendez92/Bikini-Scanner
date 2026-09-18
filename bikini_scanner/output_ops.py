@@ -12,11 +12,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 from PIL import Image
 
-from .image_formats import apply_orientation, open_oriented
+from .image_formats import open_oriented
 from .store import IGNORE_MARKER_FILENAME
 
 LABEL_NAMES = {1: "good", 0: "bad", 2: "skip"}
@@ -281,6 +281,7 @@ def build_html_report(
     thumb_size: int = 240,
     max_embedded_thumbnails: int | None = DEFAULT_HTML_EMBED_LIMIT,
     assets_dir: str | Path | None = None,
+    match_threshold: float = 0.0,
 ) -> Path:
     output = Path(output_path)
     use_assets = assets_dir is not None or (
@@ -291,9 +292,14 @@ def build_html_report(
         assets_root.mkdir(parents=True, exist_ok=True)
         _mark_ignored_directory(assets_root)
     rows: list[str] = []
+    missing = 0
     for index, sample in enumerate(samples):
         path = Path(str(sample["path"]))
         if not path.exists():
+            # Dropping these is right — there is no thumbnail to make — but doing it
+            # silently left a report with fewer cards than the grid it came from and no
+            # way to tell whether that was a filter or a problem.
+            missing += 1
             continue
         score = float(scores.get(str(path), cast(float, sample.get("score", 0.0))))
         label = label_name(labels.get(str(path)))
@@ -310,9 +316,12 @@ def build_html_report(
             axis_parts = [f"{html.escape(name)}: {float(value):.3f}" for name, value in key_scores.items()]
             if axis_parts:
                 axes_html = f"<div class='axes'>{' • '.join(axis_parts)}</div>"
+        matched = "yes" if score >= match_threshold else "no"
         rows.append(
             f"""
-            <article class="card">
+            <article class="card" data-name="{html.escape(path.name.lower())}" data-score="{score:.6f}"
+                     data-label="{html.escape(label.lower())}" data-match="{matched}"
+                     data-bucket="{html.escape(str(sample.get("bucket", "")).lower())}">
               <div class="thumb">{image_html}</div>
               <div class="meta">
                 <div class="name">{html.escape(path.name)}</div>
@@ -323,6 +332,14 @@ def build_html_report(
             </article>
             """
         )
+    if missing:
+        LOGGER.info("HTML report omitted %d image(s) that no longer exist", missing)
+    missing_note = (
+        f'<p class="missing">{missing} image(s) listed in these results no longer exist '
+        "on disk and were left out of this report.</p>"
+        if missing
+        else ""
+    )
     html_text = f"""<!doctype html>
 <html>
 <head>
@@ -335,13 +352,75 @@ body {{ font-family: sans-serif; background: #111; color: #eee; margin: 0; paddi
 .thumb img {{ width: 120px; height: 120px; object-fit: cover; border-radius: 6px; }}
 .name {{ font-weight: 700; margin-bottom: 4px; }}
 .score, .axes, .path {{ font-size: 12px; color: #cfcfcf; margin-top: 4px; word-break: break-word; }}
+.controls {{ display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 0 0 16px; font-size: 14px; }}
+.controls input[type=search] {{ padding: 6px 8px; min-width: 260px; background: #1f1f1f; color: #eee;
+  border: 1px solid #444; border-radius: 6px; }}
+.controls select {{ background: #1f1f1f; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 4px; }}
+#shown {{ color: #9f9f9f; }}
+.missing {{ color: #e0b050; font-size: 13px; margin: 0 0 12px; }}
 </style>
 </head>
 <body>
 <h1>{html.escape(title)}</h1>
-<div class="grid">
+{missing_note}
+<div class="controls">
+  <input id="q" type="search" placeholder="Filter by filename, label or bucket…" oninput="applyFilter()">
+  <label><input id="matchesOnly" type="checkbox" onchange="applyFilter()"> matches only</label>
+  <label><input id="hideDecided" type="checkbox" onchange="applyFilter()"> hide decided</label>
+  <label>Sort
+    <select id="sort" onchange="applySort()">
+      <option value="score-desc">score, highest first</option>
+      <option value="score-asc">score, lowest first</option>
+      <option value="name-asc">filename A-Z</option>
+      <option value="name-desc">filename Z-A</option>
+    </select>
+  </label>
+  <span id="shown"></span>
+</div>
+<div class="grid" id="grid">
 {"".join(rows)}
 </div>
+<script>
+// The report is read by someone who cannot re-run the scan — often from an email
+// attachment or a USB stick — so the sorting and filtering has to travel inside the
+// file. No dependencies and no network for exactly that reason.
+var grid = document.getElementById("grid");
+var cards = Array.prototype.slice.call(grid.querySelectorAll(".card"));
+function applyFilter() {{
+  var query = (document.getElementById("q").value || "").toLowerCase();
+  var matchesOnly = document.getElementById("matchesOnly").checked;
+  var hideDecided = document.getElementById("hideDecided").checked;
+  var shown = 0;
+  cards.forEach(function (card) {{
+    var label = card.dataset.label || "";
+    // Anything that carries a label at all. LABEL_NAMES writes good/bad/skip here,
+    // which is not the wording the app shows, so test for the absence of "unlabeled"
+    // rather than for a list that has to be kept in step with two vocabularies.
+    var decided = label !== "" && label !== "unlabeled";
+    var haystack = (card.dataset.name || "") + " " + label + " " + (card.dataset.bucket || "");
+    var visible = (!query || haystack.indexOf(query) !== -1)
+      && (!matchesOnly || card.dataset.match === "yes")
+      && (!hideDecided || !decided);
+    card.style.display = visible ? "" : "none";
+    if (visible) shown += 1;
+  }});
+  document.getElementById("shown").textContent = shown + " of " + cards.length + " shown";
+}}
+function applySort() {{
+  var mode = document.getElementById("sort").value;
+  var byScore = mode.indexOf("score") === 0;
+  var ascending = mode.indexOf("-asc") !== -1;
+  cards.sort(function (a, b) {{
+    var cmp = byScore
+      ? parseFloat(a.dataset.score) - parseFloat(b.dataset.score)
+      : (a.dataset.name || "").localeCompare(b.dataset.name || "");
+    return ascending ? cmp : -cmp;
+  }});
+  cards.forEach(function (card) {{ grid.appendChild(card); }});
+}}
+applySort();
+applyFilter();
+</script>
 </body>
 </html>"""
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -369,33 +448,164 @@ def _thumbnail_bytes(path: Path, thumb_size: int) -> bytes:
 
 
 def write_image_metadata(path: str | Path, keyword: str, score: float | None = None) -> bool:
+    """Tag an image with a keyword without touching a single pixel of it.
+
+    This used to decode the file, apply its EXIF orientation and re-encode it — so an
+    action described as "write keyword tags" permanently recompressed the user's
+    originals at Pillow's default JPEG quality, dropped the ICC profile, and baked the
+    rotation into the raster. Nothing here re-encodes now: JPEG is edited as a byte
+    stream, PNG is lossless so a re-save costs nothing, and the formats that can only
+    be tagged with a real metadata library are left untouched when it is absent.
+    """
     source = Path(path)
     if not source.exists():
         return False
     suffix = source.suffix.lower()
     if suffix not in {".jpg", ".jpeg", ".tif", ".tiff", ".png", ".webp"}:
         return False
-    if suffix in {".tif", ".tiff"} and _write_pyexiv2_metadata(source, keyword, score):
+    if suffix in {".jpg", ".jpeg"}:
+        return _write_jpeg_metadata(source, keyword, score)
+    if suffix == ".png":
+        return _write_png_metadata(source, keyword, score)
+    # TIFF and WebP: pyexiv2 edits them in place, and there is no lossless way to do it
+    # here without one. Refusing is the honest answer — re-encoding a WebP to attach a
+    # keyword would quietly degrade the photo it was asked to annotate.
+    if _write_pyexiv2_metadata(source, keyword, score):
         return True
+    LOGGER.info(
+        "Skipped keyword metadata for %s: tagging %s without re-encoding it needs the "
+        "optional pyexiv2 package, which is not installed. The file was left unchanged.",
+        source,
+        suffix,
+    )
+    return False
+
+
+# JPEG APP1 segments are identified by the payload prefix, not the marker.
+_EXIF_PREFIX = b"Exif\x00\x00"
+_XMP_PREFIX = b"http://ns.adobe.com/xap/1.0/\x00"
+_APP0 = 0xE0
+_APP1 = 0xE1
+_MAX_SEGMENT_PAYLOAD = 0xFFFF - 2
+
+
+def _split_jpeg_header(data: bytes) -> tuple[list[tuple[int, bytes]], int] | None:
+    """Header segments as (marker, payload), plus where the compressed scan begins.
+
+    Returns None for anything that is not a JPEG this can safely rewrite, in which case
+    the caller leaves the file alone.
+    """
+    if not data.startswith(b"\xff\xd8"):
+        return None
+    segments: list[tuple[int, bytes]] = []
+    offset = 2
+    total = len(data)
+    while offset + 4 <= total:
+        if data[offset] != 0xFF:
+            return None
+        marker = data[offset + 1]
+        # Standalone markers carry no length field.
+        if marker == 0xD8 or marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            offset += 2
+            continue
+        if marker == 0xDA:
+            # Start of scan: everything from here to EOF is entropy-coded image data
+            # and is copied across verbatim.
+            return segments, offset
+        length = int.from_bytes(data[offset + 2 : offset + 4], "big")
+        if length < 2 or offset + 2 + length > total:
+            return None
+        segments.append((marker, data[offset + 4 : offset + 2 + length]))
+        offset += 2 + length
+    return None
+
+
+def _append_segment(buffer: bytearray, marker: int, payload: bytes) -> bool:
+    if len(payload) > _MAX_SEGMENT_PAYLOAD:
+        return False
+    buffer += b"\xff" + bytes((marker,)) + (len(payload) + 2).to_bytes(2, "big") + payload
+    return True
+
+
+def _write_jpeg_metadata(source: Path, keyword: str, score: float | None) -> bool:
+    """Splice EXIF and XMP segments into the original bytes, leaving the scan alone."""
+    tmp = None
+    try:
+        data = source.read_bytes()
+        split = _split_jpeg_header(data)
+        if split is None:
+            LOGGER.warning("Could not write keyword metadata to %s: unrecognised JPEG structure", source)
+            return False
+        segments, scan_offset = split
+        # Image.open does not decode the raster, and getexif() only parses the APP1
+        # block, so reading the existing tags costs nothing and loses nothing.
+        with Image.open(source) as handle:
+            exif = handle.getexif()
+        exif[40094] = keyword.encode("utf-16le")
+        if score is not None:
+            exif[270] = f"score={score:.3f}"
+        exif_payload = exif.tobytes()
+        if not exif_payload.startswith(_EXIF_PREFIX):
+            exif_payload = _EXIF_PREFIX + exif_payload
+        xmp_payload = _xmp_packet(keyword, score)
+        if len(exif_payload) > _MAX_SEGMENT_PAYLOAD or len(xmp_payload) > _MAX_SEGMENT_PAYLOAD:
+            LOGGER.warning(
+                "Could not write keyword metadata to %s: the metadata does not fit in one JPEG segment", source
+            )
+            return False
+
+        kept = [
+            (marker, payload)
+            for marker, payload in segments
+            if not (marker == _APP1 and (payload.startswith(_EXIF_PREFIX) or payload.startswith(_XMP_PREFIX)))
+        ]
+        rebuilt = bytearray(b"\xff\xd8")
+        written = False
+
+        def _write_ours() -> None:
+            _append_segment(rebuilt, _APP1, exif_payload)
+            _append_segment(rebuilt, _APP1, xmp_payload)
+
+        for marker, payload in kept:
+            # A JFIF APP0, when present, conventionally stays first.
+            if not written and marker != _APP0:
+                _write_ours()
+                written = True
+            if not _append_segment(rebuilt, marker, payload):
+                LOGGER.warning("Could not write keyword metadata to %s: oversized JPEG segment", source)
+                return False
+        if not written:
+            _write_ours()
+        rebuilt += data[scan_offset:]
+
+        fd, tmp_name = tempfile.mkstemp(suffix=source.suffix, dir=str(source.parent))
+        os.close(fd)
+        tmp = Path(tmp_name)
+        tmp.write_bytes(bytes(rebuilt))
+        os.replace(tmp, source)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Could not write keyword metadata to %s: %s", source, exc)
+        _discard_temp(tmp)
+        return False
+
+
+def _write_png_metadata(source: Path, keyword: str, score: float | None) -> bool:
+    """Re-save with the keyword added. PNG is lossless, so the pixels survive intact.
+
+    The stored raster is written back as-is — no EXIF orientation is applied — and the
+    file's existing text chunks are carried across rather than replaced.
+    """
     tmp = None
     try:
         with Image.open(source) as handle:
-            image = apply_orientation(handle)
-            exif = image.getexif()
-            exif[40094] = keyword.encode("utf-16le")
-            if score is not None:
-                exif[270] = f"score={score:.3f}"
+            handle.load()
+            existing = dict(getattr(handle, "text", {}) or {})
+            info = _pnginfo(keyword, score, existing)
             fd, tmp_name = tempfile.mkstemp(suffix=source.suffix, dir=str(source.parent))
             os.close(fd)
             tmp = Path(tmp_name)
-            save_kwargs: dict[str, Any] = {"exif": exif.tobytes()}
-            if suffix == ".png":
-                save_kwargs.pop("exif", None)
-                pnginfo = _pnginfo(keyword, score)
-                save_kwargs["pnginfo"] = pnginfo
-            image.save(tmp, **save_kwargs)
-        if suffix in {".jpg", ".jpeg"}:
-            _inject_jpeg_xmp(tmp, keyword, score)
+            handle.save(tmp, format="PNG", pnginfo=info)
         os.replace(tmp, source)
         return True
     except Exception as exc:  # noqa: BLE001
@@ -432,18 +642,6 @@ def _xmp_packet(keyword: str, score: float | None) -> bytes:
     return b"http://ns.adobe.com/xap/1.0/\x00" + xml.encode("utf-8")
 
 
-def _inject_jpeg_xmp(path: Path, keyword: str, score: float | None) -> None:
-    data = path.read_bytes()
-    if not data.startswith(b"\xff\xd8"):
-        return
-    payload = _xmp_packet(keyword, score)
-    segment_length = len(payload) + 2
-    if segment_length > 0xFFFF:
-        return
-    segment = b"\xff\xe1" + segment_length.to_bytes(2, "big") + payload
-    path.write_bytes(data[:2] + segment + data[2:])
-
-
 def _write_pyexiv2_metadata(source: Path, keyword: str, score: float | None) -> bool:
     try:
         import pyexiv2
@@ -471,10 +669,19 @@ def _write_pyexiv2_metadata(source: Path, keyword: str, score: float | None) -> 
         return False
 
 
-def _pnginfo(keyword: str, score: float | None):
+def _pnginfo(keyword: str, score: float | None, existing: Mapping[str, str] | None = None):
     from PIL import PngImagePlugin
 
     info = PngImagePlugin.PngInfo()
+    # Carry the file's own text chunks across first: a re-save that only wrote our two
+    # keys would silently drop whatever else the image was annotated with.
+    for name, value in (existing or {}).items():
+        if name in {"Keywords", "Score"}:
+            continue
+        try:
+            info.add_text(str(name), str(value))
+        except Exception:  # noqa: BLE001
+            continue
     info.add_text("Keywords", keyword)
     if score is not None:
         info.add_text("Score", f"{score:.3f}")
@@ -504,6 +711,20 @@ class TrashOutcome:
     @property
     def failed_count(self) -> int:
         return len(self.failures)
+
+
+def trash_available() -> tuple[bool, str]:
+    """Whether anything can be moved to the recycle bin, and why not when it cannot.
+
+    Callers that pair deletion with something irreversible — rejecting a whole band
+    teaches the scanner permanently — need to know this *before* they start, or a
+    missing send2trash leaves the permanent half done and the deletion half not.
+    """
+    try:
+        import send2trash  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        return False, str(exc)
+    return True, ""
 
 
 def trash_files(paths: Sequence[str | Path]) -> TrashOutcome:

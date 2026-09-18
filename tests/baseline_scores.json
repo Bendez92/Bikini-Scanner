@@ -1,24 +1,24 @@
 {
   "buckets": [
+    "Likely match",
     "Uncertain",
     "Uncertain",
     "Uncertain",
     "Uncertain",
     "Uncertain",
-    "Uncertain",
-    "Likely false positive"
+    "Uncertain"
   ],
   "corpus_size": 14,
   "rows": [
     {
       "axes": {
         "adult": 0.064737,
-        "bikini": 0.863387,
+        "bikini": 0.985654,
         "bikini_bottom": 0.423763,
         "bikini_top": 0.429769,
         "child": 0.23068,
         "cleavage": 0.386187,
-        "detail": 0.523277,
+        "detail": 0.699342,
         "evidence_adult": 0.0,
         "evidence_child": 0.0,
         "evidence_female": 0.0,
@@ -33,20 +33,20 @@
       },
       "detail_region": "full",
       "name": "corpus_00.jpg",
-      "score": 0.130819,
+      "score": 0.174835,
       "stage": "scored",
       "visible": true,
-      "zero_shot": 0.130819
+      "zero_shot": 0.174835
     },
     {
       "axes": {
         "adult": 0.577755,
-        "bikini": 0.111616,
+        "bikini": 0.758025,
         "bikini_bottom": 0.480468,
         "bikini_top": 0.490592,
         "child": 0.086825,
         "cleavage": 0.818375,
-        "detail": 0.425526,
+        "detail": 0.461649,
         "evidence_adult": 0.155511,
         "evidence_child": 0.0,
         "evidence_female": 0.0,
@@ -61,20 +61,20 @@
       },
       "detail_region": "full",
       "name": "corpus_01.jpg",
-      "score": 0.106381,
+      "score": 0.115412,
       "stage": "scored",
       "visible": true,
-      "zero_shot": 0.106381
+      "zero_shot": 0.115412
     },
     {
       "axes": {
         "adult": 0.907282,
-        "bikini": 0.665331,
+        "bikini": 0.770994,
         "bikini_bottom": 0.694666,
         "bikini_top": 0.67508,
         "child": 0.18075,
         "cleavage": 0.855752,
-        "detail": 0.537146,
+        "detail": 0.551939,
         "evidence_adult": 0.814563,
         "evidence_child": 0.0,
         "evidence_female": 0.321614,
@@ -89,20 +89,20 @@
       },
       "detail_region": "centre",
       "name": "corpus_02.jpg",
-      "score": 0.493582,
+      "score": 0.507175,
       "stage": "scored",
       "visible": true,
-      "zero_shot": 0.493582
+      "zero_shot": 0.507175
     },
     {
       "axes": {
         "adult": 0.64782,
-        "bikini": 0.412551,
+        "bikini": 0.780738,
         "bikini_bottom": 0.747047,
         "bikini_top": 0.703728,
         "child": 0.606379,
         "cleavage": 0.554162,
-        "detail": 0.295177,
+        "detail": 0.474627,
         "evidence_adult": 0.29564,
         "evidence_child": 0.212758,
         "evidence_female": 0.058811,
@@ -117,10 +117,10 @@
       },
       "detail_region": "centre",
       "name": "corpus_03.jpg",
-      "score": 0.05365,
+      "score": 0.086266,
       "stage": "scored",
       "visible": true,
-      "zero_shot": 0.05365
+      "zero_shot": 0.086266
     },
     {
       "axes": {
@@ -153,12 +153,12 @@
     {
       "axes": {
         "adult": 0.049709,
-        "bikini": 0.507458,
+        "bikini": 0.959884,
         "bikini_bottom": 0.342156,
         "bikini_top": 0.413374,
         "child": 0.780919,
         "cleavage": 0.601399,
-        "detail": 0.062578,
+        "detail": 0.674299,
         "evidence_adult": 0.0,
         "evidence_child": 0.561838,
         "evidence_female": 0.0,
@@ -171,7 +171,7 @@
         "nsfw": 0.484328,
         "person": 0.602117
       },
-      "detail_region": "bandtop",
+      "detail_region": "centre",
       "name": "corpus_05.jpg",
       "score": 0.0,
       "stage": "minor",
@@ -181,7 +181,7 @@
     {
       "axes": {
         "adult": 0.447049,
-        "bikini": 0.214998,
+        "bikini": 0.246649,
         "bikini_bottom": 0.709256,
         "bikini_top": 0.683795,
         "child": 0.087052,
@@ -209,7 +209,7 @@
     {
       "axes": {
         "adult": 0.299443,
-        "bikini": 0.363968,
+        "bikini": 0.289281,
         "bikini_bottom": 0.422081,
         "bikini_top": 0.609978,
         "child": 0.100288,
@@ -265,12 +265,12 @@
     {
       "axes": {
         "adult": 0.290578,
-        "bikini": 0.419276,
+        "bikini": 0.83564,
         "bikini_bottom": 0.516362,
         "bikini_top": 0.599477,
         "child": 0.594159,
         "cleavage": 0.748546,
-        "detail": 0.157786,
+        "detail": 0.524251,
         "evidence_adult": 0.0,
         "evidence_child": 0.188318,
         "evidence_female": 0.108764,
@@ -285,15 +285,15 @@
       },
       "detail_region": "full",
       "name": "corpus_09.jpg",
-      "score": 0.045634,
+      "score": 0.151621,
       "stage": "scored",
       "visible": true,
-      "zero_shot": 0.045634
+      "zero_shot": 0.151621
     },
     {
       "axes": {
         "adult": 0.588871,
-        "bikini": 0.092405,
+        "bikini": 0.155379,
         "bikini_bottom": 0.309756,
         "bikini_top": 0.227681,
         "child": 0.268376,
@@ -322,7 +322,7 @@
       "axes": {
         "adult": 0.393328,
         "bikini": 0.141622,
-        "bikini_bottom": 0.18943,
+        "bikini_bottom": 0.189431,
         "bikini_top": 0.269693,
         "child": 0.96534,
         "cleavage": 0.511732,
@@ -337,7 +337,7 @@
         "gate_person": 1.0,
         "midriff": 0.145631,
         "nsfw": 0.308302,
-        "person": 0.812038
+        "person": 0.812039
       },
       "detail_region": "bandmid",
       "name": "corpus_11.jpg",
@@ -349,12 +349,12 @@
     {
       "axes": {
         "adult": 0.064737,
-        "bikini": 0.863387,
+        "bikini": 0.985654,
         "bikini_bottom": 0.423763,
         "bikini_top": 0.429769,
         "child": 0.23068,
         "cleavage": 0.386187,
-        "detail": 0.523277,
+        "detail": 0.699342,
         "evidence_adult": 0.0,
         "evidence_child": 0.0,
         "evidence_female": 0.0,
@@ -369,10 +369,10 @@
       },
       "detail_region": "full",
       "name": "corpus_duplicate.jpg",
-      "score": 0.130819,
+      "score": 0.174835,
       "stage": "scored",
       "visible": true,
-      "zero_shot": 0.130819
+      "zero_shot": 0.174835
     },
     {
       "axes": {
