@@ -6,7 +6,17 @@
       "Bash(mypy:*)",
       "Bash(python -m mypy:*)",
       "Bash(pytest:*)",
-      "Bash(python -m pytest:*)"
+      "Bash(python -m pytest:*)",
+      "Bash(.venv/Scripts/python.exe tests/test_functional.py:*)",
+      "Bash(.venv/Scripts/python.exe -m ruff check:*)",
+      "Bash(.venv/Scripts/python.exe -m pytest:*)",
+      "Bash(.venv/Scripts/python.exe scripts/score_baseline.py:*)",
+      "Bash(.venv/Scripts/mypy:*)",
+      "PowerShell(.venv\\Scripts\\python.exe tests\\test_functional.py:*)",
+      "PowerShell(.venv\\Scripts\\python.exe -m ruff check:*)",
+      "PowerShell(.venv\\Scripts\\python.exe -m pytest:*)",
+      "PowerShell(.venv\\Scripts\\python.exe scripts\\score_baseline.py:*)",
+      "PowerShell(.venv\\Scripts\\mypy:*)"
     ]
   }
 }
